@@ -1,0 +1,23 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Acquisition output (raw stacks, DSI/average TIFFs, parameter logs)
+*.tif
+*.tiff
+*.raw
+*.mat
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

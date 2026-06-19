@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Pure-PyPI dependencies for the event-DSI microscope control GUI.
+#   pip install -r requirements.txt
+#
+# The three VENDOR HARDWARE SDKs are installed separately (see README.md):
+#   * Prophesee Metavision  -> metavision_core / metavision_sdk_core
+#   * Hamamatsu DCAM-API     -> dcam.py (path set via HAMAMATSU_SDK_PATH)
+#   * PI GCS                 -> pipython (+ PI software / GCS DLLs)
+# The app degrades gracefully if any of these is missing: the matching camera
+# or stage is simply reported as unavailable rather than crashing the GUI.
+# ---------------------------------------------------------------------------
+
+numpy
+scipy
+opencv-python
+PyQt6
+
+# Raw Z-stack saving: enables streaming BigTIFF writes (flat memory, no 4 GB
+# classic-TIFF limit). Without it the app falls back to an in-memory OpenCV
+# write, which is fine only for small stacks.
+tifffile
+
+# Required by the Prophesee Metavision SDK's event_io submodule. Without it
+# `from metavision_core.event_io.raw_reader import initiate_device` raises
+# ImportError and the EVK4 camera shows up as unavailable.
+h5py
+
+# Siglent AWG control over VISA. PyVISA also needs a VISA *backend* at runtime:
+# install NI-VISA (recommended for the Siglent), or `pip install pyvisa-py`.
+pyvisa
+
+# PI stage RS-232 auto-scan (serial.tools.list_ports).
+pyserial
+
+# PI controller GCS wrapper. Pure-Python, but talking to real hardware also
+# requires the PI software / GCS DLLs to be installed on the machine.
+pipython
