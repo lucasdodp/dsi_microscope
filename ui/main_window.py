@@ -19,8 +19,9 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    EVK4_PLANE_OVERHEAD_S, ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S,
-    ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH, SESSION_STATE_PATH,
+    ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
+    ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
+    SESSION_STATE_PATH,
 )
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
@@ -54,6 +55,12 @@ class MainWindow(QMainWindow):
         self._acq_start = None      # time.time() when the acquisition started
         self._acq_label = None      # QLabel to update with the elapsed time
         self._acq_restore = None    # callable that restores the estimate text
+
+        # Acquisition-time learning: each completed run's actual elapsed time is
+        # recorded and used to calibrate future estimates (per acquisition type).
+        self._acq_record = None     # context of the running acquisition (type, predicted_s, …)
+        self._acq_aborted = False   # set if the current run was stopped / errored (don't learn from it)
+        self._acq_history = self._load_acq_history()  # {type: [{predicted_s, actual_s, …}]}
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -423,11 +430,45 @@ class MainWindow(QMainWindow):
     # ==========================
     # Acquisition time estimates
     # ==========================
+    def _calibrate(self, predicted_s, acq_type):
+        """Scale a cold-start physics estimate by what past runs of this type
+        actually took. Returns ``(adjusted_s, n_runs)``.
+
+        The correction is the **median** of the recorded ``actual_s / predicted_s``
+        ratios (robust to the odd outlier). With no history it returns the estimate
+        unchanged, so the model degrades gracefully on a fresh machine and sharpens
+        as runs accumulate.
+        """
+        records = self._acq_history.get(acq_type, [])
+        ratios = sorted(
+            r["actual_s"] / r["predicted_s"]
+            for r in records
+            if r.get("predicted_s", 0) > 0 and r.get("actual_s", 0) > 0
+        )
+        if not ratios:
+            return predicted_s, 0
+        mid = len(ratios) // 2
+        factor = ratios[mid] if len(ratios) % 2 else 0.5 * (ratios[mid - 1] + ratios[mid])
+        return predicted_s * factor, len(ratios)
+
+    @staticmethod
+    def _calib_note(runs):
+        """Suffix noting how many runs the estimate was calibrated from."""
+        return f"  · calibrated from {runs} run{'s' if runs != 1 else ''}" if runs else ""
+
+    def _evk4_predicted_s(self):
+        """Cold-start estimate (s) for a single EVK4 acquisition: the fixed
+        recording duration plus device init + post-processing overhead."""
+        return EVK4_PLANE_OVERHEAD_S + self.evk4_params.spin_time.value()
+
     def _update_evk4_time(self):
         if self._acq_label is self.lbl_evk4_time:
             return  # acquisition running: leave the live elapsed readout alone
         t = self.evk4_params.spin_time.value()
-        self.lbl_evk4_time.setText(f"Duration: {t} s")
+        total_s, runs = self._calibrate(self._evk4_predicted_s(), "evk4_single")
+        self.lbl_evk4_time.setText(
+            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({t} s recording + overhead){self._calib_note(runs)}"
+        )
 
     @staticmethod
     def _fmt_dur(seconds):
@@ -441,28 +482,30 @@ class MainWindow(QMainWindow):
             return f"{m} min {s:02d} s"
         return f"{s} s"
 
+    def _orca_predicted_s(self):
+        """Cold-start estimate (s) for a single-Z ORCA DSI acquisition: camera
+        start-up + capture + DSI reconstruction + (optional) raw-stack write."""
+        n = self.orca_params.spin_frames.value()
+        frame_s = self.orca_params.estimated_frame_time_s()
+        compute_s = self.orca_params.estimated_compute_s(n)
+        save_s = self.orca_params.estimated_raw_save_s(n) if self.chk_orca_raw.isChecked() else 0.0
+        return ORCA_CAMERA_INIT_S + n * frame_s + compute_s + save_s
+
     def _update_orca_time(self):
         if self._acq_label is self.lbl_orca_time:
             return  # acquisition running: leave the live elapsed readout alone
         n = self.orca_params.spin_frames.value()
-        frame_s = self.orca_params.estimated_frame_time_s()
-        fps = 1.0 / frame_s
-        # Capture + camera start-up + DSI reconstruction + (optional) raw-stack
-        # disk write. The compute and disk terms dominate for large full-frame
-        # stacks; the per-plane DSI compute was previously left out entirely.
-        compute_s = self.orca_params.estimated_compute_s(n)
-        save_s = self.orca_params.estimated_raw_save_s(n) if self.chk_orca_raw.isChecked() else 0.0
-        total_s = ORCA_CAMERA_INIT_S + n * frame_s + compute_s + save_s
+        fps = 1.0 / self.orca_params.estimated_frame_time_s()
+        total_s, runs = self._calibrate(self._orca_predicted_s(), "orca_single")
         self.lbl_orca_time.setText(
             f"Estimated: ≈ {self._fmt_dur(total_s)}  ({n} frames @ ≈ {fps:.0f} fps + overhead)"
+            f"{self._calib_note(runs)}"
         )
 
-    def _update_zstack_time(self):
-        if self._acq_label is self.lbl_zstack_time:
-            return  # acquisition running: leave the live elapsed readout alone
+    def _zstack_predicted_s(self):
+        """Cold-start estimate (s) for a Z-stack with the selected camera."""
         steps = self.pi_stage_widget.spin_steps.value()
-        camera = self.combo_zstack_camera.currentData()
-        if camera == "orca":
+        if self.combo_zstack_camera.currentData() == "orca":
             n = self.zstack_orca_params.spin_frames.value()
             frame_s = self.zstack_orca_params.estimated_frame_time_s()
             compute_s = self.zstack_orca_params.estimated_compute_s(n)
@@ -470,19 +513,25 @@ class MainWindow(QMainWindow):
                 self.zstack_orca_params.estimated_raw_save_s(n)
                 if self.chk_zstack_raw.isChecked() else 0.0
             )
-            # Per plane: motor move + settle, capture, DSI reconstruction, then
-            # raw-frame write. The per-plane compute was previously omitted, which
-            # is the main reason the stack ran longer than estimated.
+            # Per plane: motor move + settle, capture, DSI reconstruction, raw write.
             plane_s = ORCA_PLANE_OVERHEAD_S + n * frame_s + compute_s + save_s
             init_s = ORCA_CAMERA_INIT_S
         else:
-            # Per plane the EVK4 is re-opened and the raw file read back, which
-            # costs several seconds on top of the recording duration itself.
+            # Per plane the EVK4 is re-opened and the events accumulated.
             plane_s = EVK4_PLANE_OVERHEAD_S + self.zstack_evk4_params.spin_time.value()
             init_s = 0.0
-        total_s = init_s + steps * plane_s
+        return init_s + steps * plane_s
+
+    def _update_zstack_time(self):
+        if self._acq_label is self.lbl_zstack_time:
+            return  # acquisition running: leave the live elapsed readout alone
+        steps = self.pi_stage_widget.spin_steps.value()
+        acq_type = "orca_zstack" if self.combo_zstack_camera.currentData() == "orca" else "evk4_zstack"
+        total_s, runs = self._calibrate(self._zstack_predicted_s(), acq_type)
+        plane_s = total_s / max(1, steps)
         self.lbl_zstack_time.setText(
             f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
+            f"{self._calib_note(runs)}"
         )
 
     # ----- live elapsed timer (ground truth during an acquisition) -----
@@ -502,15 +551,102 @@ class MainWindow(QMainWindow):
         self._acq_label.setText(f"Elapsed: {m:02d}:{s:02d}")
 
     def _stop_elapsed(self):
-        """Stop the elapsed timer and restore the estimate label."""
+        """Stop the elapsed timer, record/save the real elapsed time, and restore
+        the (now calibrated) estimate label."""
         if self._acq_start is None:
             return
+        actual_s = time.time() - self._acq_start
         self._acq_timer.stop()
         self._acq_start = None
         self._acq_label = None
         restore, self._acq_restore = self._acq_restore, None
+
+        self._record_acquisition(actual_s)
+        # Keep the real duration visible alongside the worker's completion message.
+        self.lbl_status.setText(self.lbl_status.text() + f"  (elapsed {self._fmt_dur(actual_s)})")
         if restore is not None:
-            restore()
+            restore()  # recomputes the estimate, now using the run we just learned from
+
+    # ----- acquisition-time recording + learning -----
+    def _begin_acq_record(self, acq_type, predicted_s, planes, frames, out_dir, filename):
+        """Mark the start of a timed acquisition so its elapsed time can be saved
+        and learned from when it finishes."""
+        self._acq_aborted = False
+        self._acq_record = {
+            "type": acq_type,
+            "predicted_s": predicted_s,
+            "planes": planes,
+            "frames": frames,
+            "out_dir": out_dir,
+            "filename": filename,
+        }
+
+    def _record_acquisition(self, actual_s):
+        """Persist the elapsed time of the just-finished acquisition: write it into
+        the parameter log next to the data, and (for full runs) add it to the
+        learning history so future estimates of this type are calibrated."""
+        rec, self._acq_record = self._acq_record, None
+        if rec is None:
+            return
+        self._append_elapsed_to_log(rec, actual_s)
+        # Only learn from runs that actually completed — an aborted/errored run's
+        # elapsed time is for a partial acquisition and would skew the model.
+        if self._acq_aborted or rec.get("predicted_s", 0) <= 0:
+            return
+        entry = {
+            "predicted_s": round(rec["predicted_s"], 2),
+            "actual_s": round(actual_s, 2),
+            "planes": rec.get("planes"),
+            "frames": rec.get("frames"),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        history = self._acq_history.setdefault(rec["type"], [])
+        history.append(entry)
+        del history[:-ACQUISITION_HISTORY_MAX]  # keep only the most recent runs
+        self._save_acq_history()
+
+    def _append_elapsed_to_log(self, rec, actual_s):
+        """Append the estimated vs actual duration to the acquisition's parameter
+        log file, so each dataset carries a permanent record of how long it took."""
+        out_dir, filename = rec.get("out_dir"), rec.get("filename")
+        if not out_dir or not filename:
+            return
+        path = os.path.join(out_dir, f"parameters_{filename}.txt")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n[Acquisition timing]\n")
+                f.write(f"status = {'aborted' if self._acq_aborted else 'completed'}\n")
+                f.write(f"estimated_s = {rec.get('predicted_s', 0):.1f}\n")
+                f.write(f"actual_elapsed_s = {actual_s:.1f}\n")
+                f.write(f"actual_elapsed = {self._fmt_dur(actual_s)}\n")
+        except OSError:
+            pass
+
+    def _load_acq_history(self):
+        """Load the recorded actual/predicted times used to calibrate estimates."""
+        try:
+            with open(ACQUISITION_HISTORY_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_acq_history(self):
+        """Persist the learning history atomically (never leaves a corrupt file)."""
+        try:
+            directory = os.path.dirname(ACQUISITION_HISTORY_PATH)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = ACQUISITION_HISTORY_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._acq_history, f, indent=2)
+            os.replace(tmp_path, ACQUISITION_HISTORY_PATH)
+        except Exception:
+            pass
 
     def _stop_worker_silently(self, worker, finished_slot):
         """Stop a running worker and wait for it to release its device, WITHOUT
@@ -854,10 +990,16 @@ class MainWindow(QMainWindow):
             self.evk4_params.btn_apply_biases.setEnabled(True)
             self.evk4_params.btn_apply_biases.clicked.connect(self._apply_evk4_biases_live)
         else:
+            self._begin_acq_record(
+                "evk4_single", self._evk4_predicted_s(), planes=1,
+                frames=params.get("acqu_time"), out_dir=params["output_dir"],
+                filename=params["filename"],
+            )
             self._start_elapsed(self.lbl_evk4_time, self._update_evk4_time)
 
     def stop_evk4(self):
         if self.evk4_worker is not None:
+            self._acq_aborted = True  # a stopped run is partial — don't learn its time
             self.evk4_worker.stop()
             self.lbl_status.setText("Stopping EVK4...")
             self.evk4_worker.wait(3000)
@@ -957,10 +1099,16 @@ class MainWindow(QMainWindow):
             # re-applies to the live feed automatically (debounced in the widget).
             self.orca_params.roi_changed.connect(self._apply_orca_params_live)
         else:
+            self._begin_acq_record(
+                "orca_single", self._orca_predicted_s(), planes=1,
+                frames=params["orca_frames"], out_dir=params["output_dir"],
+                filename=params["filename"],
+            )
             self._start_elapsed(self.lbl_orca_time, self._update_orca_time)
 
     def stop_orca(self):
         if self.orca_worker is not None:
+            self._acq_aborted = True  # a stopped run is partial — don't learn its time
             self.orca_worker.stop()
             self.orca_worker.wait(3000)
 
@@ -1170,10 +1318,18 @@ class MainWindow(QMainWindow):
         self.zstack_worker.error_signal.connect(self.show_error)
         self.zstack_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_worker.start()
+        frames = (self.zstack_orca_params.get_params()["orca_frames"] if camera == "orca"
+                  else self.zstack_evk4_params.get_params()["acqu_time"])
+        self._begin_acq_record(
+            "orca_zstack" if camera == "orca" else "evk4_zstack",
+            self._zstack_predicted_s(), planes=self.pi_stage_widget.spin_steps.value(),
+            frames=frames, out_dir=output_dir, filename=filename,
+        )
         self._start_elapsed(self.lbl_zstack_time, self._update_zstack_time)
 
     def stop_zstack(self):
         if self.zstack_worker is not None and self.zstack_worker.isRunning():
+            self._acq_aborted = True  # a stopped stack is partial — don't learn its time
             self.zstack_worker.stop()
             self.lbl_status.setText("Aborting Z-Stack...")
         if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
@@ -1221,6 +1377,7 @@ class MainWindow(QMainWindow):
     # General UI Handling
     # ==========================
     def show_error(self, err_msg):
+        self._acq_aborted = True  # an errored run is partial — don't learn its time
         QMessageBox.critical(self, "System Error", err_msg)
         self.on_evk4_finished()
         self.on_orca_finished()

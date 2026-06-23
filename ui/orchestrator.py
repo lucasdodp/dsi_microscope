@@ -8,7 +8,7 @@ here avoids a hardware->core->hardware import tangle.
 At each focal plane it acquires with the selected camera:
   * Scientific (ORCA): a speckle frame stack -> average (widefield) + standard
     deviation (DSI) images; every plane's raw 16-bit frames are written to their
-    own multi-page TIFF (``raw_stack_<filename>_zNNN.tif``), one file per plane,
+    own multi-page TIFF (``<filename>_raw_stack_zNNN.tif``), one file per plane,
     because the downstream MATLAB algorithms (e.g. RIM) consume the planes as
     separate files rather than one combined volume.
   * Event (EVK4): an event recording for a fixed duration, accumulated directly
@@ -157,7 +157,7 @@ class AutomatedZStackWorker(QThread):
         """Acquire a frame stack at the current plane; return (avg, std) images.
 
         When raw saving is enabled, this plane's raw frames are written to their
-        own multi-page TIFF (``raw_stack_<filename>_zNNN.tif``) — one file per
+        own multi-page TIFF (``<filename>_raw_stack_zNNN.tif``) — one file per
         plane, so the downstream MATLAB algorithms can consume the planes
         individually rather than as one combined volume.
         """
@@ -196,7 +196,7 @@ class AutomatedZStackWorker(QThread):
         out_dir = self.save_params.get("output_dir", "")
         if out_dir and self.save_params.get("save_raw", True):
             filename = self.save_params.get("filename", "zstack")
-            save_raw_stack_tiff(raw_stack, out_dir, f"{filename}_z{step:03d}", roi)
+            save_raw_stack_tiff(raw_stack, out_dir, filename, roi, plane=step)
         return compute_dsi_images(raw_stack, roi)
 
     # ----------------------------------------------------------------- EVENT

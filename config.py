@@ -121,12 +121,18 @@ DCAM_DEFECTCORRECT_OPTIONS = {
 # ---------------------------------------------------------------------------
 # The estimate is a rough model so users know roughly how long to wait; the
 # *live elapsed timer* shown during an acquisition is the ground truth. These
-# constants account for the costs the old estimate ignored (it counted only
-# N×frame_time): camera start-up, the per-plane motor move + settle, the EVK4's
-# per-plane device re-initialisation, and writing the raw 16-bit stack to disk.
-# Deliberately conservative — better to slightly over- than under-estimate.
+# constants are only the COLD-START model (before any run has been recorded):
+# once acquisitions complete, their measured elapsed times calibrate the estimate
+# per acquisition type (see ACQUISITION_HISTORY_PATH and MainWindow._calibrate),
+# so machine-specific overheads the constants can't predict are learned. They
+# account for the costs a naive N×frame_time estimate ignores: camera start-up,
+# the per-plane motor move + settle, the EVK4's per-plane device re-init, and the
+# raw-stack disk write. Deliberately conservative — better to slightly over- than
+# under-estimate (and the per-plane overhead, dominated by motor settle + serial
+# round-trips + DCAM buffer setup + first-frame latency, was measured higher than
+# the original 1.3 s).
 ORCA_CAMERA_INIT_S = 1.5         # Dcamapi.init + dev_open + buffer allocation
-ORCA_PLANE_OVERHEAD_S = 1.3      # piezo move + 0.5 s settle + per-plane buffer alloc
+ORCA_PLANE_OVERHEAD_S = 2.0      # piezo move + ~0.5 s settle + serial round-trips + buffer/cap setup
 EVK4_PLANE_OVERHEAD_S = 4.0      # per-plane initiate_device + raw readback/accumulate
 ZSTACK_DISK_BYTES_PER_S = 150e6  # assumed sustained disk write rate for the raw TIFF
 # Throughput of the DSI reconstruction (per-pixel average + std across the N-frame
@@ -151,6 +157,24 @@ SESSION_STATE_PATH = os.environ.get(
         "DSIMicroscope", "last_session.json",
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Acquisition-time learning — measured elapsed times calibrate the estimate
+# ---------------------------------------------------------------------------
+# Each completed acquisition records (predicted_s, actual_s) here, keyed by type
+# (orca_single / orca_zstack / evk4_single / evk4_zstack). The duration estimate
+# is then scaled by the learned median actual/predicted ratio for that type, so
+# it converges to the real time on this machine after a couple of runs instead of
+# relying on hand-tuned constants. Stored next to the session state; env-override
+# with DSI_ACQ_HISTORY.
+ACQUISITION_HISTORY_PATH = os.environ.get(
+    "DSI_ACQ_HISTORY",
+    os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "DSIMicroscope", "acquisition_history.json",
+    ),
+)
+ACQUISITION_HISTORY_MAX = 40  # most recent runs kept per acquisition type
 
 # ---------------------------------------------------------------------------
 # Prophesee EVK4 (Metavision)

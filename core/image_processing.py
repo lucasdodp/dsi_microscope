@@ -189,7 +189,7 @@ def _prepare_raw_frames(stack, roi=None):
     return frames
 
 
-def save_raw_stack_tiff(stack, out_dir, filename, roi=None):
+def save_raw_stack_tiff(stack, out_dir, filename, roi=None, plane=None):
     """Save the raw speckle frame stack as a multi-page 16-bit TIFF.
 
     This is the archival *raw data*: every acquired frame at the camera's native
@@ -198,16 +198,23 @@ def save_raw_stack_tiff(stack, out_dir, filename, roi=None):
     in ImageJ/Fiji as a scrollable stack and can be re-processed later (e.g. with
     a different sectioning estimator or the RIM algorithm).
 
+    The filename base comes first so the user's name leads the file name:
+    ``<filename>_raw_stack.tif`` for a single plane, or
+    ``<filename>_raw_stack_zNNN.tif`` for each plane of a Z-stack.
+
     Parameters
     ----------
     stack : np.ndarray
         Raw frame stack of shape (N, H, W), typically uint16 from the ORCA.
     out_dir, filename : str
-        Destination directory and filename base (written as
-        ``raw_stack_<filename>.tif``).
+        Destination directory and filename base.
     roi : dict or None
         Optional crop bounds, matching the processed region so the raw and
         processed data cover the same field of view.
+    plane : int or None
+        Z-plane index. When given, it is appended as ``_zNNN`` so a Z-stack
+        writes one file per plane; when ``None`` (single-Z acquire) no plane
+        suffix is added.
 
     Returns
     -------
@@ -215,7 +222,8 @@ def save_raw_stack_tiff(stack, out_dir, filename, roi=None):
         The path of the file written.
     """
     frames = _prepare_raw_frames(stack, roi)
-    path = os.path.join(out_dir, f"raw_stack_{filename}.tif")
+    suffix = "" if plane is None else f"_z{plane:03d}"
+    path = os.path.join(out_dir, f"{filename}_raw_stack{suffix}.tif")
     _write_multipage_tiff(path, frames)
     return path
 
