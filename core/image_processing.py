@@ -61,6 +61,19 @@ def process_dsi(stack, roi):
     return z_val, display_img
 
 
+# Peak working-set budget for the float64 chunk processed at once in
+# ``compute_dsi_images``. Bounding this (rather than casting the whole stack to
+# float at once) keeps memory flat regardless of frame count, so a large ORCA
+# Z-stack can't drive the machine into swap.
+_DSI_CHUNK_BYTES = 128 * 1024 * 1024
+
+
+def _frame_chunk(h, w):
+    """How many H×W frames fit in the float64 working-set budget (at least one)."""
+    per_frame = max(1, h * w * 8)  # one H×W plane as float64
+    return max(1, _DSI_CHUNK_BYTES // per_frame)
+
+
 def compute_dsi_images(stack, roi=None):
     """Compute the average (widefield) and standard-deviation (DSI) images.
 
@@ -68,6 +81,13 @@ def compute_dsi_images(stack, roi=None):
     frames acquired at one focal plane, the optical sectioning comes from the
     per-pixel statistics *across* the stack (Ventalon & Mertz; cf. reference
     papers), not from moving the objective.
+
+    Memory: the mean and standard deviation are accumulated over the frame axis
+    in small chunks, in float64, instead of materializing ``stack.astype(float32)``
+    (and the deviation array ``np.std`` builds internally). Those would each be
+    the full size of the stack — gigabytes for a high frame count at full sensor,
+    enough to swap the machine to a standstill. Here the working set is only a few
+    H×W planes, so peak memory is independent of N.
 
     Parameters
     ----------
@@ -82,8 +102,7 @@ def compute_dsi_images(stack, roi=None):
         Float32 average-intensity image (the conventional widefield equivalent)
         and standard-deviation image (the optically-sectioned DSI image).
     """
-    images = stack.astype(np.float32)
-
+    images = stack
     if roi is not None:
         # Clamp to the actual frame so a generous UI value can't slice out of bounds.
         max_y, max_x = images.shape[1], images.shape[2]
@@ -91,8 +110,30 @@ def compute_dsi_images(stack, roi=None):
         x_min, x_max = roi["x_min"], min(roi["x_max"], max_x)
         images = images[:, y_min:y_max, x_min:x_max]
 
-    avg_img = np.mean(images, axis=0)
-    std_img = np.std(images, axis=0)
+    n, h, w = images.shape
+    chunk = _frame_chunk(h, w)
+
+    # Pass 1 — mean. ``sum(dtype=float64)`` reduces over the frame axis without
+    # casting the whole block to float first, so the only big array is the H×W
+    # accumulator.
+    acc = np.zeros((h, w), dtype=np.float64)
+    for start in range(0, n, chunk):
+        acc += images[start:start + chunk].sum(axis=0, dtype=np.float64)
+    mean = acc / n
+
+    # Pass 2 — population variance as the summed squared deviation about the mean
+    # (ddof=0, matching the previous ``np.std``). Two passes avoid the
+    # catastrophic cancellation a single-pass sum-of-squares can suffer.
+    sq = np.zeros((h, w), dtype=np.float64)
+    for start in range(0, n, chunk):
+        block = images[start:start + chunk].astype(np.float64)
+        block -= mean
+        block *= block
+        sq += block.sum(axis=0)
+    var = sq / n
+
+    avg_img = mean.astype(np.float32)
+    std_img = np.sqrt(var, out=var).astype(np.float32)
     return avg_img, std_img
 
 
@@ -132,10 +173,9 @@ def _write_multipage_tiff(path, frames):
 def _prepare_raw_frames(stack, roi=None):
     """Crop a raw frame stack to the ROI and coerce it to a native integer depth.
 
-    Shared by ``save_raw_stack_tiff`` and ``RawStackTiffWriter`` so the on-disk
-    raw data is identical whether it is written one stack at a time or appended
-    plane by plane. Raw data is never normalized; the camera's native bit depth
-    (typically uint16) is preserved.
+    Used by ``save_raw_stack_tiff`` so the on-disk raw data is identical for the
+    single-Z acquire and for every per-plane file of a Z-stack. Raw data is never
+    normalized; the camera's native bit depth (typically uint16) is preserved.
     """
     frames = stack
     if roi is not None:
@@ -180,52 +220,6 @@ def save_raw_stack_tiff(stack, out_dir, filename, roi=None):
     return path
 
 
-class RawStackTiffWriter:
-    """Append raw speckle frames from many planes into a *single* multi-page TIFF.
-
-    The Z-stack acquires a frame stack at every focal plane. Rather than emitting
-    one ``raw_stack_..._zNNN.tif`` per plane, this writer concatenates every
-    plane's frames (plane-major order: all of plane 0's frames, then plane 1's,
-    ...) into one ``raw_stack_<filename>.tif`` — the single archival raw-data
-    file requested for downstream re-processing.
-
-    Implementation: when ``tifffile`` is available, frames are streamed to disk
-    incrementally as a BigTIFF, so memory stays flat and the file can exceed the
-    4 GB classic-TIFF limit. Without ``tifffile`` it falls back to buffering all
-    frames in memory and writing them with a single ``cv2.imwritemulti`` call on
-    ``close()`` (fine for modest stacks; install ``tifffile`` for large 3D runs).
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self._tif = None       # tifffile.TiffWriter when streaming
-        self._buffer = None     # list of frames when buffering for OpenCV
-        try:
-            import tifffile
-            # BigTIFF + contiguous pages: a plain multi-page stack Fiji opens as a
-            # scrollable volume, with no per-file size ceiling.
-            self._tif = tifffile.TiffWriter(path, bigtiff=True)
-        except ImportError:
-            self._buffer = []
-
-    def append(self, stack, roi=None):
-        """Add one plane's frame stack (N, H, W) to the file."""
-        frames = _prepare_raw_frames(stack, roi)
-        if self._tif is not None:
-            self._tif.write(frames, contiguous=True)
-        else:
-            self._buffer.extend(frames)
-
-    def close(self):
-        """Flush and finalize the file. Safe to call more than once."""
-        if self._tif is not None:
-            self._tif.close()
-            self._tif = None
-        elif self._buffer:
-            cv2.imwritemulti(self.path, self._buffer)
-            self._buffer = []
-
-
 def save_volume_tiff(volume, out_dir, filename, kind):
     """Save a (Z, H, W) image volume as a multi-page TIFF (a depth stack).
 
@@ -255,6 +249,145 @@ def save_volume_tiff(volume, out_dir, filename, kind):
     path = os.path.join(out_dir, f"{kind}_{filename}.tif")
     _write_multipage_tiff(path, arr)
     return path
+
+
+def _gaussian(z, amp, mu, sigma, offset):
+    """Gaussian peak on a constant background, used for the axial-profile fit."""
+    return offset + amp * np.exp(-((z - mu) ** 2) / (2.0 * sigma ** 2))
+
+
+def _fit_axial_gaussian(z, y):
+    """Fit ``y(z)`` with a Gaussian-on-offset; return (fwhm, popt) or (None, None).
+
+    ``fwhm = 2*sqrt(2*ln2)*|sigma|`` in the same units as ``z`` (µm). Needs at
+    least 4 points and SciPy; any failure (too few points, no SciPy, fit did not
+    converge) degrades to (None, None) so the caller can still save the raw data.
+    """
+    if z.size < 4:
+        return None, None
+    try:
+        from scipy.optimize import curve_fit
+    except ImportError:
+        return None, None
+
+    # Initial guess: peak above a baseline, centred at the brightest plane, width
+    # a quarter of the scanned range.
+    amp0 = float(y.max() - y.min()) or 1.0
+    mu0 = float(z[np.argmax(y)])
+    sigma0 = max((float(z.max() - z.min())) / 4.0, 1e-6)
+    offset0 = float(y.min())
+    try:
+        popt, _ = curve_fit(_gaussian, z, y, p0=[amp0, mu0, sigma0, offset0], maxfev=10000)
+    except Exception:
+        return None, None
+
+    fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * abs(popt[2])
+    return fwhm, popt
+
+
+def save_axial_sectioning_plot(z_positions, intensities, out_dir, filename, kind):
+    """Save the axial-sectioning profile of a Z-stack (paper Fig. 3a) + its data.
+
+    For each focal plane the mean intensity of the optically-sectioned image is
+    plotted against axial position z; a Gaussian is fitted and its FWHM is the
+    axial sectioning (the axial extent of the detection PSF convolved with the
+    sample). Mirrors Benachir et al., "Event-based DSI", Fig. 3a.
+
+    The underlying data is **always** written as ``axial_profile_<kind>_<name>.csv``
+    (z, mean intensity, peak-normalized intensity, and the fit parameters). The
+    figure ``axial_profile_<kind>_<name>.png`` is written only if matplotlib is
+    installed; without it the data + fit are still saved.
+
+    Parameters
+    ----------
+    z_positions : sequence of float
+        Axial position (µm) of each plane, aligned with ``intensities``.
+    intensities : sequence of float
+        Mean pixel value of each plane's sectioned image (DSI std image for the
+        ORCA, accumulated event image for the EVK4).
+    out_dir, filename : str
+        Destination directory and filename base.
+    kind : str
+        Short descriptor / filename infix, e.g. ``"dsi"`` or ``"event"``.
+
+    Returns
+    -------
+    (fwhm, csv_path, png_path) : (float | None, str, str | None)
+        ``fwhm`` in µm (None if the fit failed), the CSV path, and the PNG path
+        (None if matplotlib was unavailable).
+    """
+    z = np.asarray(z_positions, dtype=float)
+    inten = np.asarray(intensities, dtype=float)
+
+    # Sort by axial position so the profile and fit are monotone in z.
+    order = np.argsort(z)
+    z, inten = z[order], inten[order]
+
+    peak = float(inten.max()) if inten.size and inten.max() > 0 else 1.0
+    inten_norm = inten / peak
+
+    fwhm, popt = _fit_axial_gaussian(z, inten_norm)
+
+    # --- data (always) -----------------------------------------------------
+    csv_path = os.path.join(out_dir, f"axial_profile_{kind}_{filename}.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("z_position_um,mean_intensity,normalized_intensity\n")
+        for zi, raw, nrm in zip(z, inten, inten_norm):
+            f.write(f"{zi:.6f},{raw:.6f},{nrm:.6f}\n")
+        f.write("\n# Gaussian fit: offset + amp*exp(-(z-mu)^2 / (2*sigma^2))\n")
+        if popt is not None:
+            amp, mu, sigma, offset = popt
+            f.write(f"# amp={amp:.6f}, mu_um={mu:.6f}, sigma_um={abs(sigma):.6f}, offset={offset:.6f}\n")
+            f.write(f"# fwhm_um={fwhm:.6f}\n")
+        else:
+            f.write("# fit_failed=True (need >=4 planes, SciPy, and a converging fit)\n")
+
+    # --- figure (best effort) ---------------------------------------------
+    png_path = _save_axial_figure(z, inten_norm, popt, fwhm, out_dir, filename, kind)
+    return fwhm, csv_path, png_path
+
+
+def _save_axial_figure(z, y_norm, popt, fwhm, out_dir, filename, kind):
+    """Render the axial-profile figure to PNG. Returns the path, or None if
+    matplotlib is not installed (the data CSV is saved regardless)."""
+    try:
+        # Object-oriented Agg API (no pyplot global state) so it is safe to call
+        # from the Z-stack worker thread and never opens a window.
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    except ImportError:
+        return None
+
+    # The data CSV is already saved by the caller, so a rendering failure here
+    # must never break the acquisition: treat the PNG as purely best-effort.
+    try:
+        fig = Figure(figsize=(6, 4))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.plot(z, y_norm, "o", color="#1f77b4", markersize=4, label="Experimental data")
+
+        if popt is not None:
+            z_fit = np.linspace(float(z.min()), float(z.max()), 400)
+            ax.plot(z_fit, _gaussian(z_fit, *popt), "-", color="#2ca02c", label="Gaussian fit")
+            amp, mu, sigma, offset = popt
+            half = offset + amp / 2.0
+            ax.annotate(
+                "", xy=(mu - fwhm / 2.0, half), xytext=(mu + fwhm / 2.0, half),
+                arrowprops=dict(arrowstyle="<->", color="red"),
+            )
+            ax.text(mu, half, f"  FWHM = {fwhm:.3f} µm", color="red", va="bottom", ha="center")
+
+        ax.set_xlabel("Axial position (µm)")
+        ax.set_ylabel("Average intensity (normalised)")
+        ax.set_title(f"Axial sectioning — {kind}")
+        ax.legend()
+        fig.tight_layout()
+
+        png_path = os.path.join(out_dir, f"axial_profile_{kind}_{filename}.png")
+        fig.savefig(png_path, dpi=150)
+        return png_path
+    except Exception:
+        return None
 
 
 def save_parameter_log(out_dir, filename, sections):

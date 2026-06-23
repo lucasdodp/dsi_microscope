@@ -6,6 +6,7 @@ dedicated thread and guarantees buffer release / device close via try/finally.
 """
 
 import sys
+import time
 
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -174,6 +175,12 @@ class OrcaWorker(QThread):
                 raise RuntimeError(f"buf_alloc(3) failed: {dcam.lasterr()}")
             buf_allocated = True
             if dcam.cap_start():
+                # Measured display framerate, reported ~twice a second so the
+                # real rate can be compared against the ROI prediction. This is
+                # the *display* rate; the live preview emit limits it, so the
+                # true camera throughput is what the acquisition reports below.
+                fps_count = 0
+                fps_t0 = time.perf_counter()
                 while self._is_running:
                     if self._pending_params is not None:
                         pending = self._pending_params
@@ -190,6 +197,8 @@ class OrcaWorker(QThread):
                         if not dcam.cap_start():
                             raise RuntimeError(f"cap_start() failed after param update: {dcam.lasterr()}")
                         self.status_update.emit("ORCA parameters updated.")
+                        fps_count = 0
+                        fps_t0 = time.perf_counter()
                         continue
                     if dcam.wait_capevent_frameready(100):
                         data = dcam.buf_getlastframedata()
@@ -207,6 +216,14 @@ class OrcaWorker(QThread):
                                     x2 = max(x1 + 1, min(roi["x_max"], fw))
                                     img = img[y1:y2, x1:x2]
                             self.image_ready.emit(img)
+                            fps_count += 1
+                            elapsed = time.perf_counter() - fps_t0
+                            if elapsed >= 0.5:
+                                self.status_update.emit(
+                                    f"Live display: ≈ {fps_count / elapsed:.0f} fps"
+                                )
+                                fps_count = 0
+                                fps_t0 = time.perf_counter()
                     else:
                         if not dcam.lasterr().is_timeout():
                             break
@@ -230,19 +247,41 @@ class OrcaWorker(QThread):
         if not dcam.buf_alloc(num_frames):
             raise RuntimeError(f"buf_alloc({num_frames}) failed: {dcam.lasterr()}")
 
-        acquired_stack = []
+        # Copy each frame straight into one preallocated array instead of a
+        # growing list of np.copy'd frames followed by a np.array() of it (that
+        # kept two full copies of the stack in RAM). The camera's ring buffer
+        # already holds N frames, so this keeps host-side overhead to a single
+        # copy and avoids the memory spike that could swap the machine.
+        raw_stack = None
+        count = 0
+        # Throttle the live preview + status updates: at high frame rates,
+        # scaling and emitting every single frame would cap the read loop well
+        # below the camera's true rate. The camera fills the ring buffer at full
+        # speed regardless; we just read it out as fast as possible and refresh
+        # the preview ~20 times over the run.
+        preview_every = max(1, num_frames // 20)
+        capture_start = None
+        capture_elapsed = 0.0
         try:
             if dcam.cap_start():
                 for i in range(num_frames):
                     if not self._is_running:
                         break
-                    self.status_update.emit(f"Acquiring speckle frame {i + 1}/{num_frames}...")
                     if dcam.wait_capevent_frameready(2000):
+                        if capture_start is None:
+                            capture_start = time.perf_counter()  # first frame in hand
                         data = dcam.buf_getframedata(i)
-                        acquired_stack.append(np.copy(data))
-                        self.image_ready.emit(scale_16bit_image(data))  # live preview
+                        if raw_stack is None:
+                            raw_stack = np.empty((num_frames,) + data.shape, dtype=data.dtype)
+                        raw_stack[i] = data  # copies out of the SDK ring buffer
+                        count += 1
+                        if i % preview_every == 0:
+                            self.status_update.emit(f"Acquiring speckle frame {i + 1}/{num_frames}...")
+                            self.image_ready.emit(scale_16bit_image(data))  # live preview
                     else:
                         raise RuntimeError(f"Frame timeout: {dcam.lasterr()}")
+                if capture_start is not None:
+                    capture_elapsed = time.perf_counter() - capture_start
                 dcam.cap_stop()
         finally:
             dcam.buf_release()
@@ -250,11 +289,24 @@ class OrcaWorker(QThread):
         if not self._is_running:
             self.status_update.emit("DSI acquisition cancelled.")
             return
-        if len(acquired_stack) < 2:
+        if count < 2:
             self.status_update.emit("Not enough frames acquired to compute DSI statistics.")
             return
 
-        raw_stack = np.array(acquired_stack)
+        # Trim if the run was cut short (e.g. stopped mid-capture).
+        if count != num_frames:
+            raw_stack = raw_stack[:count]
+
+        # Measured capture throughput — the number that actually determines how
+        # long an acquisition takes. Appended to the final status line so it
+        # stays visible after the computing/saving messages.
+        n = count
+        fps_msg = ""
+        if capture_elapsed > 0 and n > 1:
+            fps_msg = (
+                f"  [captured {n} frames in {capture_elapsed:.3f} s "
+                f"≈ {(n - 1) / capture_elapsed:.0f} fps]"
+            )
 
         self.status_update.emit("Computing average (widefield) and standard-deviation (DSI) images...")
         # If hardware subarray was active the frames are already the correct size;
@@ -273,9 +325,13 @@ class OrcaWorker(QThread):
             metadata = self.params.get("metadata")
             if metadata:
                 save_parameter_log(out_dir, filename, metadata)
-            self.status_update.emit(f"Saved raw stack + average + DSI images and parameter log to {out_dir}")
+            self.status_update.emit(
+                f"Saved raw stack + average + DSI images and parameter log to {out_dir}{fps_msg}"
+            )
         else:
-            self.status_update.emit("DSI images computed (not saved: no output directory set).")
+            self.status_update.emit(
+                f"DSI images computed (not saved: no output directory set).{fps_msg}"
+            )
 
     def stop(self):
         self._is_running = False

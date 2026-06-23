@@ -59,15 +59,19 @@ DCAM_TRIGGERSOURCE_PROP = 0x00100110
 DCAM_TRIGGER_MODE_PROP = 0x00100210
 DCAM_DEFECTCORRECT_PROP = 0x00470010
 
-# Approximate per-row readout times for the ORCA-Fusion C14440-20UP at each
-# DCAM readout-speed setting. Derived from the Hamamatsu datasheet:
-# Standard (2) → ~100 fps full-frame (2304 rows) → 10 ms / 2304 ≈ 4.34 µs/row
-# Ultra Quiet (1) → ~30 fps → 33 ms / 2304 ≈ 14.3 µs/row
-# Fast (3) → ~200 fps → 5 ms / 2304 ≈ 2.17 µs/row
+# Per-row readout time ("1H") for the ORCA-Fusion BT C15440-20UP at each DCAM
+# readout-speed setting. Taken directly from the instruction manual (§11-1-4
+# "Frame rate Calculation" and §14-1), NOT estimated:
+#   Fast scan        1H = 4.86765 µs  → 1/((2304+1)*1H) ≈ 89.1 fps full frame
+#   Standard scan    1H = 18.64706 µs → 1/((2304+1)*1H) ≈ 23.2 fps full frame
+#   Ultra quiet scan 1H = 80.0 µs     → 1/((2304+1)*1H) ≈  5.42 fps full frame
+# The free-running frame time is (Vn+1)*1H where Vn is the number of vertical
+# lines read out, so reducing the subarray HEIGHT is what raises the framerate
+# (e.g. 144 rows on Fast scan → ~1400 fps, matching HCImageLive).
 ORCA_ROW_READOUT_US = {
-    1.0: 14.3,   # Ultra Quiet
-    2.0:  4.34,  # Standard (2)
-    3.0:  2.17,  # Fast (3)
+    1.0: 80.0,      # Ultra Quiet (1)
+    2.0: 18.64706,  # Standard (2)
+    3.0: 4.86765,   # Fast (3)
 }
 
 # Hardware subarray (ROI) property ids — ORCA-Fusion C14440-20UP sensor is
@@ -111,6 +115,42 @@ DCAM_DEFECTCORRECT_OPTIONS = {
     "Off": 1.0,
     "On": 2.0,
 }
+
+# ---------------------------------------------------------------------------
+# Duration-estimate model (the "≈ … s" labels only)
+# ---------------------------------------------------------------------------
+# The estimate is a rough model so users know roughly how long to wait; the
+# *live elapsed timer* shown during an acquisition is the ground truth. These
+# constants account for the costs the old estimate ignored (it counted only
+# N×frame_time): camera start-up, the per-plane motor move + settle, the EVK4's
+# per-plane device re-initialisation, and writing the raw 16-bit stack to disk.
+# Deliberately conservative — better to slightly over- than under-estimate.
+ORCA_CAMERA_INIT_S = 1.5         # Dcamapi.init + dev_open + buffer allocation
+ORCA_PLANE_OVERHEAD_S = 1.3      # piezo move + 0.5 s settle + per-plane buffer alloc
+EVK4_PLANE_OVERHEAD_S = 4.0      # per-plane initiate_device + raw readback/accumulate
+ZSTACK_DISK_BYTES_PER_S = 150e6  # assumed sustained disk write rate for the raw TIFF
+# Throughput of the DSI reconstruction (per-pixel average + std across the N-frame
+# stack, computed in memory-bounded float64 chunks). This per-plane compute was
+# previously left out of the estimate entirely, which is the main reason a full-
+# sensor Z-stack ran much longer than predicted: at full sensor it is ~5–6 s PER
+# PLANE (≈90–100 Mpx/s measured; the conservative value here slightly over-estimates).
+ORCA_DSI_PROCESS_PIXELS_PER_S = 85e6
+
+# ---------------------------------------------------------------------------
+# Session state — parameters from the last run, auto-restored on startup
+# ---------------------------------------------------------------------------
+# On exit the app writes the current camera / Z-stack parameters here and reloads
+# them on the next launch, so a session starts where the previous one left off
+# (the manual Save/Load Preset buttons still work for named presets). Stored under
+# the per-user app-data dir to avoid cluttering the repo. Override with the
+# DSI_SESSION_STATE env var.
+SESSION_STATE_PATH = os.environ.get(
+    "DSI_SESSION_STATE",
+    os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "DSIMicroscope", "last_session.json",
+    ),
+)
 
 # ---------------------------------------------------------------------------
 # Prophesee EVK4 (Metavision)

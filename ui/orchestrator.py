@@ -7,17 +7,17 @@ here avoids a hardware->core->hardware import tangle.
 
 At each focal plane it acquires with the selected camera:
   * Scientific (ORCA): a speckle frame stack -> average (widefield) + standard
-    deviation (DSI) images; every plane's raw 16-bit frames are appended into a
-    single multi-page TIFF for the whole stack (the data the MATLAB RIM algorithm
-    consumes).
-  * Event (EVK4): an event recording for a fixed duration -> accumulated event
-    image; the raw .raw event file is saved per plane.
+    deviation (DSI) images; every plane's raw 16-bit frames are written to their
+    own multi-page TIFF (``raw_stack_<filename>_zNNN.tif``), one file per plane,
+    because the downstream MATLAB algorithms (e.g. RIM) consume the planes as
+    separate files rather than one combined volume.
+  * Event (EVK4): an event recording for a fixed duration, accumulated directly
+    into an event image (no per-plane .raw file is written).
 
 The per-plane sectioned images are assembled into a depth volume and saved as a 3D
-TIFF.
+TIFF — a single consolidated output per stack for either camera.
 """
 
-import os
 import time
 
 import numpy as np
@@ -26,7 +26,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import DCAM_EXPOSURE_PROP, EVK4_ERC_RATE
 from core import (
     accumulate_event_frame, apply_smoothing, compute_dsi_images, filter_crazy_pixels,
-    normalize_to_8bit, RawStackTiffWriter, save_parameter_log, save_volume_tiff,
+    normalize_to_8bit, save_axial_sectioning_plot, save_parameter_log,
+    save_raw_stack_tiff, save_volume_tiff,
 )
 from hardware.event_camera import EventsIterator, METAVISION_AVAILABLE, initiate_device
 from hardware.orca_camera import DCAM_AVAILABLE, Dcam, Dcamapi
@@ -71,24 +72,13 @@ class AutomatedZStackWorker(QThread):
         steps = self.motor_params["steps"]
         init_pos = focus - (step_size * steps / 2)
 
-        out_dir = self.save_params.get("output_dir", "")
-        filename = self.save_params.get("filename", "zstack")
-
         # Per-plane sectioned images, accumulated into depth volumes.
         std_volume, avg_volume, event_volume, z_positions = [], [], [], []
         dcam = None
-        # Single archival raw-data file for the whole ORCA stack: every plane's
-        # speckle frames are appended into one multi-page TIFF (instead of one
-        # file per plane).
-        raw_writer = None
 
         try:
             if self.camera == "orca":
                 dcam = self._open_orca()
-                if out_dir and self.save_params.get("save_raw", True):
-                    raw_writer = RawStackTiffWriter(
-                        os.path.join(out_dir, f"raw_stack_{filename}.tif")
-                    )
 
             # Move to the start of the stack.
             self.status_update.emit(f"Moving to start position {init_pos:.4f} µm...")
@@ -110,7 +100,7 @@ class AutomatedZStackWorker(QThread):
                 z_now = float(self.pidevice.qPOS(self.axis)[self.axis])
 
                 if self.camera == "orca":
-                    result = self._capture_plane_orca(dcam, raw_writer)
+                    result = self._capture_plane_orca(dcam, step)
                     if result is not None:
                         avg_img, std_img = result
                         avg_volume.append(avg_img)
@@ -119,7 +109,7 @@ class AutomatedZStackWorker(QThread):
                         self.image_ready.emit(normalize_to_8bit(std_img))
                         self.z_profile_update.emit(float(np.sum(std_img)), step)
                 else:
-                    event_img = self._capture_plane_event(out_dir, filename, step)
+                    event_img = self._capture_plane_event(step)
                     if event_img is not None:
                         event_volume.append(event_img)
                         z_positions.append(z_now)
@@ -151,14 +141,6 @@ class AutomatedZStackWorker(QThread):
                     Dcamapi.uninit()
                 except Exception:
                     pass
-        finally:
-            # Finalize the single raw-data TIFF, flushing whatever planes were
-            # appended (so a partial/aborted stack still yields a valid file).
-            if raw_writer is not None:
-                try:
-                    raw_writer.close()
-                except Exception:
-                    pass
 
     # ------------------------------------------------------------------ ORCA
     def _open_orca(self):
@@ -171,12 +153,13 @@ class AutomatedZStackWorker(QThread):
         dcam.prop_setvalue(DCAM_EXPOSURE_PROP, self.orca_params["orca_exposure"] / 1000.0)
         return dcam
 
-    def _capture_plane_orca(self, dcam, raw_writer):
+    def _capture_plane_orca(self, dcam, step):
         """Acquire a frame stack at the current plane; return (avg, std) images.
 
-        When ``raw_writer`` is provided, this plane's raw frames are appended to
-        the single shared multi-page raw TIFF (plane-major order) rather than
-        written to a separate per-plane file.
+        When raw saving is enabled, this plane's raw frames are written to their
+        own multi-page TIFF (``raw_stack_<filename>_zNNN.tif``) — one file per
+        plane, so the downstream MATLAB algorithms can consume the planes
+        individually rather than as one combined volume.
         """
         num_frames = self.orca_params["orca_frames"]
         roi = self.orca_params["orca_roi"]
@@ -184,33 +167,48 @@ class AutomatedZStackWorker(QThread):
         if not dcam.buf_alloc(num_frames):
             raise RuntimeError(f"buf_alloc failed: {dcam.lasterr()}")
 
-        acquired_stack = []
+        # Copy each frame straight into a single preallocated array instead of a
+        # growing list of np.copy'd frames + a later np.array() of it (that held
+        # two full copies of the stack in RAM at once). The camera's own ring
+        # buffer already holds N frames; this keeps the host-side overhead to one.
+        raw_stack = None
+        count = 0
         try:
             if dcam.cap_start():
                 for i in range(num_frames):
                     if not self._is_running:
                         break
                     if dcam.wait_capevent_frameready(2000):
-                        acquired_stack.append(np.copy(dcam.buf_getframedata(i)))
+                        frame = dcam.buf_getframedata(i)
+                        if raw_stack is None:
+                            raw_stack = np.empty((num_frames,) + frame.shape, dtype=frame.dtype)
+                        raw_stack[i] = frame  # copies out of the SDK ring buffer
+                        count += 1
                     else:
                         raise RuntimeError(f"Frame timeout: {dcam.lasterr()}")
                 dcam.cap_stop()
         finally:
             dcam.buf_release()
 
-        if not self._is_running or len(acquired_stack) != num_frames:
+        if not self._is_running or count != num_frames:
             return None
 
-        raw_stack = np.array(acquired_stack)
-        if raw_writer is not None:
-            raw_writer.append(raw_stack, roi)
+        out_dir = self.save_params.get("output_dir", "")
+        if out_dir and self.save_params.get("save_raw", True):
+            filename = self.save_params.get("filename", "zstack")
+            save_raw_stack_tiff(raw_stack, out_dir, f"{filename}_z{step:03d}", roi)
         return compute_dsi_images(raw_stack, roi)
 
     # ----------------------------------------------------------------- EVENT
-    def _capture_plane_event(self, out_dir, filename, step):
+    def _capture_plane_event(self, step):
         """Record events for a fixed duration at the current plane and accumulate
-        them into an event image. The raw .raw event file is the per-plane raw
-        data. The device is (re)initialized per plane for a clean state."""
+        them directly into an event image.
+
+        No per-plane ``.raw`` file is written: the events are summed straight
+        from the live stream, so the only EVK4 output is the consolidated
+        sectioned 3D TIFF depth volume (the "save raw" option is ORCA-only). The
+        device is (re)initialized per plane for a clean state.
+        """
         p = self.evk4_params
         device = initiate_device("")
 
@@ -226,39 +224,26 @@ class AutomatedZStackWorker(QThread):
             erc.enable(True)
             erc.set_cd_event_rate(EVK4_ERC_RATE)
 
-        save_raw = self.save_params.get("save_raw", True)
-        raw_path = ""
-        if out_dir and device.get_i_events_stream():
-            raw_path = os.path.join(out_dir, f"{filename}_z{step:03d}.raw")
-            device.get_i_events_stream().log_raw_data(raw_path)
-
         mv_iterator = EventsIterator.from_device(device=device)
         height, width = mv_iterator.get_size()
 
         self.status_update.emit(f"Recording events at plane {step+1} for {p['acqu_time']} s...")
-        start = time.time()
-        try:
-            for _ in mv_iterator:
+
+        def events_for_duration():
+            """Yield event chunks until the acquisition time elapses or the user
+            aborts — so accumulation streams with flat memory and no raw file."""
+            start = time.time()
+            for evs in mv_iterator:
                 if not self._is_running:
-                    break
+                    return
+                yield evs
                 if time.time() - start >= p["acqu_time"]:
-                    break
-        finally:
-            if device.get_i_events_stream():
-                device.get_i_events_stream().stop_log_raw_data()
+                    return
 
-        if not raw_path:
+        event_img = accumulate_event_frame(events_for_duration(), width, height)
+
+        if not self._is_running:
             return None
-
-        # Rebuild the event image from the just-saved raw file.
-        event_img = accumulate_event_frame(
-            EventsIterator(input_path=raw_path, delta_t=1000000), width, height
-        )
-        if not save_raw:
-            try:
-                os.remove(raw_path)
-            except OSError:
-                pass
         if p.get("filter_crazy_pixels", True):
             event_img = filter_crazy_pixels(event_img)
         if p.get("apply_smoothing", True):
@@ -275,16 +260,33 @@ class AutomatedZStackWorker(QThread):
             return ""
 
         n = 0
+        sectioned, kind = None, None
         if self.camera == "orca" and std_volume:
             save_volume_tiff(np.array(std_volume, dtype=np.float32), out_dir, filename, "zstack_dsi")
             save_volume_tiff(np.array(avg_volume, dtype=np.float32), out_dir, filename, "zstack_average")
             n = len(std_volume)
+            sectioned, kind = std_volume, "dsi"
         elif self.camera == "event" and event_volume:
             save_volume_tiff(np.array(event_volume, dtype=np.float32), out_dir, filename, "zstack_event")
             n = len(event_volume)
+            sectioned, kind = event_volume, "event"
 
         if n == 0:
             return ""
+
+        # Axial-sectioning profile (paper Fig. 3a): the mean intensity of each
+        # plane's optically-sectioned image vs axial position, Gaussian-fitted to
+        # extract the FWHM (= axial sectioning). The profile data is always saved
+        # as CSV; the PNG figure needs matplotlib.
+        profile_msg = ""
+        intensities = [float(np.mean(img)) for img in sectioned]
+        fwhm, _, png_path = save_axial_sectioning_plot(
+            z_positions[:n], intensities, out_dir, filename, kind
+        )
+        if fwhm is not None:
+            profile_msg = f" Axial FWHM ≈ {fwhm:.2f} µm."
+        if png_path is None:
+            profile_msg += " (install matplotlib for the profile PNG)"
 
         metadata = self.save_params.get("metadata")
         if metadata:
@@ -296,7 +298,7 @@ class AutomatedZStackWorker(QThread):
             }
             save_parameter_log(out_dir, filename, metadata)
 
-        return f" Saved {n} planes (3D TIFF) to {out_dir}"
+        return f" Saved {n} planes (3D TIFF) to {out_dir}.{profile_msg}"
 
     def _emit_position(self):
         """Report the real axis position so the UI readout tracks the stack."""

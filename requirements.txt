@@ -15,6 +15,11 @@ scipy
 opencv-python
 PyQt6
 
+# Axial-sectioning plot saved after a Z-stack (paper Fig. 3a: mean DSI intensity
+# vs z + Gaussian fit → FWHM). Optional: without it the profile data is still
+# saved as CSV (with the fit), only the PNG figure is skipped.
+matplotlib
+
 # Raw Z-stack saving: enables streaming BigTIFF writes (flat memory, no 4 GB
 # classic-TIFF limit). Without it the app falls back to an in-memory OpenCV
 # write, which is fine only for small stacks.

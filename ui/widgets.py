@@ -6,14 +6,16 @@ hardware-layer controllers (AWGController, StageController) and workers (PIMoveW
 
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen
 
 from config import (
     DCAM_BINNING_OPTIONS, DCAM_DEFECTCORRECT_OPTIONS, DCAM_READOUTSPEED_OPTIONS,
     DCAM_TRIGGER_MODE_OPTIONS, DCAM_TRIGGERSOURCE_OPTIONS,
-    ORCA_ROW_READOUT_US,
+    ORCA_DSI_PROCESS_PIXELS_PER_S, ORCA_ROW_READOUT_US,
+    ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT, ZSTACK_DISK_BYTES_PER_S,
 )
 from hardware.awg_control import AWGController
 from hardware.stage_control import PI_AVAILABLE, PIMoveWorker, StageController
@@ -112,6 +114,10 @@ class OrcaParamsWidget(QWidget):
     cropping, and camera mode/readout. Used in both the Scientific Camera tab and
     the Z-Stack tab."""
 
+    # Emitted (debounced) whenever ROI geometry — size or centre offset — changes,
+    # so a running live feed can be re-framed/re-centred without clicking Apply.
+    roi_changed = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
@@ -119,7 +125,10 @@ class OrcaParamsWidget(QWidget):
 
         setup_group = QGroupBox("Hamamatsu ORCA Setup")
         setup_form = QFormLayout()
-        self.spin_exp = QDoubleSpinBox(); self.spin_exp.setRange(0.1, 10000); self.spin_exp.setDecimals(1); self.spin_exp.setValue(50)
+        # Min 0.017 ms = 17 µs (the Fast-scan exposure floor from the manual).
+        # 3 decimals so sub-millisecond exposures can be dialled in — required to
+        # reach the high framerates (low exposure + small ROI on Fast scan).
+        self.spin_exp = QDoubleSpinBox(); self.spin_exp.setRange(0.017, 10000); self.spin_exp.setDecimals(3); self.spin_exp.setValue(50)
         self.spin_exp.setSuffix(" ms")
         self.spin_frames = QSpinBox(); self.spin_frames.setRange(2, 1000); self.spin_frames.setValue(100)
         setup_form.addRow("Exposure Time (texp):", self.spin_exp)
@@ -142,12 +151,13 @@ class OrcaParamsWidget(QWidget):
         mode_group.setLayout(mode_form)
         layout.addWidget(mode_group)
 
-        roi_group = QGroupBox("Region of Interest — Centered Hardware Crop")
+        roi_group = QGroupBox("Region of Interest — Hardware Crop")
         roi_form = QFormLayout()
-        # Crop is always centred on the sensor (1152, 1152 for ORCA-Fusion).
-        # The camera uses DCAM subarray mode so only the selected region is read
-        # out, increasing the maximum framerate proportionally. Values must be
-        # multiples of 4; the camera rejects anything else.
+        # The crop defaults to the sensor centre and can be shifted by the centre
+        # offset below. The camera uses DCAM subarray mode so only the selected
+        # region is read out, increasing the maximum framerate proportionally.
+        # Size and position must be multiples of 4; the camera rejects anything
+        # else (and falls back to a slow software crop), so _compute_roi aligns them.
         self.spin_roi_width = QSpinBox()
         self.spin_roi_width.setRange(4, 2304)
         self.spin_roi_width.setSingleStep(4)
@@ -158,11 +168,23 @@ class OrcaParamsWidget(QWidget):
         self.spin_roi_height.setSingleStep(4)
         self.spin_roi_height.setValue(2304)
         self.spin_roi_height.setSuffix(" px")
+        # Offset of the crop centre relative to the sensor centre, in pixels.
+        # The laser is not always centred on the sensor, so the crop can be
+        # shifted to follow it. Positive X = right, positive Y = down. These are
+        # draggable sliders (drag, click-to-jump, or scroll-wheel over them) with
+        # a live value label — far quicker than typing. Step 4 keeps the
+        # resulting subarray position aligned to the required grid.
+        self.slider_offset_x, offset_x_row = self._make_offset_slider(ORCA_SENSOR_WIDTH // 2)
+        self.slider_offset_y, offset_y_row = self._make_offset_slider(ORCA_SENSOR_HEIGHT // 2)
         roi_form.addRow("Width:", self.spin_roi_width)
         roi_form.addRow("Height:", self.spin_roi_height)
+        roi_form.addRow("Centre offset X:", offset_x_row)
+        roi_form.addRow("Centre offset Y:", offset_y_row)
         lbl_roi = QLabel(
-            "Full sensor: 2304 × 2304 px. Reducing the size crops to the centre "
-            "and enables hardware subarray mode, increasing the framerate."
+            "Full sensor: 2304 × 2304 px. Reducing the size enables hardware "
+            "subarray mode, increasing the framerate. The centre offset shifts "
+            "the crop off-centre to follow the laser; the region is clamped to "
+            "the sensor and aligned to a multiple of 4 px."
         )
         lbl_roi.setWordWrap(True)
         lbl_roi.setStyleSheet("color: #888888; font-size: 11px;")
@@ -181,21 +203,84 @@ class OrcaParamsWidget(QWidget):
         self.combo_readout.currentIndexChanged.connect(self._update_framerate)
         self._update_framerate()
 
+        # Debounced live re-framing: changing any ROI geometry (size or centre
+        # offset) emits `roi_changed` shortly after the user stops adjusting, so
+        # main_window can re-apply it to a running live feed and the crop follows
+        # the slider in real time (used to centre the crop on the speckle). The
+        # debounce coalesces the burst of valueChanged events from a drag into a
+        # single re-apply, avoiding a capture restart on every pixel.
+        self._roi_debounce = QTimer(self)
+        self._roi_debounce.setSingleShot(True)
+        self._roi_debounce.setInterval(200)
+        self._roi_debounce.timeout.connect(self.roi_changed.emit)
+        for signal in (
+            self.spin_roi_width.valueChanged,
+            self.spin_roi_height.valueChanged,
+            self.slider_offset_x.valueChanged,
+            self.slider_offset_y.valueChanged,
+        ):
+            signal.connect(lambda *_: self._roi_debounce.start())
+
         # Single button that sends all ORCA settings (exposure, mode, ROI) to the
         # running live-feed worker. Enabled only while live mode is active.
         self.btn_apply_live = QPushButton("Apply All Settings to Live Feed")
         self.btn_apply_live.setEnabled(False)
         layout.addWidget(self.btn_apply_live)
 
+    def _make_offset_slider(self, limit):
+        """Build a draggable centre-offset slider (range ±limit px) paired with a
+        live value label. Returns (slider, row_layout) for the form."""
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-limit, limit)
+        slider.setSingleStep(4)   # arrow keys / scroll wheel step
+        slider.setPageStep(40)    # click-in-trough jump
+        slider.setMinimumWidth(140)  # wide enough to grab and drag comfortably
+        slider.setValue(0)
+        value_lbl = QLabel("0 px")
+        value_lbl.setMinimumWidth(56)
+        value_lbl.setStyleSheet("color: #cccccc;")
+        slider.valueChanged.connect(lambda v: value_lbl.setText(f"{v} px"))
+        row = QHBoxLayout()
+        row.addWidget(slider, stretch=1)
+        row.addWidget(value_lbl)
+        return slider, row
+
+    def estimated_raw_save_s(self, n):
+        """Estimated time to write the N-frame raw 16-bit stack to disk.
+
+        The raw TIFF dominates the wall-clock time of a full-frame acquisition,
+        so the duration estimate must include it. Bytes = N · width · height · 2
+        (uint16), divided by an assumed sustained disk write rate.
+        """
+        roi = self._compute_roi()
+        w = roi["x_max"] - roi["x_min"]
+        h = roi["y_max"] - roi["y_min"]
+        return (n * w * h * 2) / ZSTACK_DISK_BYTES_PER_S
+
+    def estimated_compute_s(self, n):
+        """Estimated time to reconstruct the DSI images for an N-frame stack.
+
+        The average + standard-deviation reconstruction runs once per plane over
+        N·width·height pixels; at full sensor it is several seconds and was
+        previously omitted from the duration estimate, which is the main cause of
+        the Z-stack running longer than predicted.
+        """
+        roi = self._compute_roi()
+        w = roi["x_max"] - roi["x_min"]
+        h = roi["y_max"] - roi["y_min"]
+        return (n * w * h) / ORCA_DSI_PROCESS_PIXELS_PER_S
+
     def estimated_frame_time_s(self):
         """Estimated time per frame (seconds) — the longer of exposure and readout.
 
-        Used by main_window to compute acquisition duration estimates without
-        importing ORCA hardware constants directly.
+        The readout term follows the manual's free-running formula (Vn+1)*1H,
+        where Vn is the subarray height in rows and 1H is the per-row readout
+        time for the selected scan speed. Used by main_window to compute
+        acquisition duration estimates without importing ORCA constants directly.
         """
         texp_s = self.spin_exp.value() / 1000.0
-        row_us = ORCA_ROW_READOUT_US.get(self.combo_readout.currentData(), 4.34)
-        readout_s = self.spin_roi_height.value() * row_us * 1e-6
+        row_us = ORCA_ROW_READOUT_US.get(self.combo_readout.currentData(), 18.64706)
+        readout_s = (self.spin_roi_height.value() + 1) * row_us * 1e-6
         return max(texp_s, readout_s)
 
     def _update_framerate(self):
@@ -204,8 +289,8 @@ class OrcaParamsWidget(QWidget):
         fps = 1.0 / frame_s
         h = self.spin_roi_height.value()
         texp_s = self.spin_exp.value() / 1000.0
-        row_us = ORCA_ROW_READOUT_US.get(self.combo_readout.currentData(), 4.34)
-        readout_s = h * row_us * 1e-6
+        row_us = ORCA_ROW_READOUT_US.get(self.combo_readout.currentData(), 18.64706)
+        readout_s = (h + 1) * row_us * 1e-6
 
         if readout_s <= texp_s:
             limit = "exposure-limited"
@@ -218,12 +303,23 @@ class OrcaParamsWidget(QWidget):
             self.lbl_framerate.setText(f"Max framerate: ≈ {fps:.0f} fps ({h} px height, {limit})")
 
     def _compute_roi(self):
-        """Compute centred x_min/x_max/y_min/y_max from width and height spinboxes."""
-        sw, sh = 2304, 2304
-        w = self.spin_roi_width.value()
-        h = self.spin_roi_height.value()
-        x_min = (sw - w) // 2
-        y_min = (sh - h) // 2
+        """Compute x_min/x_max/y_min/y_max from the width, height and centre-offset
+        spinboxes.
+
+        The crop starts centred on the sensor, is shifted by the user offset,
+        then clamped so it stays fully on the sensor and floored to a multiple of
+        4 px. DCAM requires the subarray position to be a multiple of 4; an
+        unaligned position is rejected and silently degrades to a slow software
+        crop, so the alignment here is what keeps the hardware framerate gain.
+        """
+        sw, sh = ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
+        w = self.spin_roi_width.value() // 4 * 4
+        h = self.spin_roi_height.value() // 4 * 4
+        x_min = (sw - w) // 2 + self.slider_offset_x.value()
+        y_min = (sh - h) // 2 + self.slider_offset_y.value()
+        # Keep the region on the sensor, then align the position to a 4 px grid.
+        x_min = max(0, min(x_min, sw - w)) // 4 * 4
+        y_min = max(0, min(y_min, sh - h)) // 4 * 4
         return {"x_min": x_min, "x_max": x_min + w, "y_min": y_min, "y_max": y_min + h}
 
     def get_params(self):
@@ -255,6 +351,8 @@ class OrcaParamsWidget(QWidget):
             "frames": self.spin_frames.value(),
             "roi_width": self.spin_roi_width.value(),
             "roi_height": self.spin_roi_height.value(),
+            "roi_offset_x": self.slider_offset_x.value(),
+            "roi_offset_y": self.slider_offset_y.value(),
             "readout_speed": self.combo_readout.currentData(),
             "binning": self.combo_binning.currentData(),
             "trigger_source": self.combo_trigsrc.currentData(),
@@ -272,6 +370,10 @@ class OrcaParamsWidget(QWidget):
             self.spin_roi_width.setValue(int(data["roi_width"]))
         if "roi_height" in data:
             self.spin_roi_height.setValue(int(data["roi_height"]))
+        if "roi_offset_x" in data:
+            self.slider_offset_x.setValue(int(data["roi_offset_x"]))
+        if "roi_offset_y" in data:
+            self.slider_offset_y.setValue(int(data["roi_offset_y"]))
         for key, combo in [
             ("readout_speed", self.combo_readout),
             ("binning", self.combo_binning),
@@ -627,3 +729,149 @@ class PIStageWidget(QWidget):
     def close_device(self):
         self.position_timer.stop()
         self.controller.close()
+
+
+class VideoFeedLabel(QLabel):
+    """Video-feed display with an interactive crop-region selector.
+
+    Normally it behaves like the plain QLabel that showed the live image. In
+    *crop mode* the user drags a rectangle over the (full-sensor) image; the
+    selection is drawn as a bright box with dashed guide lines extending across
+    the frame, and is kept on screen after the mouse is released so the crop can
+    be reviewed *before* it is applied. ``region_drawn`` reports the selection in
+    source-image pixel coordinates (x, y, w, h) of the frame currently displayed.
+
+    The widget knows the source frame size (``set_source_size``) so it can map
+    between widget coordinates and image pixels; the pixmap is assumed centred
+    (the label uses ``AlignCenter``) and pre-scaled with KeepAspectRatio.
+    """
+
+    region_drawn = pyqtSignal(int, int, int, int)  # x, y, w, h in image pixels
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._src_w = None        # source frame width in pixels
+        self._src_h = None        # source frame height in pixels
+        self._crop_mode = False
+        self._origin = None       # drag start (widget coords)
+        self._cur = None          # current drag point (widget coords)
+        self._selection = None    # committed selection as QRect in image pixels
+
+    def set_source_size(self, w, h):
+        """Tell the label the pixel size of the frame currently shown."""
+        if (w, h) != (self._src_w, self._src_h):
+            self._src_w, self._src_h = w, h
+            # A frame of a different size means the old selection no longer maps.
+            self._selection = None
+
+    def set_crop_mode(self, on):
+        self._crop_mode = bool(on)
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if not on:
+            self._origin = self._cur = None
+        self.update()
+
+    def clear_selection(self):
+        self._selection = None
+        self._origin = self._cur = None
+        self.update()
+
+    def _image_rect(self):
+        """Return (rect, scale): the widget-coordinate rectangle the pixmap
+        occupies (centred) and the image-px -> widget-px scale, or (None, 1.0)."""
+        pm = self.pixmap()
+        if pm is None or pm.isNull() or not self._src_w or not self._src_h:
+            return None, 1.0
+        pw, ph = pm.width(), pm.height()
+        x = (self.width() - pw) // 2
+        y = (self.height() - ph) // 2
+        return QRect(x, y, pw, ph), (pw / self._src_w)
+
+    def _clamp(self, point):
+        """Clamp a widget-coordinate point to the displayed image rectangle."""
+        rect, _ = self._image_rect()
+        if rect is None:
+            return point
+        x = min(max(point.x(), rect.left()), rect.right())
+        y = min(max(point.y(), rect.top()), rect.bottom())
+        return point.__class__(x, y)
+
+    def mousePressEvent(self, event):
+        rect, _ = self._image_rect()
+        if (self._crop_mode and event.button() == Qt.MouseButton.LeftButton
+                and rect is not None and rect.contains(event.pos())):
+            self._origin = event.pos()
+            self._cur = event.pos()
+            self.update()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._crop_mode and self._origin is not None:
+            self._cur = self._clamp(event.pos())
+            self.update()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._crop_mode and self._origin is not None:
+            self._cur = self._clamp(event.pos())
+            self._commit_selection()
+            self._origin = None
+            self.update()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _commit_selection(self):
+        """Convert the dragged widget rectangle into image pixels, store and emit."""
+        rect, scale = self._image_rect()
+        if rect is None or self._origin is None or self._cur is None or scale <= 0:
+            return
+        wr = QRect(self._origin, self._cur).normalized()
+        ix = int(round((wr.left() - rect.left()) / scale))
+        iy = int(round((wr.top() - rect.top()) / scale))
+        iw = int(round(wr.width() / scale))
+        ih = int(round(wr.height() / scale))
+        # Clamp to the frame.
+        ix = max(0, min(ix, self._src_w - 1))
+        iy = max(0, min(iy, self._src_h - 1))
+        iw = max(1, min(iw, self._src_w - ix))
+        ih = max(1, min(ih, self._src_h - iy))
+        if iw < 4 or ih < 4:  # ignore an accidental click / tiny drag
+            return
+        self._selection = QRect(ix, iy, iw, ih)
+        self.region_drawn.emit(ix, iy, iw, ih)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)  # draws the pixmap / text as usual
+        if not self._crop_mode:
+            return
+        rect, scale = self._image_rect()
+        if rect is None:
+            return
+
+        # The box to draw: the live drag if one is in progress, otherwise the
+        # committed selection mapped back into widget coordinates.
+        if self._origin is not None and self._cur is not None:
+            box = QRect(self._origin, self._cur).normalized()
+        elif self._selection is not None:
+            box = QRect(
+                int(rect.left() + self._selection.left() * scale),
+                int(rect.top() + self._selection.top() * scale),
+                int(self._selection.width() * scale),
+                int(self._selection.height() * scale),
+            )
+        else:
+            return
+
+        painter = QPainter(self)
+        # Dashed guide lines spanning the frame through the selection edges.
+        painter.setPen(QPen(QColor(0, 230, 118, 130), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(box.left(), rect.top(), box.left(), rect.bottom())
+        painter.drawLine(box.right(), rect.top(), box.right(), rect.bottom())
+        painter.drawLine(rect.left(), box.top(), rect.right(), box.top())
+        painter.drawLine(rect.left(), box.bottom(), rect.right(), box.bottom())
+        # The selection rectangle itself.
+        painter.setPen(QPen(QColor("#00e676"), 2, Qt.PenStyle.SolidLine))
+        painter.drawRect(box)
+        painter.end()

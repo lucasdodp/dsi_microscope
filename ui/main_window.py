@@ -6,10 +6,11 @@ orchestrator, routing every worker's status_update / error_signal back to the si
 """
 
 import json
+import os
 import time
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel,
@@ -17,11 +18,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from config import (
+    EVK4_PLANE_OVERHEAD_S, ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S,
+    ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH, SESSION_STATE_PATH,
+)
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
 from ui.orchestrator import AutomatedZStackWorker
 from ui.widgets import (
-    AWGWidget, Evk4ParamsWidget, OrcaParamsWidget, PIStageWidget,
+    AWGWidget, Evk4ParamsWidget, OrcaParamsWidget, PIStageWidget, VideoFeedLabel,
 )
 
 
@@ -34,6 +39,21 @@ class MainWindow(QMainWindow):
         self.orca_worker = None
         self.zstack_worker = None
         self.zstack_live_worker = None
+        self._current_frame = None   # last frame shown (image pixels), for the crop tool
+        self._crop_region = None     # pending crop selection (x, y, w, h) in frame px
+        # Remembers the last auto-generated timestamp default for each filename
+        # field, so the field is only re-stamped while it still holds that default
+        # (a name the user typed themselves is never overwritten).
+        self._fn_defaults = {}
+
+        # Live elapsed-time readout: while an acquisition runs, the relevant tab's
+        # time label shows "Elapsed: mm:ss" (ground truth vs the rough estimate).
+        self._acq_timer = QTimer(self)
+        self._acq_timer.setInterval(1000)
+        self._acq_timer.timeout.connect(self._tick_elapsed)
+        self._acq_start = None      # time.time() when the acquisition started
+        self._acq_label = None      # QLabel to update with the elapsed time
+        self._acq_restore = None    # callable that restores the estimate text
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -123,12 +143,19 @@ class MainWindow(QMainWindow):
         feed_layout = QVBoxLayout(feed_panel)
         feed_layout.setContentsMargins(2, 2, 2, 2)
 
-        self.video_label = QLabel("Video Feed Offline")
+        self.video_label = VideoFeedLabel("Video Feed Offline")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setStyleSheet("color: #555555; font-size: 24px; font-weight: bold; border: none;")
-        feed_layout.addWidget(self.video_label)
+        self.video_label.region_drawn.connect(self._on_crop_region_drawn)
+        feed_layout.addWidget(self.video_label, stretch=1)
+
+        feed_layout.addWidget(self._build_crop_bar())
 
         main_layout.addWidget(feed_panel, stretch=1)
+
+        # Restore the parameters saved when the app was last closed, so a session
+        # starts where the previous one left off (silent if there is no state file).
+        self._load_session()
 
     def _toggle_awg(self, expanded):
         self.awg_widget.setVisible(expanded)
@@ -182,7 +209,8 @@ class MainWindow(QMainWindow):
         dir_layout.addWidget(self.txt_dir); dir_layout.addWidget(btn_dir)
         out_layout.addLayout(dir_layout)
         out_layout.addWidget(QLabel("Filename Base:"))
-        self.txt_filename = QLineEdit(f"recording_{time.strftime('%y%m%d_%H%M%S')}")
+        self.txt_filename = QLineEdit()
+        self._stamp_default_filename(self.txt_filename, "recording")
         out_layout.addWidget(self.txt_filename)
         self.chk_evk4_raw = QCheckBox("Save raw event recording (.raw)")
         self.chk_evk4_raw.setChecked(False)
@@ -220,6 +248,7 @@ class MainWindow(QMainWindow):
         self.orca_params.spin_frames.valueChanged.connect(self._update_orca_time)
         self.orca_params.spin_exp.valueChanged.connect(self._update_orca_time)
         self.orca_params.spin_roi_height.valueChanged.connect(self._update_orca_time)
+        self.orca_params.spin_roi_width.valueChanged.connect(self._update_orca_time)
         self.orca_params.combo_readout.currentIndexChanged.connect(self._update_orca_time)
         orca_layout.addWidget(self.orca_params)
 
@@ -234,10 +263,12 @@ class MainWindow(QMainWindow):
         orca_dir_layout.addWidget(self.txt_orca_dir); orca_dir_layout.addWidget(btn_orca_dir)
         orca_dsi_layout.addLayout(orca_dir_layout)
         orca_dsi_layout.addWidget(QLabel("Filename Base:"))
-        self.txt_orca_filename = QLineEdit(f"dsi_{time.strftime('%y%m%d_%H%M%S')}")
+        self.txt_orca_filename = QLineEdit()
+        self._stamp_default_filename(self.txt_orca_filename, "dsi")
         orca_dsi_layout.addWidget(self.txt_orca_filename)
         self.chk_orca_raw = QCheckBox("Save raw 16-bit speckle stack (3D TIFF)")
         self.chk_orca_raw.setChecked(True)
+        self.chk_orca_raw.stateChanged.connect(self._update_orca_time)
         orca_dsi_layout.addWidget(self.chk_orca_raw)
         self.btn_orca_acquire = QPushButton("⬤  Start DSI Acquisition")
         self.btn_orca_acquire.setObjectName("btnAcquire")
@@ -265,8 +296,21 @@ class MainWindow(QMainWindow):
         self.tab_zstack = QWidget()
         zstack_layout = QVBoxLayout(self.tab_zstack)
 
-        # 1. Live / Stop always at the top — start live first so you can watch
-        #    the sample while moving the stage to the starting focal plane.
+        # 1. Camera selection at the very top — the live preview, parameters and
+        #    acquisition below all act on the selected camera, so it is more
+        #    intuitive to choose it first.
+        cam_group = QGroupBox("Acquisition Camera")
+        cam_layout = QHBoxLayout()
+        cam_layout.addWidget(QLabel("Acquisition Camera:"))
+        self.combo_zstack_camera = QComboBox()
+        self.combo_zstack_camera.addItem("Scientific Camera (ORCA)", "orca")
+        self.combo_zstack_camera.addItem("Event Camera (EVK4)", "event")
+        cam_layout.addWidget(self.combo_zstack_camera, stretch=1)
+        cam_group.setLayout(cam_layout)
+        zstack_layout.addWidget(cam_group)
+
+        # 2. Live / Stop — start live first so you can watch the sample while
+        #    moving the stage to the starting focal plane.
         live_group = QGroupBox("Live Preview")
         live_layout = QHBoxLayout()
         self.btn_zstack_live = QPushButton("▶  Start Live (selected camera)")
@@ -281,23 +325,15 @@ class MainWindow(QMainWindow):
         live_group.setLayout(live_layout)
         zstack_layout.addWidget(live_group)
 
-        # 2. PI stage — position the sample while watching the live feed above.
+        # 3. PI stage — position the sample while watching the live feed above.
         self.pi_stage_widget = PIStageWidget()
         zstack_layout.addWidget(self.pi_stage_widget)
 
-        # 3. Acquisition group — select camera, set parameters and output path,
-        #    then launch the stack once the sample is positioned correctly.
+        # 4. Acquisition group — set parameters and output path, then launch the
+        #    stack (for the camera chosen at the top) once the sample is
+        #    positioned correctly.
         auto_z_group = QGroupBox("Automated 3D DSI Acquisition")
         auto_z_layout = QVBoxLayout()
-
-        cam_layout = QHBoxLayout()
-        cam_layout.addWidget(QLabel("Acquisition Camera:"))
-        self.combo_zstack_camera = QComboBox()
-        self.combo_zstack_camera.addItem("Scientific Camera (ORCA)", "orca")
-        self.combo_zstack_camera.addItem("Event Camera (EVK4)", "event")
-        self.combo_zstack_camera.currentIndexChanged.connect(self._on_zstack_camera_changed)
-        cam_layout.addWidget(self.combo_zstack_camera, stretch=1)
-        auto_z_layout.addLayout(cam_layout)
 
         # Full, independent parameter controls for each camera; only the selected
         # camera's controls are shown.
@@ -312,11 +348,15 @@ class MainWindow(QMainWindow):
             self.zstack_orca_params.spin_frames.valueChanged,
             self.zstack_orca_params.spin_exp.valueChanged,
             self.zstack_orca_params.spin_roi_height.valueChanged,
+            self.zstack_orca_params.spin_roi_width.valueChanged,
             self.zstack_orca_params.combo_readout.currentIndexChanged,
             self.zstack_evk4_params.spin_time.valueChanged,
         ):
             sig.connect(self._update_zstack_time)
         self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_zstack_time)
+        # Connected here (not at combo creation) so the slots run only once the
+        # per-camera parameter widgets above exist to be shown/hidden.
+        self.combo_zstack_camera.currentIndexChanged.connect(self._on_zstack_camera_changed)
         self.combo_zstack_camera.currentIndexChanged.connect(self._update_zstack_time)
 
         auto_z_layout.addWidget(QLabel("Output Directory:"))
@@ -328,13 +368,15 @@ class MainWindow(QMainWindow):
         auto_z_layout.addLayout(zstack_dir_layout)
 
         auto_z_layout.addWidget(QLabel("Filename Base:"))
-        self.txt_zstack_filename = QLineEdit(f"zstack_{time.strftime('%y%m%d_%H%M%S')}")
+        self.txt_zstack_filename = QLineEdit()
+        self._stamp_default_filename(self.txt_zstack_filename, "zstack")
         auto_z_layout.addWidget(self.txt_zstack_filename)
 
-        # Raw data (ORCA: all planes' speckle frames in one multi-page TIFF for
-        # the MATLAB RIM algorithm / EVK4: one .raw event file per plane).
-        self.chk_zstack_raw = QCheckBox("Save raw data (for RIM / re-processing)")
+        # Raw data (ORCA: each plane's speckle frames in its own multi-page TIFF —
+        # one file per plane — for the MATLAB RIM algorithm; EVK4: not saved).
+        self.chk_zstack_raw = QCheckBox("Save raw speckle stack — ORCA only (for RIM / re-processing)")
         self.chk_zstack_raw.setChecked(True)
+        self.chk_zstack_raw.stateChanged.connect(self._update_zstack_time)
         auto_z_layout.addWidget(self.chk_zstack_raw)
 
         lbl_zstack_info = QLabel(
@@ -370,44 +412,116 @@ class MainWindow(QMainWindow):
     # Acquisition time estimates
     # ==========================
     def _update_evk4_time(self):
+        if self._acq_label is self.lbl_evk4_time:
+            return  # acquisition running: leave the live elapsed readout alone
         t = self.evk4_params.spin_time.value()
         self.lbl_evk4_time.setText(f"Duration: {t} s")
 
+    @staticmethod
+    def _fmt_dur(seconds):
+        """Format a duration in seconds as a compact human-readable string."""
+        total = int(round(seconds))
+        m, s = divmod(total, 60)
+        if m >= 60:
+            h, m = divmod(m, 60)
+            return f"{h} h {m:02d} min"
+        if m > 0:
+            return f"{m} min {s:02d} s"
+        return f"{s} s"
+
     def _update_orca_time(self):
+        if self._acq_label is self.lbl_orca_time:
+            return  # acquisition running: leave the live elapsed readout alone
         n = self.orca_params.spin_frames.value()
         frame_s = self.orca_params.estimated_frame_time_s()
-        total_s = n * frame_s
         fps = 1.0 / frame_s
+        # Capture + camera start-up + DSI reconstruction + (optional) raw-stack
+        # disk write. The compute and disk terms dominate for large full-frame
+        # stacks; the per-plane DSI compute was previously left out entirely.
+        compute_s = self.orca_params.estimated_compute_s(n)
+        save_s = self.orca_params.estimated_raw_save_s(n) if self.chk_orca_raw.isChecked() else 0.0
+        total_s = ORCA_CAMERA_INIT_S + n * frame_s + compute_s + save_s
         self.lbl_orca_time.setText(
-            f"≈ {total_s:.0f} s  ({n} frames at ≈ {fps:.0f} fps)"
+            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({n} frames @ ≈ {fps:.0f} fps + overhead)"
         )
 
     def _update_zstack_time(self):
+        if self._acq_label is self.lbl_zstack_time:
+            return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
         camera = self.combo_zstack_camera.currentData()
         if camera == "orca":
             n = self.zstack_orca_params.spin_frames.value()
             frame_s = self.zstack_orca_params.estimated_frame_time_s()
-            plane_s = n * frame_s
-        else:
-            plane_s = self.zstack_evk4_params.spin_time.value()
-        overhead_s = 1.0  # rough: ~0.5 s motor move + 0.5 s mechanical settle
-        total_s = steps * (plane_s + overhead_s)
-        mins, secs = divmod(int(round(total_s)), 60)
-        if mins > 0:
-            self.lbl_zstack_time.setText(
-                f"≈ {mins} min {secs:02d} s  "
-                f"({steps} planes × {plane_s + overhead_s:.1f} s/plane)"
+            compute_s = self.zstack_orca_params.estimated_compute_s(n)
+            save_s = (
+                self.zstack_orca_params.estimated_raw_save_s(n)
+                if self.chk_zstack_raw.isChecked() else 0.0
             )
+            # Per plane: motor move + settle, capture, DSI reconstruction, then
+            # raw-frame write. The per-plane compute was previously omitted, which
+            # is the main reason the stack ran longer than estimated.
+            plane_s = ORCA_PLANE_OVERHEAD_S + n * frame_s + compute_s + save_s
+            init_s = ORCA_CAMERA_INIT_S
         else:
-            self.lbl_zstack_time.setText(
-                f"≈ {secs} s  ({steps} planes × {plane_s + overhead_s:.1f} s/plane)"
-            )
+            # Per plane the EVK4 is re-opened and the raw file read back, which
+            # costs several seconds on top of the recording duration itself.
+            plane_s = EVK4_PLANE_OVERHEAD_S + self.zstack_evk4_params.spin_time.value()
+            init_s = 0.0
+        total_s = init_s + steps * plane_s
+        self.lbl_zstack_time.setText(
+            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
+        )
+
+    # ----- live elapsed timer (ground truth during an acquisition) -----
+    def _start_elapsed(self, label, restore):
+        """Begin ticking 'Elapsed: mm:ss' in ``label``; ``restore`` is called on
+        stop to put the estimate back."""
+        self._acq_label = label
+        self._acq_restore = restore
+        self._acq_start = time.time()
+        self._acq_timer.start()
+        self._tick_elapsed()
+
+    def _tick_elapsed(self):
+        if self._acq_start is None or self._acq_label is None:
+            return
+        m, s = divmod(int(time.time() - self._acq_start), 60)
+        self._acq_label.setText(f"Elapsed: {m:02d}:{s:02d}")
+
+    def _stop_elapsed(self):
+        """Stop the elapsed timer and restore the estimate label."""
+        if self._acq_start is None:
+            return
+        self._acq_timer.stop()
+        self._acq_start = None
+        self._acq_label = None
+        restore, self._acq_restore = self._acq_restore, None
+        if restore is not None:
+            restore()
+
+    def _stop_worker_silently(self, worker, finished_slot):
+        """Stop a running worker and wait for it to release its device, WITHOUT
+        firing its finished handler — so a queued ``finished_signal`` from the
+        live feed can't reset the UI state of the acquisition we're about to
+        start. Returns True if a worker was actually stopped."""
+        if worker is None or not worker.isRunning():
+            return False
+        try:
+            worker.finished_signal.disconnect(finished_slot)
+        except (TypeError, RuntimeError):
+            pass
+        worker.stop()
+        worker.wait(3000)
+        return True
 
     # ==========================
     # Lifecycle / teardown
     # ==========================
     def closeEvent(self, event):
+        # Persist the current parameters so the next launch restores them.
+        self._save_session()
+
         if self.evk4_worker is not None and self.evk4_worker.isRunning():
             self.evk4_worker.stop()
             self.evk4_worker.wait(2000)
@@ -431,13 +545,13 @@ class MainWindow(QMainWindow):
     # ==========================
     # Parameter presets
     # ==========================
-    def save_preset(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Parameter Preset", "", "DSI Preset (*.json)"
-        )
-        if not path:
-            return
-        preset = {
+    def _collect_preset(self):
+        """Gather all camera / Z-stack parameters into a JSON-serialisable dict.
+
+        Shared by the manual *Save Preset* button and the automatic session-state
+        save on exit, so both write exactly the same structure.
+        """
+        return {
             "version": 1,
             "evk4": self.evk4_params.get_preset(),
             "orca": self.orca_params.get_preset(),
@@ -451,34 +565,15 @@ class MainWindow(QMainWindow):
                 "orca": self.chk_orca_raw.isChecked(),
                 "zstack": self.chk_zstack_raw.isChecked(),
             },
+            "output_dirs": {
+                "evk4": self.txt_dir.text(),
+                "orca": self.txt_orca_dir.text(),
+                "zstack": self.txt_zstack_dir.text(),
+            },
         }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(preset, f, indent=2)
-            self.lbl_status.setText(f"Preset saved: {path}")
-        except OSError as e:
-            QMessageBox.critical(self, "Save Failed", str(e))
 
-    def load_preset(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Parameter Preset", "", "DSI Preset (*.json)"
-        )
-        if not path:
-            return
-        try:
-            with open(path, encoding="utf-8") as f:
-                preset = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            QMessageBox.critical(self, "Load Failed", f"Could not read preset:\n{e}")
-            return
-
-        if preset.get("version") != 1:
-            QMessageBox.warning(
-                self, "Incompatible Preset",
-                "This file was saved by a different version of the software and cannot be loaded."
-            )
-            return
-
+    def _apply_preset(self, preset):
+        """Apply a preset/session dict to every control. Unknown keys are ignored."""
         if "evk4" in preset:
             self.evk4_params.set_preset(preset["evk4"])
             self.zstack_evk4_params.set_preset(preset["evk4"])
@@ -507,7 +602,93 @@ class MainWindow(QMainWindow):
             if "zstack" in sr:
                 self.chk_zstack_raw.setChecked(bool(sr["zstack"]))
 
+        # Output directories are restored (the filename bases stay timestamped).
+        if "output_dirs" in preset:
+            od = preset["output_dirs"]
+            if od.get("evk4"):
+                self.txt_dir.setText(od["evk4"])
+            if od.get("orca"):
+                self.txt_orca_dir.setText(od["orca"])
+            if od.get("zstack"):
+                self.txt_zstack_dir.setText(od["zstack"])
+
+    def save_preset(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Parameter Preset", "", "DSI Preset (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._collect_preset(), f, indent=2)
+            self.lbl_status.setText(f"Preset saved: {path}")
+        except OSError as e:
+            QMessageBox.critical(self, "Save Failed", str(e))
+
+    def load_preset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Parameter Preset", "", "DSI Preset (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                preset = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.critical(self, "Load Failed", f"Could not read preset:\n{e}")
+            return
+
+        if preset.get("version") != 1:
+            QMessageBox.warning(
+                self, "Incompatible Preset",
+                "This file was saved by a different version of the software and cannot be loaded."
+            )
+            return
+
+        self._apply_preset(preset)
         self.lbl_status.setText(f"Preset loaded: {path}")
+
+    # ----- automatic session state (restored on the next launch) -----
+    def _save_session(self):
+        """Persist the current parameters so the next launch starts where this one
+        left off. Best-effort: a failure here must never block app shutdown."""
+        try:
+            os.makedirs(os.path.dirname(SESSION_STATE_PATH), exist_ok=True)
+            with open(SESSION_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._collect_preset(), f, indent=2)
+        except (OSError, ValueError):
+            pass
+
+    def _load_session(self):
+        """Restore the parameters saved at the end of the previous session, if any.
+        Silent and best-effort — a missing or corrupt file just leaves defaults."""
+        try:
+            with open(SESSION_STATE_PATH, encoding="utf-8") as f:
+                preset = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(preset, dict) and preset.get("version") == 1:
+            self._apply_preset(preset)
+            self.lbl_status.setText("Restored parameters from the last session.")
+
+    # ==========================
+    # Filename base handling
+    # ==========================
+    def _stamp_default_filename(self, field, prefix):
+        """Fill a filename field with a fresh ``<prefix>_<timestamp>`` default and
+        remember it, so a later auto-refresh can tell the default apart from a name
+        the user typed."""
+        name = f"{prefix}_{time.strftime('%y%m%d_%H%M%S')}"
+        field.setText(name)
+        self._fn_defaults[field] = name
+
+    def _refresh_default_filename(self, field, prefix):
+        """Re-stamp the field with the current time, but only if it still holds the
+        previous auto-generated default — a custom name the user typed is left
+        untouched. Called at the start of an acquisition so the saved files carry
+        the acquisition time (not the app-launch time)."""
+        if self._fn_defaults.get(field) == field.text():
+            self._stamp_default_filename(field, prefix)
 
     def browse_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -598,17 +779,24 @@ class MainWindow(QMainWindow):
             return
         params = self.evk4_params.get_params()
         params["output_dir"] = self.txt_dir.text()
-        params["filename"] = self.txt_filename.text()
         params["save_raw"] = self.chk_evk4_raw.isChecked()
         if mode == "acquire" and not params["output_dir"]:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the acquisition.")
             return
+        if mode == "acquire":
+            # Stamp a default filename with the acquisition time; a custom name is kept.
+            self._refresh_default_filename(self.txt_filename, "recording")
+        params["filename"] = self.txt_filename.text()
 
         if mode == "acquire":
             params["metadata"] = self.collect_acquisition_metadata(
                 "Event Camera (EVK4) - 2D event-DSI", params["output_dir"], params["filename"],
                 self.evk4_params, self.orca_params,
             )
+            # Auto-stop a running live feed so the user doesn't have to click Stop
+            # first; this releases the camera before the acquisition opens it.
+            if self._stop_worker_silently(self.evk4_worker, self.on_evk4_finished):
+                self._reset_evk4_apply()
 
         self.btn_live.setEnabled(False)
         self.btn_acquire.setEnabled(False)
@@ -624,6 +812,8 @@ class MainWindow(QMainWindow):
         if mode == "live":
             self.evk4_params.btn_apply_biases.setEnabled(True)
             self.evk4_params.btn_apply_biases.clicked.connect(self._apply_evk4_biases_live)
+        else:
+            self._start_elapsed(self.lbl_evk4_time, self._update_evk4_time)
 
     def stop_evk4(self):
         if self.evk4_worker is not None:
@@ -632,10 +822,16 @@ class MainWindow(QMainWindow):
             self.evk4_worker.wait(3000)
 
     def on_evk4_finished(self):
+        self._stop_elapsed()
         self.btn_live.setEnabled(True)
         self.btn_acquire.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.txt_filename.setText(f"recording_{time.strftime('%y%m%d_%H%M%S')}")
+        # The filename is re-stamped at the start of the next acquisition (if it is
+        # still the auto-default), so stopping a live feed never wipes a typed name.
+        self._reset_evk4_apply()
+
+    def _reset_evk4_apply(self):
+        """Disable + disconnect the EVK4 live bias-apply button."""
         self.evk4_params.btn_apply_biases.setEnabled(False)
         try:
             self.evk4_params.btn_apply_biases.clicked.disconnect(self._apply_evk4_biases_live)
@@ -664,16 +860,43 @@ class MainWindow(QMainWindow):
         params = self.orca_params.get_params()
         params["save_raw_stack"] = self.chk_orca_raw.isChecked()
         params["output_dir"] = self.txt_orca_dir.text()
-        params["filename"] = self.txt_orca_filename.text()
         if mode == "acquire" and not params["output_dir"]:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the DSI acquisition.")
             return
+        if mode == "acquire":
+            # Stamp a default filename with the acquisition time; a custom name is kept.
+            self._refresh_default_filename(self.txt_orca_filename, "dsi")
+        params["filename"] = self.txt_orca_filename.text()
 
         if mode == "acquire":
+            # Pre-flight memory check (see start_zstack): the frame stack is held
+            # in RAM (camera ring buffer + our copy); a high frame count at full
+            # sensor can exceed physical memory. Warn rather than freeze.
+            roi = params["orca_roi"]
+            px = max(1, roi["x_max"] - roi["x_min"]) * max(1, roi["y_max"] - roi["y_min"])
+            need = 2 * params["orca_frames"] * px * 2 + 128 * 1024 * 1024
+            avail = self._available_memory_bytes()
+            if avail is not None and need > 0.85 * avail:
+                resp = QMessageBox.warning(
+                    self, "Acquisition may exhaust memory",
+                    f"This acquisition is estimated to need about {self._format_bytes(need)} of RAM, "
+                    f"but only {self._format_bytes(avail)} is currently free.\n\n"
+                    "Running it may make the computer unresponsive. Reduce the frame count (N) "
+                    "or the ROI size before retrying.\n\nStart anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if resp != QMessageBox.StandardButton.Yes:
+                    return
+
             params["metadata"] = self.collect_acquisition_metadata(
                 "Scientific Camera (ORCA) - Single-Z DSI", params["output_dir"], params["filename"],
                 self.evk4_params, self.orca_params,
             )
+            # Auto-stop a running live feed so the user doesn't have to click Stop
+            # first; this releases the camera before the acquisition opens it.
+            if self._stop_worker_silently(self.orca_worker, self.on_orca_finished):
+                self._reset_orca_live_apply()
 
         self.btn_orca_live.setEnabled(False)
         self.btn_orca_acquire.setEnabled(False)
@@ -689,6 +912,11 @@ class MainWindow(QMainWindow):
         if mode == "live":
             self.orca_params.btn_apply_live.setEnabled(True)
             self.orca_params.btn_apply_live.clicked.connect(self._apply_orca_params_live)
+            # Live re-framing: dragging the ROI size / centre-offset controls
+            # re-applies to the live feed automatically (debounced in the widget).
+            self.orca_params.roi_changed.connect(self._apply_orca_params_live)
+        else:
+            self._start_elapsed(self.lbl_orca_time, self._update_orca_time)
 
     def stop_orca(self):
         if self.orca_worker is not None:
@@ -696,15 +924,22 @@ class MainWindow(QMainWindow):
             self.orca_worker.wait(3000)
 
     def on_orca_finished(self):
+        self._stop_elapsed()
         self.btn_orca_live.setEnabled(True)
         self.btn_orca_acquire.setEnabled(True)
         self.btn_orca_stop.setEnabled(False)
-        self.txt_orca_filename.setText(f"dsi_{time.strftime('%y%m%d_%H%M%S')}")
+        # Filename is re-stamped at the next acquisition start (if still the auto-
+        # default), so stopping live focus mode never wipes a typed name.
+        self._reset_orca_live_apply()
+
+    def _reset_orca_live_apply(self):
+        """Disable + disconnect the ORCA live-apply button and live re-framing."""
         self.orca_params.btn_apply_live.setEnabled(False)
-        try:
-            self.orca_params.btn_apply_live.clicked.disconnect(self._apply_orca_params_live)
-        except (RuntimeError, TypeError):
-            pass
+        for sig in (self.orca_params.btn_apply_live.clicked, self.orca_params.roi_changed):
+            try:
+                sig.disconnect(self._apply_orca_params_live)
+            except (RuntimeError, TypeError):
+                pass
 
     def _apply_orca_params_live(self):
         if self.orca_worker is not None and self.orca_worker.isRunning():
@@ -736,6 +971,7 @@ class MainWindow(QMainWindow):
             self.zstack_live_worker.image_ready.connect(self.update_image)
             self.zstack_orca_params.btn_apply_live.setEnabled(True)
             self.zstack_orca_params.btn_apply_live.clicked.connect(self._apply_zstack_orca_params_live)
+            self.zstack_orca_params.roi_changed.connect(self._apply_zstack_orca_params_live)
         else:
             self.zstack_live_worker = CameraWorker("live", self.zstack_evk4_params.get_params())
             self.zstack_live_worker.frame_ready.connect(self.update_image)
@@ -746,6 +982,67 @@ class MainWindow(QMainWindow):
         self.zstack_live_worker.error_signal.connect(self.show_error)
         self.zstack_live_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_live_worker.start()
+
+    def _zstack_orca_peak_bytes(self):
+        """Rough estimate of the peak RAM an ORCA Z-stack needs, in bytes.
+
+        Dominated by the per-plane frame stack held in RAM (the camera's own
+        N-frame ring buffer + our single host copy, both uint16) and the depth
+        volumes that accumulate over every plane (average + DSI, float32, plus a
+        transient copy when they are written). Deliberately rough — it only needs
+        to be good enough to catch a configuration that clearly won't fit.
+        """
+        p = self.zstack_orca_params.get_params()
+        roi = p["orca_roi"]
+        w = max(1, roi["x_max"] - roi["x_min"])
+        h = max(1, roi["y_max"] - roi["y_min"])
+        n = p["orca_frames"]
+        z = self.pi_stage_widget.spin_steps.value()
+        px = w * h
+        frame_stack = 2 * n * px * 2     # SDK ring buffer + host copy (uint16 = 2 B)
+        volumes = 3 * z * px * 4         # avg + DSI float32 volumes + a save-time copy
+        chunk = 128 * 1024 * 1024        # compute_dsi_images working-set budget
+        return frame_stack + volumes + chunk
+
+    @staticmethod
+    def _available_memory_bytes():
+        """Best-effort free physical memory in bytes, or None if undetermined."""
+        try:
+            import ctypes
+
+            class _MemStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+        try:
+            import os
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            return None
+
+    @staticmethod
+    def _format_bytes(num):
+        """Human-readable byte size (e.g. ``3.4 GB``)."""
+        value = float(num)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024.0 or unit == "GB":
+                return f"{value:.1f} {unit}"
+            value /= 1024.0
 
     def start_zstack(self):
         camera = self.combo_zstack_camera.currentData()
@@ -765,8 +1062,32 @@ class MainWindow(QMainWindow):
         if not output_dir:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the Z-Stack.")
             return
+
+        # Pre-flight memory check: an ORCA Z-stack holds a whole frame stack in
+        # RAM at each plane (the camera ring buffer plus our copy) and grows the
+        # depth volumes plane by plane. A high frame count at full sensor can
+        # exceed physical memory and swap the machine to a standstill, so warn
+        # before launching a run that would not fit.
+        if camera == "orca":
+            need = self._zstack_orca_peak_bytes()
+            avail = self._available_memory_bytes()
+            if avail is not None and need > 0.85 * avail:
+                resp = QMessageBox.warning(
+                    self, "Z-Stack may exhaust memory",
+                    f"This Z-Stack is estimated to need about {self._format_bytes(need)} of RAM, "
+                    f"but only {self._format_bytes(avail)} is currently free.\n\n"
+                    "Running it may make the computer unresponsive. Reduce the frame count "
+                    "(N), the ROI size, or the number of Z steps before retrying.\n\n"
+                    "Start anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if resp != QMessageBox.StandardButton.Yes:
+                    return
+
+        # Stamp a default filename with the acquisition time; a custom name is kept.
+        self._refresh_default_filename(self.txt_zstack_filename, "zstack")
         filename = self.txt_zstack_filename.text()
-        camera = self.combo_zstack_camera.currentData()
         source = (
             "3D Z-Stack (ORCA) - per-plane DSI" if camera == "orca"
             else "3D Z-Stack (EVK4) - per-plane event-DSI"
@@ -780,6 +1101,11 @@ class MainWindow(QMainWindow):
                 source, output_dir, filename, self.zstack_evk4_params, self.zstack_orca_params
             ),
         }
+
+        # Auto-stop a running live preview so its camera handle is released before
+        # the orchestrator opens the camera; the user no longer needs to click Stop.
+        if self._stop_worker_silently(self.zstack_live_worker, self.on_zstack_finished):
+            self._reset_zstack_live_apply()
 
         self._set_zstack_busy(True)
 
@@ -803,6 +1129,7 @@ class MainWindow(QMainWindow):
         self.zstack_worker.error_signal.connect(self.show_error)
         self.zstack_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_worker.start()
+        self._start_elapsed(self.lbl_zstack_time, self._update_zstack_time)
 
     def stop_zstack(self):
         if self.zstack_worker is not None and self.zstack_worker.isRunning():
@@ -816,11 +1143,21 @@ class MainWindow(QMainWindow):
         print(f"Step {step_num} | Computed Z-Profile value: {z_val}")
 
     def on_zstack_finished(self):
+        self._stop_elapsed()
         self._set_zstack_busy(False)
         self.pi_stage_widget.resume_position_updates()
-        self.txt_zstack_filename.setText(f"zstack_{time.strftime('%y%m%d_%H%M%S')}")
+        # Filename is re-stamped at the next Z-stack start (if still the auto-
+        # default), so stopping the live preview never wipes a typed name.
+        self._reset_zstack_live_apply()
+
+    def _reset_zstack_live_apply(self):
+        """Disable + disconnect both Z-stack live-apply buttons and live re-framing."""
         self.zstack_orca_params.btn_apply_live.setEnabled(False)
         self.zstack_evk4_params.btn_apply_biases.setEnabled(False)
+        try:
+            self.zstack_orca_params.roi_changed.disconnect(self._apply_zstack_orca_params_live)
+        except (RuntimeError, TypeError):
+            pass
         for slot in (self._apply_zstack_orca_params_live, self._apply_zstack_evk4_biases_live):
             try:
                 self.zstack_orca_params.btn_apply_live.clicked.disconnect(slot)
@@ -862,6 +1199,123 @@ class MainWindow(QMainWindow):
             qt_img = QImage(img.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
 
         pixmap = QPixmap.fromImage(qt_img)
+        # Let the crop overlay map widget <-> image pixels for this frame size.
+        self.video_label.set_source_size(w, h)
         self.video_label.setPixmap(
             pixmap.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+        )
+
+    # ==========================
+    # Interactive crop tool
+    # ==========================
+    def _build_crop_bar(self):
+        """Crop-tool control bar shown beneath the video feed."""
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(6, 4, 6, 4)
+
+        self.btn_crop_select = QPushButton("⛶  Select Crop Region")
+        self.btn_crop_select.setCheckable(True)
+        self.btn_crop_select.setToolTip(
+            "Drag a rectangle on the full-sensor ORCA live image to mark a crop "
+            "region. The box stays on screen so you can review it, then click "
+            "'Apply Crop' to set the camera ROI to that region."
+        )
+        self.btn_crop_select.toggled.connect(self._toggle_crop_mode)
+
+        self.btn_crop_apply = QPushButton("Apply Crop")
+        self.btn_crop_apply.setObjectName("btnAcquire")
+        self.btn_crop_apply.setEnabled(False)
+        self.btn_crop_apply.clicked.connect(self._apply_crop)
+
+        self.btn_crop_reset = QPushButton("Reset to Full")
+        self.btn_crop_reset.clicked.connect(self._reset_crop)
+
+        self.lbl_crop = QLabel("")
+        self.lbl_crop.setStyleSheet(
+            "color: #00e676; font-size: 11px; font-weight: bold; border: none;"
+        )
+
+        layout.addWidget(self.btn_crop_select)
+        layout.addWidget(self.btn_crop_apply)
+        layout.addWidget(self.btn_crop_reset)
+        layout.addWidget(self.lbl_crop, stretch=1)
+        return bar
+
+    def _active_orca_params(self):
+        """The ORCA parameter widget the crop tool should drive: the Z-stack copy
+        when that tab is active with the ORCA camera, otherwise the standalone one."""
+        if (self.tabs.currentWidget() is self.tab_zstack
+                and self.combo_zstack_camera.currentData() == "orca"):
+            return self.zstack_orca_params
+        return self.orca_params
+
+    def _toggle_crop_mode(self, on):
+        self.video_label.set_crop_mode(on)
+        self.btn_crop_select.setText(
+            "⛶  Selecting… (drag on image)" if on else "⛶  Select Crop Region"
+        )
+        if not on:
+            self._crop_region = None
+            self.btn_crop_apply.setEnabled(False)
+            self.lbl_crop.setText("")
+
+    def _frame_region_to_sensor(self, x, y, w, h):
+        """Map a region in the displayed frame's pixels to absolute sensor pixels.
+
+        Assumes the frame was read out 1:1 (no binning) from the active ROI, so the
+        frame origin is that ROI's top-left — at full sensor this is the identity.
+        """
+        roi = self._active_orca_params()._compute_roi()
+        return roi["x_min"] + x, roi["y_min"] + y, w, h
+
+    def _on_crop_region_drawn(self, x, y, w, h):
+        """A rectangle was drawn on the feed: remember it and preview the ROI."""
+        self._crop_region = (x, y, w, h)
+        sx, sy, sw, sh = self._frame_region_to_sensor(x, y, w, h)
+        self.btn_crop_apply.setEnabled(True)
+        self.lbl_crop.setText(f"Selection: {sw} × {sh} px  @ ({sx}, {sy}) — click Apply Crop")
+
+    def _apply_crop(self):
+        """Set the active ORCA ROI to the drawn region (re-applies live if running)."""
+        if self._crop_region is None:
+            return
+        if self._current_frame is None:
+            self.lbl_status.setText("Start an ORCA live feed before cropping.")
+            return
+        x, y, w, h = self._crop_region
+        sx, sy, sw, sh = self._frame_region_to_sensor(x, y, w, h)
+        params = self._active_orca_params()
+        # Convert the absolute sensor rectangle into the widget's width/height +
+        # centre-offset model; _compute_roi re-aligns to multiples of 4 and clamps.
+        offset_x = int(round(sx + sw / 2.0 - ORCA_SENSOR_WIDTH / 2.0))
+        offset_y = int(round(sy + sh / 2.0 - ORCA_SENSOR_HEIGHT / 2.0))
+        params.spin_roi_width.setValue(min(sw, ORCA_SENSOR_WIDTH))
+        params.spin_roi_height.setValue(min(sh, ORCA_SENSOR_HEIGHT))
+        params.slider_offset_x.setValue(offset_x)   # QSlider clamps to its range
+        params.slider_offset_y.setValue(offset_y)
+
+        applied = params._compute_roi()
+        aw = applied["x_max"] - applied["x_min"]
+        ah = applied["y_max"] - applied["y_min"]
+        self.lbl_status.setText(
+            f"Crop applied: {aw} × {ah} px @ ({applied['x_min']}, {applied['y_min']})."
+        )
+        # Leave crop mode; the live feed now shows the cropped subarray.
+        self.btn_crop_select.setChecked(False)  # fires _toggle_crop_mode(False)
+        self.video_label.clear_selection()
+
+    def _reset_crop(self):
+        """Restore the active ORCA ROI to the full sensor."""
+        params = self._active_orca_params()
+        params.spin_roi_width.setValue(ORCA_SENSOR_WIDTH)
+        params.spin_roi_height.setValue(ORCA_SENSOR_HEIGHT)
+        params.slider_offset_x.setValue(0)
+        params.slider_offset_y.setValue(0)
+        self._crop_region = None
+        self.btn_crop_apply.setEnabled(False)
+        self.lbl_crop.setText("")
+        self.video_label.clear_selection()
+        self.lbl_status.setText(
+            f"ROI reset to full sensor ({ORCA_SENSOR_WIDTH} × {ORCA_SENSOR_HEIGHT})."
         )
