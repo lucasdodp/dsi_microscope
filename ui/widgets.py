@@ -533,6 +533,33 @@ class AWGWidget(QGroupBox):
             settings[f"ch{channel}_output"] = "ON" if widgets["output"].isChecked() else "OFF"
         return settings
 
+    def get_preset(self):
+        """Return the AWG UI parameters for presets / session restore.
+
+        Persists the VISA address and per-channel frequency/amplitude. The live
+        output ON/OFF state is deliberately *not* saved — it drives the hardware
+        and must only be turned on after the user connects the device.
+        """
+        preset = {"visa_address": self.combo_visa.currentText()}
+        for channel, widgets in self.channels.items():
+            preset[f"ch{channel}_freq"] = widgets["freq"].value()
+            preset[f"ch{channel}_amp"] = widgets["amp"].value()
+        return preset
+
+    def set_preset(self, data):
+        """Restore AWG UI parameters from a preset dict. Unknown keys are ignored;
+        the VISA address is only selected if it is still in the resource list."""
+        addr = data.get("visa_address")
+        if addr:
+            idx = self.combo_visa.findText(addr)
+            if idx >= 0:
+                self.combo_visa.setCurrentIndex(idx)
+        for channel, widgets in self.channels.items():
+            if f"ch{channel}_freq" in data:
+                widgets["freq"].setValue(float(data[f"ch{channel}_freq"]))
+            if f"ch{channel}_amp" in data:
+                widgets["amp"].setValue(float(data[f"ch{channel}_amp"]))
+
     def close_device(self):
         self.controller.close()
 

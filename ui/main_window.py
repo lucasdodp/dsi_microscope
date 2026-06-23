@@ -13,8 +13,8 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QTabWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -156,6 +156,18 @@ class MainWindow(QMainWindow):
         # Restore the parameters saved when the app was last closed, so a session
         # starts where the previous one left off (silent if there is no state file).
         self._load_session()
+
+        # Persist parameters continuously, so the last session is remembered no
+        # matter how the app exits — a clean window close, an app quit, or an
+        # abrupt stop (e.g. the IDE's stop button) that skips closeEvent. A
+        # periodic autosave backs up the save-on-close, and writes are atomic.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._save_session)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(15000)  # 15 s; the file is tiny
+        self._autosave_timer.timeout.connect(self._save_session)
+        self._autosave_timer.start()
 
     def _toggle_awg(self, expanded):
         self.awg_widget.setVisible(expanded)
@@ -555,10 +567,12 @@ class MainWindow(QMainWindow):
             "version": 1,
             "evk4": self.evk4_params.get_preset(),
             "orca": self.orca_params.get_preset(),
+            "awg": self.awg_widget.get_preset(),
             "zstack": {
                 "camera": self.combo_zstack_camera.currentData(),
                 "step_size": self.pi_stage_widget.spin_step_size.value(),
                 "num_steps": self.pi_stage_widget.spin_steps.value(),
+                "focus": self.pi_stage_widget.spin_focus.value(),
             },
             "save_raw": {
                 "evk4": self.chk_evk4_raw.isChecked(),
@@ -582,6 +596,9 @@ class MainWindow(QMainWindow):
             self.orca_params.set_preset(preset["orca"])
             self.zstack_orca_params.set_preset(preset["orca"])
 
+        if "awg" in preset:
+            self.awg_widget.set_preset(preset["awg"])
+
         if "zstack" in preset:
             z = preset["zstack"]
             if "camera" in z:
@@ -592,6 +609,8 @@ class MainWindow(QMainWindow):
                 self.pi_stage_widget.spin_step_size.setValue(float(z["step_size"]))
             if "num_steps" in z:
                 self.pi_stage_widget.spin_steps.setValue(int(z["num_steps"]))
+            if "focus" in z:
+                self.pi_stage_widget.spin_focus.setValue(float(z["focus"]))
 
         if "save_raw" in preset:
             sr = preset["save_raw"]
@@ -651,25 +670,47 @@ class MainWindow(QMainWindow):
     # ----- automatic session state (restored on the next launch) -----
     def _save_session(self):
         """Persist the current parameters so the next launch starts where this one
-        left off. Best-effort: a failure here must never block app shutdown."""
+        left off.
+
+        Robust by design — parameter persistence must not depend on a clean
+        shutdown: this is called periodically, on app quit, and on window close.
+        The dict is built *before* any file is touched (so a problem there can't
+        truncate the file), and written to a temp file that is atomically renamed
+        into place (so an interrupted write can never leave an empty/corrupt
+        session file that would silently reset everything to defaults). Every
+        failure mode is swallowed so a save attempt can never crash the app.
+        """
         try:
-            os.makedirs(os.path.dirname(SESSION_STATE_PATH), exist_ok=True)
-            with open(SESSION_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._collect_preset(), f, indent=2)
-        except (OSError, ValueError):
+            preset = self._collect_preset()
+        except Exception:
+            return
+        try:
+            directory = os.path.dirname(SESSION_STATE_PATH)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = SESSION_STATE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(preset, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, SESSION_STATE_PATH)  # atomic on Windows + POSIX
+        except Exception:
             pass
 
     def _load_session(self):
-        """Restore the parameters saved at the end of the previous session, if any.
-        Silent and best-effort — a missing or corrupt file just leaves defaults."""
+        """Restore the parameters saved by the previous session, if any. Silent and
+        best-effort — a missing/corrupt file just leaves the defaults in place."""
         try:
             with open(SESSION_STATE_PATH, encoding="utf-8") as f:
                 preset = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except Exception:
             return
-        if isinstance(preset, dict) and preset.get("version") == 1:
-            self._apply_preset(preset)
-            self.lbl_status.setText("Restored parameters from the last session.")
+        try:
+            if isinstance(preset, dict) and preset.get("version") == 1:
+                self._apply_preset(preset)
+                self.lbl_status.setText("Restored parameters from the last session.")
+        except Exception:
+            pass
 
     # ==========================
     # Filename base handling
