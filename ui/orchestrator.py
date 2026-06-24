@@ -122,6 +122,11 @@ class AutomatedZStackWorker(QThread):
                 finally:
                     Dcamapi.uninit()
 
+            # Recenter the objective on the focus: the scan loop otherwise leaves
+            # it parked at the last (top-most) plane, but the user expects it back
+            # at the centre of the stack whether the run completed or was stopped.
+            self._return_to_focus()
+
             saved_msg = self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
             if self._is_running:
                 self.status_update.emit(f"Automated Z-Stack Complete.{saved_msg}")
@@ -141,6 +146,8 @@ class AutomatedZStackWorker(QThread):
                     Dcamapi.uninit()
                 except Exception:
                     pass
+            # Still try to bring the objective back to focus after a failure.
+            self._return_to_focus()
 
     # ------------------------------------------------------------------ ORCA
     def _open_orca(self):
@@ -312,6 +319,24 @@ class AutomatedZStackWorker(QThread):
         """Report the real axis position so the UI readout tracks the stack."""
         try:
             self.position_update.emit(float(self.pidevice.qPOS(self.axis)[self.axis]))
+        except Exception:
+            pass
+
+    def _return_to_focus(self):
+        """Move the objective back to the user focus (centre of the scan).
+
+        Called when the stack ends — completed, stopped, or errored — so the
+        stage never sits at the top-most plane afterwards. Best-effort: a move
+        failure here must not mask the run's real outcome.
+        """
+        if not self.pidevice:
+            return
+        try:
+            focus = self.motor_params["focus"]
+            self.status_update.emit(f"Returning objective to focus {focus:.4f} µm...")
+            self.pidevice.MOV(self.axis, focus)
+            pitools.waitontarget(self.pidevice, axes=self.axis)
+            self._emit_position()
         except Exception:
             pass
 

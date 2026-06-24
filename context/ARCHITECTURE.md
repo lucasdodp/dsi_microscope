@@ -3,6 +3,8 @@
 Control software for the **Institut Fresnel event-based Dynamic Speckle Illumination (event-DSI) microscope**. It is a PyQt6 desktop application that drives the full optical setup and reconstructs optically-sectioned wide-field fluorescence images.
 
 > This document is the high-level map kept for context across sessions. When you change behaviour, update the relevant section here too.
+>
+> For the formal math — every equation behind acquisition and reconstruction, with rendered symbols — see [MATHEMATICS.md](MATHEMATICS.md).
 
 ---
 
@@ -177,6 +179,7 @@ MainWindow.start_zstack  (pauses PIStageWidget polling; hands stage to orchestra
          ORCA:  grab N frames → compute_dsi_images → save_raw_stack_tiff(per-plane <name>_raw_stack_zNNN.tif)
          EVK4:  stream events for acqu_time → accumulate_event_frame (no per-plane .raw)
          emit image_ready + z_profile_update + position_update
+       return objective to focus (recenter; never left at the top-most plane)
        save_volume_tiff(depth volumes)
        save_axial_sectioning_plot(z, per-plane mean intensity)  # Fig. 3a: CSV + Gaussian FWHM + PNG
        save_axial_average_plot(z, per-plane mean average intensity)  # ORCA only: CSV + straight-line fit + PNG
