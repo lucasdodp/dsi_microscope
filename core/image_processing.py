@@ -398,6 +398,123 @@ def _save_axial_figure(z, y_norm, popt, fwhm, out_dir, filename, kind):
         return None
 
 
+def _fit_axial_line(z, y):
+    """Fit ``y(z)`` with a straight line; return (slope, intercept) or (None, None).
+
+    Unlike the optically-sectioned image, the widefield-equivalent *average* image
+    has no depth discrimination: it collects out-of-focus light at every plane, so
+    its mean intensity stays essentially flat across the stack. A straight line
+    (not a Gaussian peak) is therefore the right model, and a near-zero slope is
+    the signature of that absence of sectioning. Needs at least 2 points; any
+    failure degrades to (None, None) so the caller can still save the raw data.
+    """
+    if z.size < 2:
+        return None, None
+    try:
+        slope, intercept = np.polyfit(z, y, 1)
+    except Exception:
+        return None, None
+    return float(slope), float(intercept)
+
+
+def save_axial_average_plot(z_positions, intensities, out_dir, filename):
+    """Save the axial profile of the *average* (widefield) image + its data.
+
+    Companion to :func:`save_axial_sectioning_plot`. Where the sectioned image
+    peaks at the focal plane (Gaussian, with a meaningful FWHM), the conventional
+    widefield/average image shows **no** optical sectioning: its mean intensity is
+    essentially constant across z. We model it with a straight line to make that
+    contrast explicit — the (near-flat) slope quantifies the lack of sectioning.
+
+    The data is **always** written as ``axial_average_<name>.csv`` (z, mean
+    intensity, peak-normalized intensity, and the line-fit parameters). The figure
+    ``axial_average_<name>.png`` is written only if matplotlib is installed.
+
+    Parameters
+    ----------
+    z_positions : sequence of float
+        Axial position (µm) of each plane, aligned with ``intensities``.
+    intensities : sequence of float
+        Mean pixel value of each plane's average (widefield) image.
+    out_dir, filename : str
+        Destination directory and filename base.
+
+    Returns
+    -------
+    (slope, csv_path, png_path) : (float | None, str, str | None)
+        Fitted slope (per µm; None if the fit failed), the CSV path, and the PNG
+        path (None if matplotlib was unavailable).
+    """
+    z = np.asarray(z_positions, dtype=float)
+    inten = np.asarray(intensities, dtype=float)
+
+    # Sort by axial position so the profile and fit are monotone in z.
+    order = np.argsort(z)
+    z, inten = z[order], inten[order]
+
+    peak = float(inten.max()) if inten.size and inten.max() > 0 else 1.0
+    inten_norm = inten / peak
+
+    slope, intercept = _fit_axial_line(z, inten_norm)
+
+    # --- data (always) -----------------------------------------------------
+    csv_path = os.path.join(out_dir, f"axial_average_{filename}.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("z_position_um,mean_intensity,normalized_intensity\n")
+        for zi, raw, nrm in zip(z, inten, inten_norm):
+            f.write(f"{zi:.6f},{raw:.6f},{nrm:.6f}\n")
+        f.write("\n# Linear fit: intercept + slope*z\n")
+        if slope is not None:
+            f.write(f"# slope_per_um={slope:.6f}, intercept={intercept:.6f}\n")
+        else:
+            f.write("# fit_failed=True (need >=2 planes)\n")
+
+    # --- figure (best effort) ---------------------------------------------
+    png_path = _save_average_figure(z, inten_norm, slope, intercept, out_dir, filename)
+    return slope, csv_path, png_path
+
+
+def _save_average_figure(z, y_norm, slope, intercept, out_dir, filename):
+    """Render the axial *average* profile to PNG with its straight-line fit.
+
+    Returns the path, or None if matplotlib is not installed (the data CSV is
+    saved regardless). Mirrors :func:`_save_axial_figure` but overlays a line
+    instead of a Gaussian.
+    """
+    try:
+        # Object-oriented Agg API (no pyplot global state) so it is safe to call
+        # from the Z-stack worker thread and never opens a window.
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    except ImportError:
+        return None
+
+    # The data CSV is already saved by the caller, so a rendering failure here
+    # must never break the acquisition: treat the PNG as purely best-effort.
+    try:
+        fig = Figure(figsize=(6, 4))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.plot(z, y_norm, "o", color="#1f77b4", markersize=4, label="Experimental data")
+
+        if slope is not None:
+            z_fit = np.linspace(float(z.min()), float(z.max()), 400)
+            ax.plot(z_fit, intercept + slope * z_fit, "-", color="#2ca02c",
+                    label=f"Linear fit (slope = {slope:.3g} /µm)")
+
+        ax.set_xlabel("Axial position (µm)")
+        ax.set_ylabel("Average intensity (normalised)")
+        ax.set_title("Axial average — widefield (no sectioning)")
+        ax.legend()
+        fig.tight_layout()
+
+        png_path = os.path.join(out_dir, f"axial_average_{filename}.png")
+        fig.savefig(png_path, dpi=150)
+        return png_path
+    except Exception:
+        return None
+
+
 def save_parameter_log(out_dir, filename, sections):
     """Write a human-readable ``.txt`` record of all acquisition parameters.
 

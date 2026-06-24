@@ -100,6 +100,7 @@ Dependency-light constants:
 - `save_raw_stack_tiff(stack, dir, name, roi=None, plane=None)` — one plane's raw 16-bit frames as a multi-page TIFF (`<name>_raw_stack.tif`), native bit depth preserved. The user's filename base leads the name. Used by the single-Z acquire **and** by the Z-stack, which passes `plane=step` so each plane writes a **separate** z-indexed file (`<name>_raw_stack_zNNN.tif`) — the downstream MATLAB algorithms (e.g. **RIM**) consume the planes individually, not as one combined volume.
 - `save_volume_tiff(volume, dir, name, kind)` — a (Z,H,W) depth stack as a multi-page TIFF (float32 → 32-bit, no per-slice normalization).
 - `save_axial_sectioning_plot(z_positions, intensities, dir, name, kind)` — the **axial-sectioning profile** (paper Fig. 3a): per-plane mean sectioned-image intensity vs axial position, Gaussian-fitted (`scipy.optimize.curve_fit`) to extract the **FWHM = axial sectioning**. Always writes `axial_profile_<kind>_<name>.csv` (z, raw + peak-normalized intensity, fit params); writes the PNG only if **matplotlib** is installed (lazy OO `FigureCanvasAgg` import, thread-safe, no window). Returns `(fwhm, csv_path, png_path)`. Helpers `_gaussian`, `_fit_axial_gaussian`, `_save_axial_figure` degrade to data-only on any failure (no SciPy/matplotlib, <4 planes, non-convergence).
+- `save_axial_average_plot(z_positions, intensities, dir, name)` — **companion profile of the *average* (widefield) image** vs axial position. Unlike the sectioned image, the average collects out-of-focus light at every plane, so its intensity is essentially **flat** across z — it has *no* optical sectioning. It is therefore fitted with a **straight line** (`np.polyfit`, no SciPy needed) rather than a Gaussian; the near-zero slope quantifies the absence of sectioning. Same CSV-always / PNG-if-matplotlib contract: writes `axial_average_<name>.csv` + `.png`. Returns `(slope, csv_path, png_path)`. Helpers `_fit_axial_line`, `_save_average_figure`. **ORCA-only** (the event camera produces no average image).
 - `_write_multipage_tiff` / `_prepare_raw_frames` — shared internals (ROI crop + native-depth coercion).
 
 *Logging:*
@@ -140,7 +141,7 @@ Dependency-light constants:
 - **`orchestrator.py`** — `AutomatedZStackWorker(QThread)`, the **3D integration point**. Drives the PI stage to each Z plane and acquires with the **selected camera**:
   - **ORCA**: a speckle frame stack → `compute_dsi_images` (avg + std); each plane's raw frames written to their own `<name>_raw_stack_zNNN.tif` via `save_raw_stack_tiff(..., plane=step)` (one file per plane); emits the normalized std image + `z_profile_update`.
   - **EVK4**: a fixed-duration recording per plane (device re-init per plane for clean state), accumulated **directly from the live stream** via `accumulate_event_frame` (+ optional filter/smooth). **No per-plane `.raw` file is written** — the stack's only data output is the single consolidated `zstack_event_*.tif` volume (the "save raw" checkbox is ORCA-only). `_capture_plane_event(step)` uses a bounded generator (`events_for_duration`) so memory stays flat and an abort discards the partial plane.
-  - At the end, per-plane sectioned images are stacked into depth volumes and saved via `save_volume_tiff`, the **axial-sectioning profile** (Fig. 3a) is fitted and saved via `save_axial_sectioning_plot` (FWHM reported in the status bar), plus a parameter log that records the z-positions. Each ORCA plane's raw file is written as that plane completes, so partial/aborted stacks keep the raw files of every plane that finished and still save whatever sectioned planes completed.
+  - At the end, per-plane sectioned images are stacked into depth volumes and saved via `save_volume_tiff`, the **axial-sectioning profile** (Fig. 3a) is fitted and saved via `save_axial_sectioning_plot` (FWHM reported in the status bar), and — for ORCA — a **companion axial-average profile** of the widefield image is saved via `save_axial_average_plot` (straight-line fit, showing the average has no sectioning), plus a parameter log that records the z-positions. Each ORCA plane's raw file is written as that plane completes, so partial/aborted stacks keep the raw files of every plane that finished and still save whatever sectioned planes completed.
 
 ---
 
@@ -178,6 +179,7 @@ MainWindow.start_zstack  (pauses PIStageWidget polling; hands stage to orchestra
          emit image_ready + z_profile_update + position_update
        save_volume_tiff(depth volumes)
        save_axial_sectioning_plot(z, per-plane mean intensity)  # Fig. 3a: CSV + Gaussian FWHM + PNG
+       save_axial_average_plot(z, per-plane mean average intensity)  # ORCA only: CSV + straight-line fit + PNG
        save_parameter_log
 ```
 

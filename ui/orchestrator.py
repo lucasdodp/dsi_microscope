@@ -26,8 +26,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import DCAM_EXPOSURE_PROP, EVK4_ERC_RATE
 from core import (
     accumulate_event_frame, apply_smoothing, compute_dsi_images, filter_crazy_pixels,
-    normalize_to_8bit, save_axial_sectioning_plot, save_parameter_log,
-    save_raw_stack_tiff, save_volume_tiff,
+    normalize_to_8bit, save_axial_average_plot, save_axial_sectioning_plot,
+    save_parameter_log, save_raw_stack_tiff, save_volume_tiff,
 )
 from hardware.event_camera import EventsIterator, METAVISION_AVAILABLE, initiate_device
 from hardware.orca_camera import DCAM_AVAILABLE, Dcam, Dcamapi
@@ -287,6 +287,14 @@ class AutomatedZStackWorker(QThread):
             profile_msg = f" Axial FWHM ≈ {fwhm:.2f} µm."
         if png_path is None:
             profile_msg += " (install matplotlib for the profile PNG)"
+
+        # Companion profile of the *average* (widefield) image vs axial position.
+        # Unlike the sectioned image it has no peak — its mean intensity is flat
+        # across z — so it is fitted with a straight line, not a Gaussian. The
+        # average image only exists for the ORCA (the event camera produces none).
+        if self.camera == "orca" and avg_volume:
+            avg_intensities = [float(np.mean(img)) for img in avg_volume]
+            save_axial_average_plot(z_positions[:n], avg_intensities, out_dir, filename)
 
         metadata = self.save_params.get("metadata")
         if metadata:
