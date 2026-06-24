@@ -270,12 +270,13 @@ $$
 
 ### 5.2 16-bit live-view scaling — `scale_16bit_image`
 
-An integer stretch by the current frame maximum, then a down-shift to 8 bits:
+A **fixed** linear map from the full 16-bit range to 8 bits (an 8-bit down-shift), independent of frame content:
 
 $$
-O(x,y) = \left\lfloor \frac{I(x,y)\cdot \big\lfloor 65535 / I_{\max}\big\rfloor}{256} \right\rfloor,
-\qquad I_{\max}=\max_{x,y} I .
+O(x,y) = \left\lfloor \frac{I(x,y)}{256} \right\rfloor .
 $$
+
+This is deliberately content-independent so the display brightness tracks the real signal level — a shorter exposure looks dimmer, as on the vendor software. The earlier per-frame auto-stretch by the frame maximum, $O = \lfloor I\cdot\lfloor 65535/I_{\max}\rfloor / 256\rfloor$, *inverted* that relationship: a dimmer frame was multiplied by a larger $\lfloor 65535/I_{\max}\rfloor$, so reducing the exposure made the preview brighter. It affected the live preview only; the raw stack and the DSI statistics always use the untouched 16-bit data.
 
 ---
 

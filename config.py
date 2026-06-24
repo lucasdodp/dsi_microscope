@@ -182,6 +182,10 @@ ACQUISITION_HISTORY_MAX = 40  # most recent runs kept per acquisition type
 EVK4_ERC_RATE = 20_000_000          # Event Rate Controller cap (events/s)
 EVK4_FPS = 25                       # PeriodicFrameGenerationAlgorithm display fps
 EVK4_CRAZY_PIXEL_PERCENTILE = 99.9  # Hot-pixel rejection threshold
+# IMX636 sensor geometry — the EVK4 streams events in this full-sensor pixel
+# space regardless of any ROI, so the crop window is expressed against it.
+EVK4_SENSOR_WIDTH = 1280
+EVK4_SENSOR_HEIGHT = 720
 
 # ---------------------------------------------------------------------------
 # Qt stylesheet (dark theme)

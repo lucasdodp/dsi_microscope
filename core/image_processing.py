@@ -137,6 +137,28 @@ def compute_dsi_images(stack, roi=None):
     return avg_img, std_img
 
 
+def crop_to_roi(image, roi):
+    """Crop a 2D (H, W) or 3D (H, W, C) image to an ROI window.
+
+    The ROI uses the same ``x_min``/``x_max``/``y_min``/``y_max`` keys as the
+    ORCA DSI crop, expressed in the image's own pixel coordinates. Bounds are
+    clamped to the frame so a generous selection can't slice out of range, and
+    ``roi=None`` (or a window covering the whole frame) returns the image
+    unchanged. Works for both grayscale and colour frames, so it serves the EVK4
+    live preview (BGR) and the accumulated event image (2D) alike.
+    """
+    if roi is None:
+        return image
+    h, w = image.shape[:2]
+    y0 = max(0, min(int(roi["y_min"]), h))
+    y1 = max(y0, min(int(roi["y_max"]), h))
+    x0 = max(0, min(int(roi["x_min"]), w))
+    x1 = max(x0, min(int(roi["x_max"]), w))
+    if (x0, y0, x1, y1) == (0, 0, w, h):
+        return image
+    return image[y0:y1, x0:x1]
+
+
 def normalize_to_8bit(image):
     """Min-max normalize a float image to an 8-bit image for display / preview."""
     return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -550,14 +572,19 @@ def save_parameter_log(out_dir, filename, sections):
 def scale_16bit_image(data):
     """Scale a 16-bit camera frame to an 8-bit display image.
 
-    Mirrors the original live-view scaling: stretch by an integer multiple of the
-    current frame maximum, then down-shift to 8-bit.
+    Uses a *fixed* linear map from the full 16-bit range to 8 bits (a plain
+    8-bit down-shift), so the displayed brightness tracks the real signal level:
+    a shorter exposure looks dimmer, as it does on the vendor software.
+
+    The previous version auto-stretched every frame by its own maximum
+    (``imul = 65535 // frame_max``). That inverted the relationship — a dimmer
+    frame was scaled by a *larger* multiplier, so reducing the exposure made the
+    live preview *brighter*. It was a display artifact only: the raw stack and
+    the DSI statistics always run on the untouched camera data, so acquisition
+    was never affected.
     """
     if data.dtype == np.uint16:
-        imax = np.amax(data)
-        if imax > 0:
-            imul = int(65535 / imax)
-            data = data * imul
+        return (data >> 8).astype(np.uint8)
     return (data / 256).astype(np.uint8)
 
 

@@ -25,11 +25,13 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import DCAM_EXPOSURE_PROP, EVK4_ERC_RATE
 from core import (
-    accumulate_event_frame, apply_smoothing, compute_dsi_images, filter_crazy_pixels,
-    normalize_to_8bit, save_axial_average_plot, save_axial_sectioning_plot,
-    save_parameter_log, save_raw_stack_tiff, save_volume_tiff,
+    accumulate_event_frame, apply_smoothing, compute_dsi_images, crop_to_roi,
+    filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
+    save_axial_sectioning_plot, save_parameter_log, save_raw_stack_tiff, save_volume_tiff,
 )
-from hardware.event_camera import EventsIterator, METAVISION_AVAILABLE, initiate_device
+from hardware.event_camera import (
+    apply_event_roi, EventsIterator, METAVISION_AVAILABLE, initiate_device,
+)
 from hardware.orca_camera import DCAM_AVAILABLE, Dcam, Dcamapi
 from hardware.stage_control import pitools
 
@@ -231,6 +233,11 @@ class AutomatedZStackWorker(QThread):
             erc.enable(True)
             erc.set_cd_event_rate(EVK4_ERC_RATE)
 
+        # Fixed ROI per plane: set the hardware ROI best-effort (event-rate cut),
+        # then software-crop the accumulated image to the same window below.
+        roi = p.get("evk4_roi")
+        apply_event_roi(device, roi)
+
         mv_iterator = EventsIterator.from_device(device=device)
         height, width = mv_iterator.get_size()
 
@@ -248,6 +255,7 @@ class AutomatedZStackWorker(QThread):
                     return
 
         event_img = accumulate_event_frame(events_for_duration(), width, height)
+        event_img = crop_to_roi(event_img, roi)  # match the live crop framing
 
         if not self._is_running:
             return None

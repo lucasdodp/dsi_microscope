@@ -14,6 +14,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen
 from config import (
     DCAM_BINNING_OPTIONS, DCAM_DEFECTCORRECT_OPTIONS, DCAM_READOUTSPEED_OPTIONS,
     DCAM_TRIGGER_MODE_OPTIONS, DCAM_TRIGGERSOURCE_OPTIONS,
+    EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT,
     ORCA_DSI_PROCESS_PIXELS_PER_S, ORCA_ROW_READOUT_US,
     ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT, ZSTACK_DISK_BYTES_PER_S,
 )
@@ -33,10 +34,40 @@ def make_dcam_combo(options, default_label):
     return combo
 
 
+def make_offset_slider(limit, step=4):
+    """Build a draggable centre-offset slider (range ±limit px) paired with a
+    live value label. Returns (slider, row_layout) for a form row.
+
+    Shared by the ORCA and EVK4 ROI controls so the crop offset behaves
+    identically for both cameras — drag, click-to-jump, or scroll-wheel, with a
+    live "N px" readout instead of typing.
+    """
+    slider = QSlider(Qt.Orientation.Horizontal)
+    slider.setRange(-limit, limit)
+    slider.setSingleStep(step)    # arrow keys / scroll wheel step
+    slider.setPageStep(step * 10)  # click-in-trough jump
+    slider.setMinimumWidth(140)   # wide enough to grab and drag comfortably
+    slider.setValue(0)
+    value_lbl = QLabel("0 px")
+    value_lbl.setMinimumWidth(56)
+    value_lbl.setStyleSheet("color: #cccccc;")
+    slider.valueChanged.connect(lambda v: value_lbl.setText(f"{v} px"))
+    row = QHBoxLayout()
+    row.addWidget(slider, stretch=1)
+    row.addWidget(value_lbl)
+    return slider, row
+
+
 class Evk4ParamsWidget(QWidget):
     """Reusable Prophesee EVK4 parameter controls: biases, per-acquisition
-    duration, and post-processing options. Used in both the Event Camera tab and
-    the Z-Stack tab so each has independent, fully selectable parameters."""
+    duration, ROI crop, and post-processing options. Used in both the Event
+    Camera tab and the Z-Stack tab so each has independent, fully selectable
+    parameters."""
+
+    # Emitted (debounced) whenever the ROI geometry — size or centre offset —
+    # changes, so a running live feed can be re-cropped without clicking Apply.
+    # Mirrors OrcaParamsWidget so the interactive crop tool drives both cameras.
+    roi_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -76,6 +107,71 @@ class Evk4ParamsWidget(QWidget):
         post_group.setLayout(post_layout)
         layout.addWidget(post_group)
 
+        # ROI crop — the same width/height + centre-offset model as the ORCA, so
+        # the interactive crop tool and live re-cropping work identically for the
+        # event camera. The crop is expressed in IMX636 full-sensor pixels; the
+        # event stream is always full-sensor, so the region is software-cropped
+        # from the live frame and the accumulated image (and, best-effort, used to
+        # drive a hardware ROI to cut the event rate).
+        roi_group = QGroupBox("Region of Interest — Crop")
+        roi_form = QFormLayout()
+        self.spin_roi_width = QSpinBox()
+        self.spin_roi_width.setRange(1, EVK4_SENSOR_WIDTH)
+        self.spin_roi_width.setValue(EVK4_SENSOR_WIDTH)
+        self.spin_roi_width.setSuffix(" px")
+        self.spin_roi_height = QSpinBox()
+        self.spin_roi_height.setRange(1, EVK4_SENSOR_HEIGHT)
+        self.spin_roi_height.setValue(EVK4_SENSOR_HEIGHT)
+        self.spin_roi_height.setSuffix(" px")
+        self.slider_offset_x, offset_x_row = make_offset_slider(EVK4_SENSOR_WIDTH // 2, step=1)
+        self.slider_offset_y, offset_y_row = make_offset_slider(EVK4_SENSOR_HEIGHT // 2, step=1)
+        roi_form.addRow("Width:", self.spin_roi_width)
+        roi_form.addRow("Height:", self.spin_roi_height)
+        roi_form.addRow("Centre offset X:", offset_x_row)
+        roi_form.addRow("Centre offset Y:", offset_y_row)
+        lbl_roi = QLabel(
+            f"Full sensor: {EVK4_SENSOR_WIDTH} × {EVK4_SENSOR_HEIGHT} px. The crop "
+            "is centred and shifted by the offsets, clamped to the sensor. Drag a "
+            "box on the live feed (crop tool) to set it visually."
+        )
+        lbl_roi.setWordWrap(True)
+        lbl_roi.setStyleSheet("color: #888888; font-size: 11px;")
+        roi_form.addRow(lbl_roi)
+        roi_group.setLayout(roi_form)
+        layout.addWidget(roi_group)
+
+        # Debounced live re-cropping: coalesce the burst of valueChanged events
+        # from a drag into a single re-apply (the worker just updates its software
+        # crop window — no device restart, unlike the ORCA hardware subarray).
+        self._roi_debounce = QTimer(self)
+        self._roi_debounce.setSingleShot(True)
+        self._roi_debounce.setInterval(200)
+        self._roi_debounce.timeout.connect(self.roi_changed.emit)
+        for signal in (
+            self.spin_roi_width.valueChanged,
+            self.spin_roi_height.valueChanged,
+            self.slider_offset_x.valueChanged,
+            self.slider_offset_y.valueChanged,
+        ):
+            signal.connect(lambda *_: self._roi_debounce.start())
+
+    def _compute_roi(self):
+        """Compute x_min/x_max/y_min/y_max from the width, height and centre-offset
+        controls, clamped to the IMX636 sensor.
+
+        Unlike the ORCA there is no multiple-of-4 alignment requirement: the crop
+        is applied as an exact software slice (and a best-effort hardware ROI),
+        so any window is valid.
+        """
+        sw, sh = EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
+        w = min(self.spin_roi_width.value(), sw)
+        h = min(self.spin_roi_height.value(), sh)
+        x_min = (sw - w) // 2 + self.slider_offset_x.value()
+        y_min = (sh - h) // 2 + self.slider_offset_y.value()
+        x_min = max(0, min(x_min, sw - w))
+        y_min = max(0, min(y_min, sh - h))
+        return {"x_min": x_min, "x_max": x_min + w, "y_min": y_min, "y_max": y_min + h}
+
     def get_params(self):
         return {
             "bias_fo": self.spin_fo.value(),
@@ -85,11 +181,20 @@ class Evk4ParamsWidget(QWidget):
             "acqu_time": self.spin_time.value(),
             "filter_crazy_pixels": self.chk_crazy.isChecked(),
             "apply_smoothing": self.chk_smooth.isChecked(),
+            "evk4_roi": self._compute_roi(),
         }
 
     def get_preset(self):
         """Return all widget values as a JSON-serialisable dict for preset files."""
-        return self.get_params()
+        data = self.get_params()
+        data.pop("evk4_roi", None)  # store the control values, not the derived window
+        data.update({
+            "roi_width": self.spin_roi_width.value(),
+            "roi_height": self.spin_roi_height.value(),
+            "roi_offset_x": self.slider_offset_x.value(),
+            "roi_offset_y": self.slider_offset_y.value(),
+        })
+        return data
 
     def set_preset(self, data):
         """Restore widget values from a preset dict. Unknown keys are ignored."""
@@ -107,6 +212,14 @@ class Evk4ParamsWidget(QWidget):
             self.chk_crazy.setChecked(bool(data["filter_crazy_pixels"]))
         if "apply_smoothing" in data:
             self.chk_smooth.setChecked(bool(data["apply_smoothing"]))
+        if "roi_width" in data:
+            self.spin_roi_width.setValue(int(data["roi_width"]))
+        if "roi_height" in data:
+            self.spin_roi_height.setValue(int(data["roi_height"]))
+        if "roi_offset_x" in data:
+            self.slider_offset_x.setValue(int(data["roi_offset_x"]))
+        if "roi_offset_y" in data:
+            self.slider_offset_y.setValue(int(data["roi_offset_y"]))
 
 
 class OrcaParamsWidget(QWidget):
@@ -174,8 +287,8 @@ class OrcaParamsWidget(QWidget):
         # draggable sliders (drag, click-to-jump, or scroll-wheel over them) with
         # a live value label — far quicker than typing. Step 4 keeps the
         # resulting subarray position aligned to the required grid.
-        self.slider_offset_x, offset_x_row = self._make_offset_slider(ORCA_SENSOR_WIDTH // 2)
-        self.slider_offset_y, offset_y_row = self._make_offset_slider(ORCA_SENSOR_HEIGHT // 2)
+        self.slider_offset_x, offset_x_row = make_offset_slider(ORCA_SENSOR_WIDTH // 2)
+        self.slider_offset_y, offset_y_row = make_offset_slider(ORCA_SENSOR_HEIGHT // 2)
         roi_form.addRow("Width:", self.spin_roi_width)
         roi_form.addRow("Height:", self.spin_roi_height)
         roi_form.addRow("Centre offset X:", offset_x_row)
@@ -226,24 +339,6 @@ class OrcaParamsWidget(QWidget):
         self.btn_apply_live = QPushButton("Apply All Settings to Live Feed")
         self.btn_apply_live.setEnabled(False)
         layout.addWidget(self.btn_apply_live)
-
-    def _make_offset_slider(self, limit):
-        """Build a draggable centre-offset slider (range ±limit px) paired with a
-        live value label. Returns (slider, row_layout) for the form."""
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(-limit, limit)
-        slider.setSingleStep(4)   # arrow keys / scroll wheel step
-        slider.setPageStep(40)    # click-in-trough jump
-        slider.setMinimumWidth(140)  # wide enough to grab and drag comfortably
-        slider.setValue(0)
-        value_lbl = QLabel("0 px")
-        value_lbl.setMinimumWidth(56)
-        value_lbl.setStyleSheet("color: #cccccc;")
-        slider.valueChanged.connect(lambda v: value_lbl.setText(f"{v} px"))
-        row = QHBoxLayout()
-        row.addWidget(slider, stretch=1)
-        row.addWidget(value_lbl)
-        return slider, row
 
     def estimated_raw_save_s(self, n):
         """Estimated time to write the N-frame raw 16-bit stack to disk.

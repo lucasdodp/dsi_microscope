@@ -7,6 +7,7 @@ the optical-sectioning mathematics can be unit-tested and reused in isolation.
 from .image_processing import (
     process_dsi,
     compute_dsi_images,
+    crop_to_roi,
     normalize_to_8bit,
     save_dsi_results,
     save_raw_stack_tiff,
@@ -24,6 +25,7 @@ from .image_processing import (
 __all__ = [
     "process_dsi",
     "compute_dsi_images",
+    "crop_to_roi",
     "normalize_to_8bit",
     "save_dsi_results",
     "save_raw_stack_tiff",

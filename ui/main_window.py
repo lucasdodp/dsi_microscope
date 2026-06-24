@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 
 from config import (
     ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
+    EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH,
     ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
     SESSION_STATE_PATH,
 )
@@ -699,10 +700,16 @@ class MainWindow(QMainWindow):
         Shared by the manual *Save Preset* button and the automatic session-state
         save on exit, so both write exactly the same structure.
         """
+        # Each camera params widget exists twice — once in its own tab and once
+        # in the Z-Stack tab — and the two are fully independent. Persist *both*
+        # copies, or a Camera Mode & Readout (or any) change made in the Z-Stack
+        # tab would be silently dropped (only the standalone copy was saved).
         return {
             "version": 1,
             "evk4": self.evk4_params.get_preset(),
+            "evk4_zstack": self.zstack_evk4_params.get_preset(),
             "orca": self.orca_params.get_preset(),
+            "orca_zstack": self.zstack_orca_params.get_preset(),
             "awg": self.awg_widget.get_preset(),
             "zstack": {
                 "camera": self.combo_zstack_camera.currentData(),
@@ -724,13 +731,16 @@ class MainWindow(QMainWindow):
 
     def _apply_preset(self, preset):
         """Apply a preset/session dict to every control. Unknown keys are ignored."""
+        # Restore each tab's copy independently. Older session/preset files only
+        # stored one set per camera; fall back to it for the Z-Stack copy so they
+        # still load (and keep the previous "applied to both" behaviour).
         if "evk4" in preset:
             self.evk4_params.set_preset(preset["evk4"])
-            self.zstack_evk4_params.set_preset(preset["evk4"])
+            self.zstack_evk4_params.set_preset(preset.get("evk4_zstack", preset["evk4"]))
 
         if "orca" in preset:
             self.orca_params.set_preset(preset["orca"])
-            self.zstack_orca_params.set_preset(preset["orca"])
+            self.zstack_orca_params.set_preset(preset.get("orca_zstack", preset["orca"]))
 
         if "awg" in preset:
             self.awg_widget.set_preset(preset["awg"])
@@ -896,6 +906,7 @@ class MainWindow(QMainWindow):
         o = orca_widget.get_params()
         modes = orca_widget.mode_labels()
         roi = o["orca_roi"]
+        eroi = e["evk4_roi"]
         return {
             "Acquisition": {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -911,6 +922,10 @@ class MainWindow(QMainWindow):
                 "acquisition_time_s": e["acqu_time"],
                 "filter_crazy_pixels": e["filter_crazy_pixels"],
                 "apply_smoothing": e["apply_smoothing"],
+                "roi_x_min": eroi["x_min"],
+                "roi_x_max": eroi["x_max"],
+                "roi_y_min": eroi["y_min"],
+                "roi_y_max": eroi["y_max"],
             },
             "Scientific Camera (Hamamatsu ORCA-Fusion)": {
                 "exposure_time_ms": o["orca_exposure"],
@@ -989,6 +1004,9 @@ class MainWindow(QMainWindow):
         if mode == "live":
             self.evk4_params.btn_apply_biases.setEnabled(True)
             self.evk4_params.btn_apply_biases.clicked.connect(self._apply_evk4_biases_live)
+            # Live re-cropping: dragging the ROI controls (or the crop tool)
+            # re-frames the live feed automatically (debounced in the widget).
+            self.evk4_params.roi_changed.connect(self._apply_evk4_roi_live)
         else:
             self._begin_acq_record(
                 "evk4_single", self._evk4_predicted_s(), planes=1,
@@ -1014,16 +1032,24 @@ class MainWindow(QMainWindow):
         self._reset_evk4_apply()
 
     def _reset_evk4_apply(self):
-        """Disable + disconnect the EVK4 live bias-apply button."""
+        """Disable + disconnect the EVK4 live bias-apply button and live re-cropping."""
         self.evk4_params.btn_apply_biases.setEnabled(False)
         try:
             self.evk4_params.btn_apply_biases.clicked.disconnect(self._apply_evk4_biases_live)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.evk4_params.roi_changed.disconnect(self._apply_evk4_roi_live)
         except (RuntimeError, TypeError):
             pass
 
     def _apply_evk4_biases_live(self):
         if self.evk4_worker is not None and self.evk4_worker.isRunning():
             self.evk4_worker.apply_biases(self.evk4_params.get_params())
+
+    def _apply_evk4_roi_live(self):
+        if self.evk4_worker is not None and self.evk4_worker.isRunning():
+            self.evk4_worker.apply_roi(self.evk4_params._compute_roi())
 
     # ==========================
     # ORCA Logic
@@ -1166,6 +1192,7 @@ class MainWindow(QMainWindow):
             self.zstack_live_worker.frame_ready.connect(self.update_image)
             self.zstack_evk4_params.btn_apply_biases.setEnabled(True)
             self.zstack_evk4_params.btn_apply_biases.clicked.connect(self._apply_zstack_evk4_biases_live)
+            self.zstack_evk4_params.roi_changed.connect(self._apply_zstack_evk4_roi_live)
 
         self.zstack_live_worker.status_update.connect(self.lbl_status.setText)
         self.zstack_live_worker.error_signal.connect(self.show_error)
@@ -1355,6 +1382,10 @@ class MainWindow(QMainWindow):
             self.zstack_orca_params.roi_changed.disconnect(self._apply_zstack_orca_params_live)
         except (RuntimeError, TypeError):
             pass
+        try:
+            self.zstack_evk4_params.roi_changed.disconnect(self._apply_zstack_evk4_roi_live)
+        except (RuntimeError, TypeError):
+            pass
         for slot in (self._apply_zstack_orca_params_live, self._apply_zstack_evk4_biases_live):
             try:
                 self.zstack_orca_params.btn_apply_live.clicked.disconnect(slot)
@@ -1372,6 +1403,10 @@ class MainWindow(QMainWindow):
     def _apply_zstack_evk4_biases_live(self):
         if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
             self.zstack_live_worker.apply_biases(self.zstack_evk4_params.get_params())
+
+    def _apply_zstack_evk4_roi_live(self):
+        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
+            self.zstack_live_worker.apply_roi(self.zstack_evk4_params._compute_roi())
 
     # ==========================
     # General UI Handling
@@ -1415,9 +1450,9 @@ class MainWindow(QMainWindow):
         self.btn_crop_select = QPushButton("⛶  Select Crop Region")
         self.btn_crop_select.setCheckable(True)
         self.btn_crop_select.setToolTip(
-            "Drag a rectangle on the full-sensor ORCA live image to mark a crop "
-            "region. The box stays on screen so you can review it, then click "
-            "'Apply Crop' to set the camera ROI to that region."
+            "Drag a rectangle on the live image (ORCA or event camera) to mark a "
+            "crop region. The box stays on screen so you can review it, then click "
+            "'Apply Crop' to set that camera's ROI to the region."
         )
         self.btn_crop_select.toggled.connect(self._toggle_crop_mode)
 
@@ -1440,13 +1475,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_crop, stretch=1)
         return bar
 
-    def _active_orca_params(self):
-        """The ORCA parameter widget the crop tool should drive: the Z-stack copy
-        when that tab is active with the ORCA camera, otherwise the standalone one."""
-        if (self.tabs.currentWidget() is self.tab_zstack
-                and self.combo_zstack_camera.currentData() == "orca"):
-            return self.zstack_orca_params
-        return self.orca_params
+    def _active_crop_target(self):
+        """Return (params_widget, sensor_w, sensor_h) for the camera the crop tool
+        should drive, based on the active tab (and the Z-stack camera selector).
+
+        Both ORCA and EVK4 params widgets expose the same ROI interface
+        (``spin_roi_width``/``spin_roi_height``, ``slider_offset_x``/``_y``,
+        ``_compute_roi``), so the crop tool treats them uniformly — only the
+        sensor dimensions differ between cameras."""
+        if self.tabs.currentWidget() is self.tab_zstack:
+            if self.combo_zstack_camera.currentData() == "orca":
+                return self.zstack_orca_params, ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
+            return self.zstack_evk4_params, EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
+        if self.tabs.currentWidget() is self.tab_evk4:
+            return self.evk4_params, EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
+        return self.orca_params, ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
 
     def _toggle_crop_mode(self, on):
         self.video_label.set_crop_mode(on)
@@ -1461,10 +1504,12 @@ class MainWindow(QMainWindow):
     def _frame_region_to_sensor(self, x, y, w, h):
         """Map a region in the displayed frame's pixels to absolute sensor pixels.
 
-        Assumes the frame was read out 1:1 (no binning) from the active ROI, so the
-        frame origin is that ROI's top-left — at full sensor this is the identity.
+        The frame shown is the active ROI window (1:1, no binning), so the frame
+        origin is that ROI's top-left — at full sensor this is the identity. Works
+        for either camera via the active crop target's ROI.
         """
-        roi = self._active_orca_params()._compute_roi()
+        params, _, _ = self._active_crop_target()
+        roi = params._compute_roi()
         return roi["x_min"] + x, roi["y_min"] + y, w, h
 
     def _on_crop_region_drawn(self, x, y, w, h):
@@ -1475,21 +1520,21 @@ class MainWindow(QMainWindow):
         self.lbl_crop.setText(f"Selection: {sw} × {sh} px  @ ({sx}, {sy}) — click Apply Crop")
 
     def _apply_crop(self):
-        """Set the active ORCA ROI to the drawn region (re-applies live if running)."""
+        """Set the active camera's ROI to the drawn region (re-applies live if running)."""
         if self._crop_region is None:
             return
         if self._current_frame is None:
-            self.lbl_status.setText("Start an ORCA live feed before cropping.")
+            self.lbl_status.setText("Start a live feed before cropping.")
             return
         x, y, w, h = self._crop_region
         sx, sy, sw, sh = self._frame_region_to_sensor(x, y, w, h)
-        params = self._active_orca_params()
+        params, sensor_w, sensor_h = self._active_crop_target()
         # Convert the absolute sensor rectangle into the widget's width/height +
-        # centre-offset model; _compute_roi re-aligns to multiples of 4 and clamps.
-        offset_x = int(round(sx + sw / 2.0 - ORCA_SENSOR_WIDTH / 2.0))
-        offset_y = int(round(sy + sh / 2.0 - ORCA_SENSOR_HEIGHT / 2.0))
-        params.spin_roi_width.setValue(min(sw, ORCA_SENSOR_WIDTH))
-        params.spin_roi_height.setValue(min(sh, ORCA_SENSOR_HEIGHT))
+        # centre-offset model; _compute_roi clamps (and, for ORCA, 4-px-aligns).
+        offset_x = int(round(sx + sw / 2.0 - sensor_w / 2.0))
+        offset_y = int(round(sy + sh / 2.0 - sensor_h / 2.0))
+        params.spin_roi_width.setValue(min(sw, sensor_w))
+        params.spin_roi_height.setValue(min(sh, sensor_h))
         params.slider_offset_x.setValue(offset_x)   # QSlider clamps to its range
         params.slider_offset_y.setValue(offset_y)
 
@@ -1504,10 +1549,10 @@ class MainWindow(QMainWindow):
         self.video_label.clear_selection()
 
     def _reset_crop(self):
-        """Restore the active ORCA ROI to the full sensor."""
-        params = self._active_orca_params()
-        params.spin_roi_width.setValue(ORCA_SENSOR_WIDTH)
-        params.spin_roi_height.setValue(ORCA_SENSOR_HEIGHT)
+        """Restore the active camera's ROI to its full sensor."""
+        params, sensor_w, sensor_h = self._active_crop_target()
+        params.spin_roi_width.setValue(sensor_w)
+        params.spin_roi_height.setValue(sensor_h)
         params.slider_offset_x.setValue(0)
         params.slider_offset_y.setValue(0)
         self._crop_region = None
@@ -1515,5 +1560,5 @@ class MainWindow(QMainWindow):
         self.lbl_crop.setText("")
         self.video_label.clear_selection()
         self.lbl_status.setText(
-            f"ROI reset to full sensor ({ORCA_SENSOR_WIDTH} × {ORCA_SENSOR_HEIGHT})."
+            f"ROI reset to full sensor ({sensor_w} × {sensor_h})."
         )
