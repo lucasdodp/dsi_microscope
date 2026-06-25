@@ -41,8 +41,16 @@ class MainWindow(QMainWindow):
         self.orca_worker = None
         self.zstack_worker = None
         self.zstack_live_worker = None
-        self._current_frame = None   # last frame shown (image pixels), for the crop tool
+        # Snapshot of the ORCA settings currently applied to the Z-Stack live feed,
+        # so a real-time crop change re-applies only the ROI (other edits wait for
+        # the Apply button).
+        self._zstack_orca_live_params = None
+        # Last frame shown per camera (image pixels), for the crop tool. The two
+        # cameras have independent feeds so both can be viewed at once.
+        self._orca_frame = None
+        self._evk4_frame = None
         self._crop_region = None     # pending crop selection (x, y, w, h) in frame px
+        self._crop_label = None      # the feed label currently in crop mode (if any)
         # Remembers the last auto-generated timestamp default for each filename
         # field, so the field is only re-stamped while it still holds that default
         # (a name the user typed themselves is never overwritten).
@@ -118,9 +126,14 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.awg_widget)
 
         self.tabs = QTabWidget()
+        # 3D Z-Stack is the primary workflow, so it is the first tab and the one
+        # shown on launch. The standalone camera tabs follow it.
+        self._build_zstack_tab()
         self._build_evk4_tab()
         self._build_orca_tab()
-        self._build_zstack_tab()
+        # Switching tabs changes which camera the crop tool targets; cancel any
+        # in-progress crop so its overlay can't be stranded on the previous feed.
+        self.tabs.currentChanged.connect(self._cancel_crop_mode)
         # Populate the time-estimate labels with the default parameter values.
         self._update_evk4_time()
         self._update_orca_time()
@@ -151,13 +164,60 @@ class MainWindow(QMainWindow):
         feed_layout = QVBoxLayout(feed_panel)
         feed_layout.setContentsMargins(2, 2, 2, 2)
 
-        self.video_label = VideoFeedLabel("Video Feed Offline")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("color: #555555; font-size: 24px; font-weight: bold; border: none;")
-        self.video_label.region_drawn.connect(self._on_crop_region_drawn)
-        feed_layout.addWidget(self.video_label, stretch=1)
+        # The two cameras share the sample via a beamsplitter, so both can stream
+        # at once. A view selector chooses what is shown: one camera at a time
+        # (toggle) or both feeds stacked. Each feed is an independent VideoFeedLabel
+        # so the two never overwrite each other.
+        view_bar = QHBoxLayout()
+        view_bar.setContentsMargins(6, 4, 6, 0)
+        lbl_view = QLabel("Display:")
+        lbl_view.setStyleSheet("color: #cccccc; border: none;")
+        self.combo_feed_view = QComboBox()
+        self.combo_feed_view.addItem("ORCA only", "orca")
+        self.combo_feed_view.addItem("Event camera only", "evk4")
+        self.combo_feed_view.addItem("Both (stacked)", "both")
+        # Launch showing the ORCA feed only; the user can switch to the event
+        # camera or Both (stacked), or use Start Both Cameras (which selects Both).
+        self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData("orca"))
+        self.combo_feed_view.currentIndexChanged.connect(self._apply_feed_view)
+        view_bar.addWidget(lbl_view)
+        view_bar.addWidget(self.combo_feed_view)
+        view_bar.addStretch()
+
+        # Start/stop both live feeds at once. This lives in the shared feed panel
+        # (not a single camera's tab) because it acts on both cameras together —
+        # the beamsplitter feeds both simultaneously.
+        self.btn_both_live = QPushButton("▶  Start Both Cameras")
+        self.btn_both_live.setObjectName("btnLive")
+        self.btn_both_live.setToolTip(
+            "Start the ORCA and event-camera live feeds together (or stop both if "
+            "both are running). Switches the display to Both (stacked)."
+        )
+        self.btn_both_live.clicked.connect(self._toggle_both_live)
+        view_bar.addWidget(self.btn_both_live)
+        feed_layout.addLayout(view_bar)
+
+        self.lbl_orca_feed_title = QLabel("Scientific Camera (ORCA)")
+        self.lbl_evk4_feed_title = QLabel("Event Camera (EVK4)")
+        self.video_label_orca = VideoFeedLabel("ORCA Feed Offline")
+        self.video_label_evk4 = VideoFeedLabel("Event Camera Feed Offline")
+        for title in (self.lbl_orca_feed_title, self.lbl_evk4_feed_title):
+            title.setStyleSheet(
+                "color: #4daaf2; font-size: 12px; font-weight: bold; border: none; padding: 2px 6px;"
+            )
+        for lbl, title in (
+            (self.video_label_orca, self.lbl_orca_feed_title),
+            (self.video_label_evk4, self.lbl_evk4_feed_title),
+        ):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color: #555555; font-size: 24px; font-weight: bold; border: none;")
+            lbl.region_drawn.connect(self._on_crop_region_drawn)
+            feed_layout.addWidget(title)
+            feed_layout.addWidget(lbl, stretch=1)
 
         feed_layout.addWidget(self._build_crop_bar())
+
+        self._apply_feed_view()
 
         main_layout.addWidget(feed_panel, stretch=1)
 
@@ -232,9 +292,12 @@ class MainWindow(QMainWindow):
         self.txt_filename = QLineEdit()
         self._stamp_default_filename(self.txt_filename, "recording")
         out_layout.addWidget(self.txt_filename)
-        self.chk_evk4_raw = QCheckBox("Save raw event recording (.raw)")
-        self.chk_evk4_raw.setChecked(False)
-        out_layout.addWidget(self.chk_evk4_raw)
+        lbl_evk4_raw = QLabel(
+            "The raw event recording (.raw) is always saved alongside the .tif/.mat."
+        )
+        lbl_evk4_raw.setWordWrap(True)
+        lbl_evk4_raw.setStyleSheet("color: #888888; font-size: 11px;")
+        out_layout.addWidget(lbl_evk4_raw)
         out_group.setLayout(out_layout)
         evk4_layout.addWidget(out_group)
 
@@ -426,7 +489,14 @@ class MainWindow(QMainWindow):
         camera = self.combo_zstack_camera.currentData()
         self.zstack_orca_params.setVisible(camera == "orca")
         self.zstack_evk4_params.setVisible(camera == "event")
+        self._cancel_crop_mode()
         self._update_zstack_time()
+
+    def _cancel_crop_mode(self):
+        """Leave crop mode if active — used when the crop target (tab / Z-stack
+        camera) changes, so the overlay can't be stranded on the wrong feed."""
+        if self.btn_crop_select.isChecked():
+            self.btn_crop_select.setChecked(False)  # fires _toggle_crop_mode(False)
 
     # ==========================
     # Acquisition time estimates
@@ -718,7 +788,7 @@ class MainWindow(QMainWindow):
                 "focus": self.pi_stage_widget.spin_focus.value(),
             },
             "save_raw": {
-                "evk4": self.chk_evk4_raw.isChecked(),
+                # EVK4 .raw is always saved now, so there is no toggle to persist.
                 "orca": self.chk_orca_raw.isChecked(),
                 "zstack": self.chk_zstack_raw.isChecked(),
             },
@@ -760,8 +830,8 @@ class MainWindow(QMainWindow):
 
         if "save_raw" in preset:
             sr = preset["save_raw"]
-            if "evk4" in sr:
-                self.chk_evk4_raw.setChecked(bool(sr["evk4"]))
+            # "evk4" may appear in older preset/session files; ignored — the EVK4
+            # .raw is always saved now.
             if "orca" in sr:
                 self.chk_orca_raw.setChecked(bool(sr["orca"]))
             if "zstack" in sr:
@@ -969,9 +1039,14 @@ class MainWindow(QMainWindow):
                 "See README.md for setup instructions.",
             )
             return
+        # Refuse a second handle if the Z-Stack tab already has the event camera live.
+        if isinstance(self.zstack_live_worker, CameraWorker) and self.zstack_live_worker.isRunning():
+            self.lbl_status.setText(
+                "The event camera is already live from the 3D Z-Stack tab — stop it there first."
+            )
+            return
         params = self.evk4_params.get_params()
         params["output_dir"] = self.txt_dir.text()
-        params["save_raw"] = self.chk_evk4_raw.isChecked()
         if mode == "acquire" and not params["output_dir"]:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the acquisition.")
             return
@@ -995,11 +1070,12 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
 
         self.evk4_worker = CameraWorker(mode, params)
-        self.evk4_worker.frame_ready.connect(self.update_image)
+        self.evk4_worker.frame_ready.connect(self.update_evk4_image)
         self.evk4_worker.status_update.connect(self.lbl_status.setText)
         self.evk4_worker.error_signal.connect(self.show_error)
         self.evk4_worker.finished_signal.connect(self.on_evk4_finished)
         self.evk4_worker.start()
+        self._sync_both_live_button()
 
         if mode == "live":
             self.evk4_params.btn_apply_biases.setEnabled(True)
@@ -1030,6 +1106,7 @@ class MainWindow(QMainWindow):
         # The filename is re-stamped at the start of the next acquisition (if it is
         # still the auto-default), so stopping a live feed never wipes a typed name.
         self._reset_evk4_apply()
+        self._sync_both_live_button()
 
     def _reset_evk4_apply(self):
         """Disable + disconnect the EVK4 live bias-apply button and live re-cropping."""
@@ -1064,6 +1141,14 @@ class MainWindow(QMainWindow):
                 "(e.g. …\\dcamsdk4\\samples\\python).\n\n"
                 "Open a new terminal after running 'setx' and restart the app.\n\n"
                 "See README.md for full setup instructions.",
+            )
+            return
+        # The ORCA can be open in only one place at a time; refuse to open a second
+        # handle if the Z-Stack tab already has it live (that would conflict and can
+        # freeze the feed).
+        if isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning():
+            self.lbl_status.setText(
+                "ORCA is already live from the 3D Z-Stack tab — stop it there before starting it here."
             )
             return
         params = self.orca_params.get_params()
@@ -1112,11 +1197,12 @@ class MainWindow(QMainWindow):
         self.btn_orca_stop.setEnabled(True)
 
         self.orca_worker = OrcaWorker(mode, params)
-        self.orca_worker.image_ready.connect(self.update_image)
+        self.orca_worker.image_ready.connect(self.update_orca_image)
         self.orca_worker.status_update.connect(self.lbl_status.setText)
         self.orca_worker.error_signal.connect(self.show_error)
         self.orca_worker.finished_signal.connect(self.on_orca_finished)
         self.orca_worker.start()
+        self._sync_both_live_button()
 
         if mode == "live":
             self.orca_params.btn_apply_live.setEnabled(True)
@@ -1146,6 +1232,7 @@ class MainWindow(QMainWindow):
         # Filename is re-stamped at the next acquisition start (if still the auto-
         # default), so stopping live focus mode never wipes a typed name.
         self._reset_orca_live_apply()
+        self._sync_both_live_button()
 
     def _reset_orca_live_apply(self):
         """Disable + disconnect the ORCA live-apply button and live re-framing."""
@@ -1179,17 +1266,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Event Camera Unavailable",
                 "The Prophesee Metavision SDK was not found. See README.md for setup instructions.")
             return
+        # Don't open a camera that is already live from its own tab (or via Start
+        # Both Cameras) — a second handle to the same device conflicts.
+        if camera == "orca" and self.orca_worker is not None and self.orca_worker.isRunning():
+            self.lbl_status.setText(
+                "ORCA is already live from the Scientific Camera tab — stop it there first."
+            )
+            return
+        if camera == "event" and self.evk4_worker is not None and self.evk4_worker.isRunning():
+            self.lbl_status.setText(
+                "The event camera is already live from the Event Camera tab — stop it there first."
+            )
+            return
         self._set_zstack_busy(True)
 
         if camera == "orca":
             self.zstack_live_worker = OrcaWorker("live", self.zstack_orca_params.get_params())
-            self.zstack_live_worker.image_ready.connect(self.update_image)
+            self.zstack_live_worker.image_ready.connect(self.update_orca_image)
+            # Remember what is currently applied to the live feed: the Apply button
+            # pushes ALL settings (exposure, mode, ROI), but a live crop change must
+            # apply only the ROI and leave any un-applied edits untouched.
+            self._zstack_orca_live_params = self.zstack_orca_params.get_params()
             self.zstack_orca_params.btn_apply_live.setEnabled(True)
             self.zstack_orca_params.btn_apply_live.clicked.connect(self._apply_zstack_orca_params_live)
-            self.zstack_orca_params.roi_changed.connect(self._apply_zstack_orca_params_live)
+            self.zstack_orca_params.roi_changed.connect(self._apply_zstack_orca_roi_live)
         else:
             self.zstack_live_worker = CameraWorker("live", self.zstack_evk4_params.get_params())
-            self.zstack_live_worker.frame_ready.connect(self.update_image)
+            self.zstack_live_worker.frame_ready.connect(self.update_evk4_image)
             self.zstack_evk4_params.btn_apply_biases.setEnabled(True)
             self.zstack_evk4_params.btn_apply_biases.clicked.connect(self._apply_zstack_evk4_biases_live)
             self.zstack_evk4_params.roi_changed.connect(self._apply_zstack_evk4_roi_live)
@@ -1338,7 +1441,9 @@ class MainWindow(QMainWindow):
             camera=camera,
             evk4_params=self.zstack_evk4_params.get_params(),
         )
-        self.zstack_worker.image_ready.connect(self.update_image)
+        self.zstack_worker.image_ready.connect(
+            self.update_orca_image if camera == "orca" else self.update_evk4_image
+        )
         self.zstack_worker.status_update.connect(self.lbl_status.setText)
         self.zstack_worker.z_profile_update.connect(self.handle_z_profile)
         self.zstack_worker.position_update.connect(self.pi_stage_widget.show_position)
@@ -1379,7 +1484,7 @@ class MainWindow(QMainWindow):
         self.zstack_orca_params.btn_apply_live.setEnabled(False)
         self.zstack_evk4_params.btn_apply_biases.setEnabled(False)
         try:
-            self.zstack_orca_params.roi_changed.disconnect(self._apply_zstack_orca_params_live)
+            self.zstack_orca_params.roi_changed.disconnect(self._apply_zstack_orca_roi_live)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -1397,8 +1502,26 @@ class MainWindow(QMainWindow):
                 pass
 
     def _apply_zstack_orca_params_live(self):
+        """Apply ALL ORCA settings to the live feed — triggered by the Apply button."""
         if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            self.zstack_live_worker.apply_params(self.zstack_orca_params.get_params())
+            params = self.zstack_orca_params.get_params()
+            self._zstack_orca_live_params = params
+            self.zstack_live_worker.apply_params(params)
+
+    def _apply_zstack_orca_roi_live(self):
+        """Apply only the crop/ROI to the running ORCA live feed, in real time.
+
+        Other parameter edits (exposure, mode, readout) are deliberately left for
+        the Apply button: a live crop change merges the new ROI onto the
+        last-applied settings, so dragging the crop never pushes un-applied edits.
+        """
+        if not (isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning()):
+            return
+        base = self._zstack_orca_live_params or self.zstack_orca_params.get_params()
+        params = dict(base)
+        params["orca_roi"] = self.zstack_orca_params._compute_roi()
+        self._zstack_orca_live_params = params
+        self.zstack_live_worker.apply_params(params)
 
     def _apply_zstack_evk4_biases_live(self):
         if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
@@ -1418,9 +1541,63 @@ class MainWindow(QMainWindow):
         self.on_orca_finished()
         self.on_zstack_finished()
 
-    @pyqtSlot(np.ndarray)
-    def update_image(self, cv_img):
-        self._current_frame = cv_img
+    def _apply_feed_view(self):
+        """Show/hide each camera feed per the view selector (ORCA, EVK4, or both)."""
+        mode = self.combo_feed_view.currentData()
+        show_orca = mode in ("orca", "both")
+        show_evk4 = mode in ("evk4", "both")
+        self.lbl_orca_feed_title.setVisible(show_orca)
+        self.video_label_orca.setVisible(show_orca)
+        self.lbl_evk4_feed_title.setVisible(show_evk4)
+        self.video_label_evk4.setVisible(show_evk4)
+
+    # ==========================
+    # Dual-camera live (both feeds at once)
+    # ==========================
+    def _orca_live_running(self):
+        """True if the ORCA is held by any live feed — its own tab or the Z-Stack
+        tab — so we never open the same camera twice."""
+        if self.orca_worker is not None and self.orca_worker.isRunning():
+            return True
+        return isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning()
+
+    def _evk4_live_running(self):
+        """True if the event camera is held by any live feed (its own tab or the
+        Z-Stack tab)."""
+        if self.evk4_worker is not None and self.evk4_worker.isRunning():
+            return True
+        return isinstance(self.zstack_live_worker, CameraWorker) and self.zstack_live_worker.isRunning()
+
+    def _toggle_both_live(self):
+        """Start both camera live feeds, or stop both if both are already running.
+
+        Reuses the existing per-camera start/stop paths (so live-apply wiring,
+        status routing and finished handlers all behave exactly as on the tabs);
+        each start_* call guards its own SDK availability and warns if missing.
+        """
+        if self._orca_live_running() and self._evk4_live_running():
+            self.stop_orca()
+            self.stop_evk4()
+            self._sync_both_live_button()
+            return
+        # Show both feeds so the result is visible immediately.
+        self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData("both"))
+        # Start only the camera(s) not already running, so a feed already live on
+        # its own tab isn't reopened (which would leak a second camera handle).
+        if not self._orca_live_running():
+            self.start_orca("live")
+        if not self._evk4_live_running():
+            self.start_evk4("live")
+        self._sync_both_live_button()
+
+    def _sync_both_live_button(self):
+        """Reflect the combined live state in the Start/Stop Both button label, so
+        it stays correct even when feeds are started/stopped from their own tabs."""
+        both = self._orca_live_running() and self._evk4_live_running()
+        self.btn_both_live.setText("■  Stop Both Cameras" if both else "▶  Start Both Cameras")
+
+    def _render_to_label(self, label, cv_img):
+        """Render a NumPy frame into a feed label, scaled with KeepAspectRatio."""
         # PyQt6 requires bytes, not memoryview; ascontiguousarray packs the
         # ROI-cropped slice before tobytes() serialises it row-by-row.
         img = np.ascontiguousarray(cv_img)
@@ -1433,10 +1610,20 @@ class MainWindow(QMainWindow):
 
         pixmap = QPixmap.fromImage(qt_img)
         # Let the crop overlay map widget <-> image pixels for this frame size.
-        self.video_label.set_source_size(w, h)
-        self.video_label.setPixmap(
-            pixmap.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+        label.set_source_size(w, h)
+        label.setPixmap(
+            pixmap.scaled(label.width(), label.height(), Qt.AspectRatioMode.KeepAspectRatio)
         )
+
+    @pyqtSlot(np.ndarray)
+    def update_orca_image(self, cv_img):
+        self._orca_frame = cv_img
+        self._render_to_label(self.video_label_orca, cv_img)
+
+    @pyqtSlot(np.ndarray)
+    def update_evk4_image(self, cv_img):
+        self._evk4_frame = cv_img
+        self._render_to_label(self.video_label_evk4, cv_img)
 
     # ==========================
     # Interactive crop tool
@@ -1491,8 +1678,34 @@ class MainWindow(QMainWindow):
             return self.evk4_params, EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
         return self.orca_params, ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
 
+    def _active_crop_label(self):
+        """Return the VideoFeedLabel for the camera the crop tool should drive,
+        mirroring _active_crop_target (same active-tab / Z-stack-camera logic)."""
+        if self.tabs.currentWidget() is self.tab_zstack:
+            if self.combo_zstack_camera.currentData() == "orca":
+                return self.video_label_orca
+            return self.video_label_evk4
+        if self.tabs.currentWidget() is self.tab_evk4:
+            return self.video_label_evk4
+        return self.video_label_orca
+
+    def _active_crop_frame(self):
+        """Last frame of the camera the crop tool targets, or None if no feed yet."""
+        return (self._evk4_frame if self._active_crop_label() is self.video_label_evk4
+                else self._orca_frame)
+
     def _toggle_crop_mode(self, on):
-        self.video_label.set_crop_mode(on)
+        label = self._active_crop_label()
+        # Only one feed draws the crop overlay at a time; clear the other.
+        for lbl in (self.video_label_orca, self.video_label_evk4):
+            if lbl is not label:
+                lbl.set_crop_mode(False)
+        # Make sure the targeted feed is visible so the overlay can be seen/dragged.
+        if on and not label.isVisible():
+            cam = "evk4" if label is self.video_label_evk4 else "orca"
+            self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData(cam))
+        label.set_crop_mode(on)
+        self._crop_label = label if on else None
         self.btn_crop_select.setText(
             "⛶  Selecting… (drag on image)" if on else "⛶  Select Crop Region"
         )
@@ -1523,7 +1736,7 @@ class MainWindow(QMainWindow):
         """Set the active camera's ROI to the drawn region (re-applies live if running)."""
         if self._crop_region is None:
             return
-        if self._current_frame is None:
+        if self._active_crop_frame() is None:
             self.lbl_status.setText("Start a live feed before cropping.")
             return
         x, y, w, h = self._crop_region
@@ -1546,7 +1759,7 @@ class MainWindow(QMainWindow):
         )
         # Leave crop mode; the live feed now shows the cropped subarray.
         self.btn_crop_select.setChecked(False)  # fires _toggle_crop_mode(False)
-        self.video_label.clear_selection()
+        self._active_crop_label().clear_selection()
 
     def _reset_crop(self):
         """Restore the active camera's ROI to its full sensor."""
@@ -1558,7 +1771,7 @@ class MainWindow(QMainWindow):
         self._crop_region = None
         self.btn_crop_apply.setEnabled(False)
         self.lbl_crop.setText("")
-        self.video_label.clear_selection()
+        self._active_crop_label().clear_selection()
         self.lbl_status.setText(
             f"ROI reset to full sensor ({sensor_w} × {sensor_h})."
         )

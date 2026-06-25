@@ -179,11 +179,9 @@ class CameraWorker(QThread):
             if self.mode == "acquire" and self._is_running:
                 self.status_update.emit("Processing final image from RAW data...")
                 self.process_final_image(log_path, width, height)
-                if log_path and not self.params.get("save_raw", True):
-                    try:
-                        os.remove(log_path)
-                    except OSError:
-                        pass
+                # The raw event recording (.raw) is always kept alongside the
+                # .tif/.mat — it is the full event stream the 2D image is derived
+                # from, which downstream analysis re-uses.
 
             self.status_update.emit("Camera stopped.")
             self.finished_signal.emit()

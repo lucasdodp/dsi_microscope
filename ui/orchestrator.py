@@ -11,13 +11,15 @@ At each focal plane it acquires with the selected camera:
     own multi-page TIFF (``<filename>_raw_stack_zNNN.tif``), one file per plane,
     because the downstream MATLAB algorithms (e.g. RIM) consume the planes as
     separate files rather than one combined volume.
-  * Event (EVK4): an event recording for a fixed duration, accumulated directly
-    into an event image (no per-plane .raw file is written).
+  * Event (EVK4): an event recording for a fixed duration, accumulated into an
+    event image; each plane's raw event stream is also saved to its own
+    ``<filename>_events_zNNN.raw`` (one file per plane).
 
 The per-plane sectioned images are assembled into a depth volume and saved as a 3D
 TIFF — a single consolidated output per stack for either camera.
 """
 
+import os
 import time
 
 import numpy as np
@@ -210,13 +212,13 @@ class AutomatedZStackWorker(QThread):
 
     # ----------------------------------------------------------------- EVENT
     def _capture_plane_event(self, step):
-        """Record events for a fixed duration at the current plane and accumulate
-        them directly into an event image.
+        """Record events for a fixed duration at the current plane, accumulate
+        them into an event image, and always save this plane's raw event stream.
 
-        No per-plane ``.raw`` file is written: the events are summed straight
-        from the live stream, so the only EVK4 output is the consolidated
-        sectioned 3D TIFF depth volume (the "save raw" option is ORCA-only). The
-        device is (re)initialized per plane for a clean state.
+        Each plane's events are written to their own ``<filename>_events_zNNN.raw``
+        (one file per plane, z-indexed, mirroring the ORCA's per-plane raw TIFF)
+        in addition to being summed into the consolidated sectioned 3D TIFF depth
+        volume. The device is (re)initialized per plane for a clean state.
         """
         p = self.evk4_params
         device = initiate_device("")
@@ -238,6 +240,18 @@ class AutomatedZStackWorker(QThread):
         roi = p.get("evk4_roi")
         apply_event_roi(device, roi)
 
+        # Always save this plane's raw event stream (one .raw per plane). Logging
+        # must start before the iterator and be stopped in a finally — stopping
+        # without a prior log_raw_data can crash the native library.
+        out_dir = self.save_params.get("output_dir", "")
+        filename = self.save_params.get("filename", "zstack")
+        events_stream = device.get_i_events_stream()
+        raw_logging = False
+        if out_dir and events_stream:
+            raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
+            events_stream.log_raw_data(raw_path)
+            raw_logging = True
+
         mv_iterator = EventsIterator.from_device(device=device)
         height, width = mv_iterator.get_size()
 
@@ -245,7 +259,7 @@ class AutomatedZStackWorker(QThread):
 
         def events_for_duration():
             """Yield event chunks until the acquisition time elapses or the user
-            aborts — so accumulation streams with flat memory and no raw file."""
+            aborts — so accumulation streams with flat memory."""
             start = time.time()
             for evs in mv_iterator:
                 if not self._is_running:
@@ -254,7 +268,11 @@ class AutomatedZStackWorker(QThread):
                 if time.time() - start >= p["acqu_time"]:
                     return
 
-        event_img = accumulate_event_frame(events_for_duration(), width, height)
+        try:
+            event_img = accumulate_event_frame(events_for_duration(), width, height)
+        finally:
+            if raw_logging:
+                events_stream.stop_log_raw_data()
         event_img = crop_to_roi(event_img, roi)  # match the live crop framing
 
         if not self._is_running:
