@@ -134,12 +134,12 @@ class MainWindow(QMainWindow):
         # PI Z-stage: shared between both tabs, in its own collapsible section
         # (mirroring the AWG) so it is reachable from either camera's tab.
         self.pi_stage_widget = PIStageWidget()
-        self.btn_pi_toggle = QPushButton("▾  PI Z-Stage Control")
+        self.btn_pi_toggle = QPushButton("▸  PI Z-Stage Control")
         self.btn_pi_toggle.setCheckable(True)
-        self.btn_pi_toggle.setChecked(True)
         self.btn_pi_toggle.setStyleSheet("text-align: left; padding: 8px; background-color: #3a3f44;")
         self.btn_pi_toggle.toggled.connect(self._toggle_pi)
         control_layout.addWidget(self.btn_pi_toggle)
+        self.pi_stage_widget.setVisible(False)  # starts collapsed, like the AWG section
         control_layout.addWidget(self.pi_stage_widget)
         # The number of Z steps drives both tabs' acquisition-time estimates.
         self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_orca_time)
@@ -576,7 +576,7 @@ class MainWindow(QMainWindow):
         out_dir, filename = rec.get("out_dir"), rec.get("filename")
         if not out_dir or not filename:
             return
-        path = os.path.join(out_dir, f"parameters_{filename}.txt")
+        path = os.path.join(out_dir, f"{filename}_parameters.txt")
         if not os.path.exists(path):
             return
         try:

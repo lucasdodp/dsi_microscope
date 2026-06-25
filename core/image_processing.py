@@ -171,10 +171,10 @@ def save_dsi_results(avg_img, std_img, out_dir, filename):
     (e.g. RIM in MATLAB); the ``.tif`` files are 8-bit normalized previews.
     Returns the output directory for status reporting.
     """
-    scipy.io.savemat(os.path.join(out_dir, f"average_{filename}.mat"), {"average_image": avg_img})
-    scipy.io.savemat(os.path.join(out_dir, f"dsi_{filename}.mat"), {"dsi_image": std_img})
-    cv2.imwrite(os.path.join(out_dir, f"average_{filename}.tif"), normalize_to_8bit(avg_img))
-    cv2.imwrite(os.path.join(out_dir, f"dsi_{filename}.tif"), normalize_to_8bit(std_img))
+    scipy.io.savemat(os.path.join(out_dir, f"{filename}_average.mat"), {"average_image": avg_img})
+    scipy.io.savemat(os.path.join(out_dir, f"{filename}_dsi.mat"), {"dsi_image": std_img})
+    cv2.imwrite(os.path.join(out_dir, f"{filename}_average.tif"), normalize_to_8bit(avg_img))
+    cv2.imwrite(os.path.join(out_dir, f"{filename}_dsi.tif"), normalize_to_8bit(std_img))
     return out_dir
 
 
@@ -264,9 +264,9 @@ def save_volume_tiff(volume, out_dir, filename, kind):
         Image volume of shape (Z, H, W).
     out_dir, filename : str
         Destination directory and filename base (written as
-        ``<kind>_<filename>.tif``).
+        ``<filename>_<kind>.tif``).
     kind : str
-        Short descriptor / filename prefix, e.g. ``"zstack_dsi"``.
+        Short descriptor / filename suffix, e.g. ``"zstack_dsi"``.
 
     Returns
     -------
@@ -276,7 +276,7 @@ def save_volume_tiff(volume, out_dir, filename, kind):
     arr = np.asarray(volume)
     if arr.dtype not in (np.uint8, np.uint16, np.float32):
         arr = arr.astype(np.float32)
-    path = os.path.join(out_dir, f"{kind}_{filename}.tif")
+    path = os.path.join(out_dir, f"{filename}_{kind}.tif")
     _write_multipage_tiff(path, arr)
     return path
 
@@ -323,9 +323,9 @@ def save_axial_sectioning_plot(z_positions, intensities, out_dir, filename, kind
     axial sectioning (the axial extent of the detection PSF convolved with the
     sample). Mirrors Benachir et al., "Event-based DSI", Fig. 3a.
 
-    The underlying data is **always** written as ``axial_profile_<kind>_<name>.csv``
+    The underlying data is **always** written as ``<name>_axial_profile_<kind>.csv``
     (z, mean intensity, peak-normalized intensity, and the fit parameters). The
-    figure ``axial_profile_<kind>_<name>.png`` is written only if matplotlib is
+    figure ``<name>_axial_profile_<kind>.png`` is written only if matplotlib is
     installed; without it the data + fit are still saved.
 
     Parameters
@@ -359,7 +359,7 @@ def save_axial_sectioning_plot(z_positions, intensities, out_dir, filename, kind
     fwhm, popt = _fit_axial_gaussian(z, inten_norm)
 
     # --- data (always) -----------------------------------------------------
-    csv_path = os.path.join(out_dir, f"axial_profile_{kind}_{filename}.csv")
+    csv_path = os.path.join(out_dir, f"{filename}_axial_profile_{kind}.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write("z_position_um,mean_intensity,normalized_intensity\n")
         for zi, raw, nrm in zip(z, inten, inten_norm):
@@ -413,7 +413,7 @@ def _save_axial_figure(z, y_norm, popt, fwhm, out_dir, filename, kind):
         ax.legend()
         fig.tight_layout()
 
-        png_path = os.path.join(out_dir, f"axial_profile_{kind}_{filename}.png")
+        png_path = os.path.join(out_dir, f"{filename}_axial_profile_{kind}.png")
         fig.savefig(png_path, dpi=150)
         return png_path
     except Exception:
@@ -448,9 +448,9 @@ def save_axial_average_plot(z_positions, intensities, out_dir, filename):
     essentially constant across z. We model it with a straight line to make that
     contrast explicit — the (near-flat) slope quantifies the lack of sectioning.
 
-    The data is **always** written as ``axial_average_<name>.csv`` (z, mean
+    The data is **always** written as ``<name>_axial_average.csv`` (z, mean
     intensity, peak-normalized intensity, and the line-fit parameters). The figure
-    ``axial_average_<name>.png`` is written only if matplotlib is installed.
+    ``<name>_axial_average.png`` is written only if matplotlib is installed.
 
     Parameters
     ----------
@@ -480,7 +480,7 @@ def save_axial_average_plot(z_positions, intensities, out_dir, filename):
     slope, intercept = _fit_axial_line(z, inten_norm)
 
     # --- data (always) -----------------------------------------------------
-    csv_path = os.path.join(out_dir, f"axial_average_{filename}.csv")
+    csv_path = os.path.join(out_dir, f"{filename}_axial_average.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write("z_position_um,mean_intensity,normalized_intensity\n")
         for zi, raw, nrm in zip(z, inten, inten_norm):
@@ -530,7 +530,7 @@ def _save_average_figure(z, y_norm, slope, intercept, out_dir, filename):
         ax.legend()
         fig.tight_layout()
 
-        png_path = os.path.join(out_dir, f"axial_average_{filename}.png")
+        png_path = os.path.join(out_dir, f"{filename}_axial_average.png")
         fig.savefig(png_path, dpi=150)
         return png_path
     except Exception:
@@ -547,7 +547,7 @@ def save_parameter_log(out_dir, filename, sections):
     ----------
     out_dir, filename : str
         Destination directory and filename base (the log is written as
-        ``parameters_<filename>.txt``).
+        ``<filename>_parameters.txt``).
     sections : dict
         Ordered mapping of ``{section title: {parameter: value}}``.
 
@@ -563,7 +563,7 @@ def save_parameter_log(out_dir, filename, sections):
             lines.append(f"{key} = {value}")
         lines.append("")
 
-    path = os.path.join(out_dir, f"parameters_{filename}.txt")
+    path = os.path.join(out_dir, f"{filename}_parameters.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return path
@@ -625,9 +625,9 @@ def save_mat_tif(image, out_dir, filename):
 
     Returns the output directory for status reporting.
     """
-    mat_path = os.path.join(out_dir, f"final_image_{filename}.mat")
+    mat_path = os.path.join(out_dir, f"{filename}_final_image.mat")
     scipy.io.savemat(mat_path, {"final_image": image})
 
-    tif_path = os.path.join(out_dir, f"final_image_{filename}.tif")
+    tif_path = os.path.join(out_dir, f"{filename}_final_image.tif")
     cv2.imwrite(tif_path, image)
     return out_dir
