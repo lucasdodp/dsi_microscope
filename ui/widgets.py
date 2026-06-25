@@ -874,6 +874,7 @@ class VideoFeedLabel(QLabel):
         super().__init__(text)
         self._src_w = None        # source frame width in pixels
         self._src_h = None        # source frame height in pixels
+        self._orig_pixmap = None  # full-resolution frame, re-scaled to fit on resize
         self._crop_mode = False
         self._origin = None       # drag start (widget coords)
         self._cur = None          # current drag point (widget coords)
@@ -885,6 +886,31 @@ class VideoFeedLabel(QLabel):
             self._src_w, self._src_h = w, h
             # A frame of a different size means the old selection no longer maps.
             self._selection = None
+
+    def set_frame_pixmap(self, pixmap):
+        """Display a full-resolution frame, scaled to fit the current label size.
+
+        The *original* pixmap is kept so it can be re-scaled whenever the label is
+        resized (a tab switch, a Display-mode change, or a window resize). Scaling
+        only at render time left a stale, wrongly-sized pixmap after a layout
+        change until the next frame arrived — which is the flicker fixed here.
+        """
+        self._orig_pixmap = pixmap
+        self._rescale_pixmap()
+
+    def _rescale_pixmap(self):
+        """Re-scale the stored frame to the current label size (KeepAspectRatio)."""
+        if self._orig_pixmap is None or self._orig_pixmap.isNull():
+            return
+        super().setPixmap(
+            self._orig_pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Layout changed the label size — re-fit the current frame immediately so
+        # it never stays scaled to the previous size.
+        self._rescale_pixmap()
 
     def set_crop_mode(self, on):
         self._crop_mode = bool(on)

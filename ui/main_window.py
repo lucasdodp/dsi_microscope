@@ -3,6 +3,11 @@
 This is the only place that instantiates the hardware workers and the Z-stack
 orchestrator, routing every worker's status_update / error_signal back to the single
 `lbl_status` bar and managing button enable/disable state during acquisition.
+
+The application is Z-Stack-only: there is one tab per camera (ORCA and EVK4), each
+driving the automated 3D Z-stack for that detector. The shared instruments (AWG and
+PI Z-stage) live in collapsible sections of the left control panel so both tabs can
+reach them.
 """
 
 import json
@@ -37,14 +42,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Institut Fresnel - DSI Microscope Control")
         self.resize(1300, 950)
-        self.evk4_worker = None
-        self.orca_worker = None
-        self.zstack_worker = None
-        self.zstack_live_worker = None
-        # Snapshot of the ORCA settings currently applied to the Z-Stack live feed,
-        # so a real-time crop change re-applies only the ROI (other edits wait for
-        # the Apply button).
-        self._zstack_orca_live_params = None
+        # Live preview workers (one per camera) and the single Z-stack orchestrator.
+        self.orca_worker = None     # ORCA live-focus worker
+        self.evk4_worker = None     # EVK4 live worker
+        self.zstack_worker = None   # automated Z-stack orchestrator (one at a time)
+        self._zstack_camera = None  # "orca"/"event" while a Z-stack runs, else None
+        # Snapshot of the ORCA settings currently applied to the live feed, so a
+        # real-time crop change re-applies only the ROI (other edits wait for Apply).
+        self._orca_live_params = None
         # Last frame shown per camera (image pixels), for the crop tool. The two
         # cameras have independent feeds so both can be viewed at once.
         self._orca_frame = None
@@ -113,8 +118,9 @@ class MainWindow(QMainWindow):
         preset_layout.addWidget(btn_load_preset)
         control_layout.addLayout(preset_layout)
 
-        # AWG control is set rarely, so keep it in a collapsible section to free
-        # up vertical space for the acquisition tabs (starts collapsed).
+        # Shared instruments live in collapsible sections so both Z-stack tabs can
+        # reach them. The AWG is set rarely, so it starts collapsed; the PI stage is
+        # used for every stack, so it starts expanded.
         self.btn_awg_toggle = QPushButton("▸  Siglent AWG Control (LC Speckle)")
         self.btn_awg_toggle.setCheckable(True)
         self.btn_awg_toggle.setStyleSheet("text-align: left; padding: 8px; background-color: #3a3f44;")
@@ -125,19 +131,29 @@ class MainWindow(QMainWindow):
         self.awg_widget.setVisible(False)
         control_layout.addWidget(self.awg_widget)
 
+        # PI Z-stage: shared between both tabs, in its own collapsible section
+        # (mirroring the AWG) so it is reachable from either camera's tab.
+        self.pi_stage_widget = PIStageWidget()
+        self.btn_pi_toggle = QPushButton("▾  PI Z-Stage Control")
+        self.btn_pi_toggle.setCheckable(True)
+        self.btn_pi_toggle.setChecked(True)
+        self.btn_pi_toggle.setStyleSheet("text-align: left; padding: 8px; background-color: #3a3f44;")
+        self.btn_pi_toggle.toggled.connect(self._toggle_pi)
+        control_layout.addWidget(self.btn_pi_toggle)
+        control_layout.addWidget(self.pi_stage_widget)
+        # The number of Z steps drives both tabs' acquisition-time estimates.
+        self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_orca_time)
+        self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_evk4_time)
+
         self.tabs = QTabWidget()
-        # 3D Z-Stack is the primary workflow, so it is the first tab and the one
-        # shown on launch. The standalone camera tabs follow it.
-        self._build_zstack_tab()
-        self._build_evk4_tab()
-        self._build_orca_tab()
-        # Switching tabs changes which camera the crop tool targets; cancel any
-        # in-progress crop so its overlay can't be stranded on the previous feed.
-        self.tabs.currentChanged.connect(self._cancel_crop_mode)
+        self._build_zstack_orca_tab()
+        self._build_zstack_evk4_tab()
+        # Switching tabs changes which camera the crop tool targets and which feed
+        # is shown; cancel any in-progress crop and follow the tab's camera.
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         # Populate the time-estimate labels with the default parameter values.
-        self._update_evk4_time()
         self._update_orca_time()
-        self._update_zstack_time()
+        self._update_evk4_time()
         control_layout.addWidget(self.tabs)
         control_layout.addStretch()
 
@@ -176,17 +192,16 @@ class MainWindow(QMainWindow):
         self.combo_feed_view.addItem("ORCA only", "orca")
         self.combo_feed_view.addItem("Event camera only", "evk4")
         self.combo_feed_view.addItem("Both (stacked)", "both")
-        # Launch showing the ORCA feed only; the user can switch to the event
-        # camera or Both (stacked), or use Start Both Cameras (which selects Both).
+        # Launch showing the ORCA feed only; the feed follows the active tab, and
+        # the user can pick Both or use Start Both Cameras.
         self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData("orca"))
         self.combo_feed_view.currentIndexChanged.connect(self._apply_feed_view)
         view_bar.addWidget(lbl_view)
         view_bar.addWidget(self.combo_feed_view)
         view_bar.addStretch()
 
-        # Start/stop both live feeds at once. This lives in the shared feed panel
-        # (not a single camera's tab) because it acts on both cameras together —
-        # the beamsplitter feeds both simultaneously.
+        # Start/stop both live feeds at once (beamsplitter feeds both). Lives in the
+        # shared feed panel because it acts on both cameras together.
         self.btn_both_live = QPushButton("▶  Start Both Cameras")
         self.btn_both_live.setObjectName("btnLive")
         self.btn_both_live.setToolTip(
@@ -237,265 +252,170 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._save_session)
         self._autosave_timer.start()
 
+        self._refresh_buttons()
+
     def _toggle_awg(self, expanded):
         self.awg_widget.setVisible(expanded)
         arrow = "▾" if expanded else "▸"
         self.btn_awg_toggle.setText(f"{arrow}  Siglent AWG Control (LC Speckle)")
 
+    def _toggle_pi(self, expanded):
+        self.pi_stage_widget.setVisible(expanded)
+        arrow = "▾" if expanded else "▸"
+        self.btn_pi_toggle.setText(f"{arrow}  PI Z-Stage Control")
+
     # ==========================
     # Tab construction
     # ==========================
-    def _build_evk4_tab(self):
-        self.tab_evk4 = QWidget()
-        evk4_layout = QVBoxLayout(self.tab_evk4)
-
-        # 1. Live controls — always visible at the top so the user can start
-        #    watching events immediately before touching any other setting.
-        action_group = QGroupBox("EVK4 Controls")
-        action_layout = QVBoxLayout()
-        self.btn_live = QPushButton("▶  Start Live Mode")
-        self.btn_live.setObjectName("btnLive")
-        self.btn_live.clicked.connect(lambda: self.start_evk4("live"))
-        self.btn_acquire = QPushButton("⬤  Start Acquisition")
-        self.btn_acquire.setObjectName("btnAcquire")
-        self.btn_acquire.clicked.connect(lambda: self.start_evk4("acquire"))
-        self.btn_stop = QPushButton("■  Stop EVK4")
-        self.btn_stop.setObjectName("btnStop")
-        self.btn_stop.clicked.connect(self.stop_evk4)
-        self.btn_stop.setEnabled(False)
-        action_layout.addWidget(self.btn_live)
-        action_layout.addWidget(self.btn_acquire)
-        action_layout.addWidget(self.btn_stop)
-        self.lbl_evk4_time = QLabel()
-        self.lbl_evk4_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
-        action_layout.addWidget(self.lbl_evk4_time)
-        action_group.setLayout(action_layout)
-        evk4_layout.addWidget(action_group)
-
-        # 2. Camera parameters — adjust biases while watching the live feed,
-        #    then click "Apply Biases to Live Feed" to push them to hardware.
-        self.evk4_params = Evk4ParamsWidget()
-        self.evk4_params.spin_time.valueChanged.connect(self._update_evk4_time)
-        evk4_layout.addWidget(self.evk4_params)
-
-        # 3. Output settings — set before starting an acquisition.
-        out_group = QGroupBox("EVK4 Output")
-        out_layout = QVBoxLayout()
-        out_layout.addWidget(QLabel("Output Directory:"))
-        dir_layout = QHBoxLayout()
-        self.txt_dir = QLineEdit()
-        btn_dir = QPushButton("Browse")
-        btn_dir.clicked.connect(self.browse_dir)
-        dir_layout.addWidget(self.txt_dir); dir_layout.addWidget(btn_dir)
-        out_layout.addLayout(dir_layout)
-        out_layout.addWidget(QLabel("Filename Base:"))
-        self.txt_filename = QLineEdit()
-        self._stamp_default_filename(self.txt_filename, "recording")
-        out_layout.addWidget(self.txt_filename)
-        lbl_evk4_raw = QLabel(
-            "The raw event recording (.raw) is always saved alongside the .tif/.mat."
-        )
-        lbl_evk4_raw.setWordWrap(True)
-        lbl_evk4_raw.setStyleSheet("color: #888888; font-size: 11px;")
-        out_layout.addWidget(lbl_evk4_raw)
-        out_group.setLayout(out_layout)
-        evk4_layout.addWidget(out_group)
-
-        evk4_layout.addStretch()
-        self.tabs.addTab(self.tab_evk4, "Event Camera (2D)")
-
-    def _build_orca_tab(self):
+    def _build_zstack_orca_tab(self):
+        """Z-Stack tab for the Hamamatsu ORCA (per-plane DSI)."""
         self.tab_orca = QWidget()
-        orca_layout = QVBoxLayout(self.tab_orca)
+        layout = QVBoxLayout(self.tab_orca)
 
-        # 1. Live controls at the top — start the live feed first to focus the
-        #    sample, then scroll down to adjust parameters and click Apply.
-        orca_actions_group = QGroupBox("ORCA Controls")
-        orca_actions_layout = QHBoxLayout()
-        self.btn_orca_live = QPushButton("▶  Start Live Focus Mode")
+        # 1. Live preview — start it first to focus the sample and set the crop.
+        live_group = QGroupBox("Live Preview")
+        live_layout = QHBoxLayout()
+        self.btn_orca_live = QPushButton("▶  Start Live")
         self.btn_orca_live.setObjectName("btnLive")
-        self.btn_orca_live.clicked.connect(lambda: self.start_orca("live"))
-        self.btn_orca_stop = QPushButton("■  Stop ORCA")
+        self.btn_orca_live.clicked.connect(self.start_orca_live)
+        self.btn_orca_stop = QPushButton("■  Stop")
         self.btn_orca_stop.setObjectName("btnStop")
         self.btn_orca_stop.clicked.connect(self.stop_orca)
         self.btn_orca_stop.setEnabled(False)
-        orca_actions_layout.addWidget(self.btn_orca_live)
-        orca_actions_layout.addWidget(self.btn_orca_stop)
-        orca_actions_group.setLayout(orca_actions_layout)
-        orca_layout.addWidget(orca_actions_group)
+        live_layout.addWidget(self.btn_orca_live)
+        live_layout.addWidget(self.btn_orca_stop)
+        live_group.setLayout(live_layout)
+        layout.addWidget(live_group)
 
-        # 2. Camera parameters — tune exposure, mode and ROI while watching live,
-        #    then click "Apply All Settings to Live Feed" (at the bottom of the
-        #    widget) to push them to the camera without restarting.
+        # 2. Camera parameters — full control. Crop applies live; other settings
+        #    apply when "Apply All Settings to Live Feed" is clicked.
         self.orca_params = OrcaParamsWidget()
-        self.orca_params.spin_frames.valueChanged.connect(self._update_orca_time)
-        self.orca_params.spin_exp.valueChanged.connect(self._update_orca_time)
-        self.orca_params.spin_roi_height.valueChanged.connect(self._update_orca_time)
-        self.orca_params.spin_roi_width.valueChanged.connect(self._update_orca_time)
-        self.orca_params.combo_readout.currentIndexChanged.connect(self._update_orca_time)
-        orca_layout.addWidget(self.orca_params)
+        for sig in (
+            self.orca_params.spin_frames.valueChanged,
+            self.orca_params.spin_exp.valueChanged,
+            self.orca_params.spin_roi_height.valueChanged,
+            self.orca_params.spin_roi_width.valueChanged,
+            self.orca_params.combo_readout.currentIndexChanged,
+        ):
+            sig.connect(self._update_orca_time)
+        layout.addWidget(self.orca_params)
 
-        # 3. DSI acquisition — set output path, then acquire when ready.
-        orca_dsi_group = QGroupBox("DSI Acquisition (Single Z-Plane)")
-        orca_dsi_layout = QVBoxLayout()
-        orca_dsi_layout.addWidget(QLabel("Output Directory:"))
-        orca_dir_layout = QHBoxLayout()
+        # 3. Automated Z-stack acquisition.
+        acq_group = QGroupBox("Automated 3D Z-Stack (ORCA DSI)")
+        acq_layout = QVBoxLayout()
+        acq_layout.addWidget(QLabel("Output Directory:"))
+        dir_layout = QHBoxLayout()
         self.txt_orca_dir = QLineEdit()
-        btn_orca_dir = QPushButton("Browse")
-        btn_orca_dir.clicked.connect(self.browse_orca_dir)
-        orca_dir_layout.addWidget(self.txt_orca_dir); orca_dir_layout.addWidget(btn_orca_dir)
-        orca_dsi_layout.addLayout(orca_dir_layout)
-        orca_dsi_layout.addWidget(QLabel("Filename Base:"))
+        btn_dir = QPushButton("Browse")
+        btn_dir.clicked.connect(self.browse_orca_dir)
+        dir_layout.addWidget(self.txt_orca_dir); dir_layout.addWidget(btn_dir)
+        acq_layout.addLayout(dir_layout)
+        acq_layout.addWidget(QLabel("Filename Base:"))
         self.txt_orca_filename = QLineEdit()
-        self._stamp_default_filename(self.txt_orca_filename, "dsi")
-        orca_dsi_layout.addWidget(self.txt_orca_filename)
-        self.chk_orca_raw = QCheckBox("Save raw 16-bit speckle stack (3D TIFF)")
+        self._stamp_default_filename(self.txt_orca_filename, "zstack_orca")
+        acq_layout.addWidget(self.txt_orca_filename)
+        self.chk_orca_raw = QCheckBox("Save raw 16-bit speckle stack per plane (for RIM / re-processing)")
         self.chk_orca_raw.setChecked(True)
         self.chk_orca_raw.stateChanged.connect(self._update_orca_time)
-        orca_dsi_layout.addWidget(self.chk_orca_raw)
-        self.btn_orca_acquire = QPushButton("⬤  Start DSI Acquisition")
-        self.btn_orca_acquire.setObjectName("btnAcquire")
-        self.btn_orca_acquire.clicked.connect(lambda: self.start_orca("acquire"))
-        orca_dsi_layout.addWidget(self.btn_orca_acquire)
+        acq_layout.addWidget(self.chk_orca_raw)
+        info = QLabel(
+            "Moves through Z and acquires an ORCA speckle stack at each plane, saving "
+            "the per-plane sectioned images as a 3D TIFF depth volume, the raw stacks "
+            "(one file per plane), and a parameter log."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888888; font-size: 11px;")
+        acq_layout.addWidget(info)
+        self.btn_orca_zstack = QPushButton("⬤  Start ORCA Z-Stack")
+        self.btn_orca_zstack.setObjectName("btnAcquire")
+        self.btn_orca_zstack.clicked.connect(lambda: self.start_zstack("orca"))
+        acq_layout.addWidget(self.btn_orca_zstack)
         self.lbl_orca_time = QLabel()
         self.lbl_orca_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
-        orca_dsi_layout.addWidget(self.lbl_orca_time)
-        lbl_dsi_info = QLabel(
-            "Records N frames at the current focus, then computes the average "
-            "(widefield) and standard-deviation (optically-sectioned DSI) images. "
-            "Tune the speckle decorrelation time (AWG) close to or slightly slower "
-            "than texp."
-        )
-        lbl_dsi_info.setWordWrap(True)
-        lbl_dsi_info.setStyleSheet("color: #888888; font-size: 11px;")
-        orca_dsi_layout.addWidget(lbl_dsi_info)
-        orca_dsi_group.setLayout(orca_dsi_layout)
-        orca_layout.addWidget(orca_dsi_group)
+        acq_layout.addWidget(self.lbl_orca_time)
+        acq_group.setLayout(acq_layout)
+        layout.addWidget(acq_group)
 
-        orca_layout.addStretch()
-        self.tabs.addTab(self.tab_orca, "Scientific Camera (ORCA)")
+        layout.addStretch()
+        self.tabs.addTab(self.tab_orca, "Z-Stack (ORCA)")
 
-    def _build_zstack_tab(self):
-        self.tab_zstack = QWidget()
-        zstack_layout = QVBoxLayout(self.tab_zstack)
+    def _build_zstack_evk4_tab(self):
+        """Z-Stack tab for the Prophesee EVK4 (per-plane event-DSI)."""
+        self.tab_evk4 = QWidget()
+        layout = QVBoxLayout(self.tab_evk4)
 
-        # 1. Camera selection at the very top — the live preview, parameters and
-        #    acquisition below all act on the selected camera, so it is more
-        #    intuitive to choose it first.
-        cam_group = QGroupBox("Acquisition Camera")
-        cam_layout = QHBoxLayout()
-        cam_layout.addWidget(QLabel("Acquisition Camera:"))
-        self.combo_zstack_camera = QComboBox()
-        self.combo_zstack_camera.addItem("Scientific Camera (ORCA)", "orca")
-        self.combo_zstack_camera.addItem("Event Camera (EVK4)", "event")
-        cam_layout.addWidget(self.combo_zstack_camera, stretch=1)
-        cam_group.setLayout(cam_layout)
-        zstack_layout.addWidget(cam_group)
-
-        # 2. Live / Stop — start live first so you can watch the sample while
-        #    moving the stage to the starting focal plane.
+        # 1. Live preview.
         live_group = QGroupBox("Live Preview")
         live_layout = QHBoxLayout()
-        self.btn_zstack_live = QPushButton("▶  Start Live (selected camera)")
-        self.btn_zstack_live.setObjectName("btnLive")
-        self.btn_zstack_live.clicked.connect(self.start_zstack_live)
-        self.btn_stop_zstack = QPushButton("■  Stop")
-        self.btn_stop_zstack.setObjectName("btnStop")
-        self.btn_stop_zstack.clicked.connect(self.stop_zstack)
-        self.btn_stop_zstack.setEnabled(False)
-        live_layout.addWidget(self.btn_zstack_live)
-        live_layout.addWidget(self.btn_stop_zstack)
+        self.btn_evk4_live = QPushButton("▶  Start Live")
+        self.btn_evk4_live.setObjectName("btnLive")
+        self.btn_evk4_live.clicked.connect(self.start_evk4_live)
+        self.btn_evk4_stop = QPushButton("■  Stop")
+        self.btn_evk4_stop.setObjectName("btnStop")
+        self.btn_evk4_stop.clicked.connect(self.stop_evk4)
+        self.btn_evk4_stop.setEnabled(False)
+        live_layout.addWidget(self.btn_evk4_live)
+        live_layout.addWidget(self.btn_evk4_stop)
         live_group.setLayout(live_layout)
-        zstack_layout.addWidget(live_group)
+        layout.addWidget(live_group)
 
-        # 3. PI stage — position the sample while watching the live feed above.
-        self.pi_stage_widget = PIStageWidget()
-        zstack_layout.addWidget(self.pi_stage_widget)
+        # 2. Camera parameters — full control. Crop applies live; biases apply when
+        #    "Apply Biases to Live Feed" is clicked.
+        self.evk4_params = Evk4ParamsWidget()
+        self.evk4_params.spin_time.valueChanged.connect(self._update_evk4_time)
+        layout.addWidget(self.evk4_params)
 
-        # 4. Acquisition group — set parameters and output path, then launch the
-        #    stack (for the camera chosen at the top) once the sample is
-        #    positioned correctly.
-        auto_z_group = QGroupBox("Automated 3D DSI Acquisition")
-        auto_z_layout = QVBoxLayout()
-
-        # Full, independent parameter controls for each camera; only the selected
-        # camera's controls are shown.
-        self.zstack_orca_params = OrcaParamsWidget()
-        self.zstack_evk4_params = Evk4ParamsWidget()
-        self.zstack_evk4_params.setVisible(False)
-        auto_z_layout.addWidget(self.zstack_orca_params)
-        auto_z_layout.addWidget(self.zstack_evk4_params)
-
-        # Keep the Z-Stack time label updated whenever any relevant parameter changes.
-        for sig in (
-            self.zstack_orca_params.spin_frames.valueChanged,
-            self.zstack_orca_params.spin_exp.valueChanged,
-            self.zstack_orca_params.spin_roi_height.valueChanged,
-            self.zstack_orca_params.spin_roi_width.valueChanged,
-            self.zstack_orca_params.combo_readout.currentIndexChanged,
-            self.zstack_evk4_params.spin_time.valueChanged,
-        ):
-            sig.connect(self._update_zstack_time)
-        self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_zstack_time)
-        # Connected here (not at combo creation) so the slots run only once the
-        # per-camera parameter widgets above exist to be shown/hidden.
-        self.combo_zstack_camera.currentIndexChanged.connect(self._on_zstack_camera_changed)
-        self.combo_zstack_camera.currentIndexChanged.connect(self._update_zstack_time)
-
-        auto_z_layout.addWidget(QLabel("Output Directory:"))
-        zstack_dir_layout = QHBoxLayout()
-        self.txt_zstack_dir = QLineEdit()
-        btn_zstack_dir = QPushButton("Browse")
-        btn_zstack_dir.clicked.connect(self.browse_zstack_dir)
-        zstack_dir_layout.addWidget(self.txt_zstack_dir); zstack_dir_layout.addWidget(btn_zstack_dir)
-        auto_z_layout.addLayout(zstack_dir_layout)
-
-        auto_z_layout.addWidget(QLabel("Filename Base:"))
-        self.txt_zstack_filename = QLineEdit()
-        self._stamp_default_filename(self.txt_zstack_filename, "zstack")
-        auto_z_layout.addWidget(self.txt_zstack_filename)
-
-        # Raw data (ORCA: each plane's speckle frames in its own multi-page TIFF —
-        # one file per plane — for the MATLAB RIM algorithm; EVK4: not saved).
-        self.chk_zstack_raw = QCheckBox("Save raw speckle stack — ORCA only (for RIM / re-processing)")
-        self.chk_zstack_raw.setChecked(True)
-        self.chk_zstack_raw.stateChanged.connect(self._update_zstack_time)
-        auto_z_layout.addWidget(self.chk_zstack_raw)
-
-        lbl_zstack_info = QLabel(
-            "Moves through Z and acquires with the selected camera at each plane, "
-            "saving the per-plane sectioned images as a 3D TIFF depth volume plus a "
-            "parameter log."
+        # 3. Automated Z-stack acquisition.
+        acq_group = QGroupBox("Automated 3D Z-Stack (Event-DSI)")
+        acq_layout = QVBoxLayout()
+        acq_layout.addWidget(QLabel("Output Directory:"))
+        dir_layout = QHBoxLayout()
+        self.txt_evk4_dir = QLineEdit()
+        btn_dir = QPushButton("Browse")
+        btn_dir.clicked.connect(self.browse_evk4_dir)
+        dir_layout.addWidget(self.txt_evk4_dir); dir_layout.addWidget(btn_dir)
+        acq_layout.addLayout(dir_layout)
+        acq_layout.addWidget(QLabel("Filename Base:"))
+        self.txt_evk4_filename = QLineEdit()
+        self._stamp_default_filename(self.txt_evk4_filename, "zstack_evk4")
+        acq_layout.addWidget(self.txt_evk4_filename)
+        info = QLabel(
+            "Moves through Z and records events at each plane. Each plane's raw event "
+            "stream (.raw) is always saved, alongside the accumulated event depth "
+            "volume (3D TIFF) and a parameter log."
         )
-        lbl_zstack_info.setWordWrap(True)
-        lbl_zstack_info.setStyleSheet("color: #888888; font-size: 11px;")
-        auto_z_layout.addWidget(lbl_zstack_info)
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888888; font-size: 11px;")
+        acq_layout.addWidget(info)
+        self.btn_evk4_zstack = QPushButton("⬤  Start EVK4 Z-Stack")
+        self.btn_evk4_zstack.setObjectName("btnAcquire")
+        self.btn_evk4_zstack.clicked.connect(lambda: self.start_zstack("event"))
+        acq_layout.addWidget(self.btn_evk4_zstack)
+        self.lbl_evk4_time = QLabel()
+        self.lbl_evk4_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
+        acq_layout.addWidget(self.lbl_evk4_time)
+        acq_group.setLayout(acq_layout)
+        layout.addWidget(acq_group)
 
-        self.btn_start_zstack = QPushButton("⬤  Start Z-Stack Acquisition")
-        self.btn_start_zstack.setObjectName("btnAcquire")
-        self.btn_start_zstack.clicked.connect(self.start_zstack)
-        auto_z_layout.addWidget(self.btn_start_zstack)
-        self.lbl_zstack_time = QLabel()
-        self.lbl_zstack_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
-        auto_z_layout.addWidget(self.lbl_zstack_time)
+        layout.addStretch()
+        self.tabs.addTab(self.tab_evk4, "Z-Stack (EVK4)")
 
-        auto_z_group.setLayout(auto_z_layout)
-        zstack_layout.addWidget(auto_z_group)
-        zstack_layout.addStretch()
-
-        self.tabs.addTab(self.tab_zstack, "3D Z-Stack")
-
-    def _on_zstack_camera_changed(self):
-        camera = self.combo_zstack_camera.currentData()
-        self.zstack_orca_params.setVisible(camera == "orca")
-        self.zstack_evk4_params.setVisible(camera == "event")
+    def _on_tab_changed(self):
+        """Tab switched: cancel any in-progress crop and follow the tab's camera in
+        the feed panel (unless the user has chosen Both)."""
         self._cancel_crop_mode()
-        self._update_zstack_time()
+        if getattr(self, "combo_feed_view", None) is None:
+            return
+        if self.combo_feed_view.currentData() != "both":
+            cam = "evk4" if self.tabs.currentWidget() is self.tab_evk4 else "orca"
+            idx = self.combo_feed_view.findData(cam)
+            if idx >= 0:
+                self.combo_feed_view.setCurrentIndex(idx)
 
     def _cancel_crop_mode(self):
-        """Leave crop mode if active — used when the crop target (tab / Z-stack
-        camera) changes, so the overlay can't be stranded on the wrong feed."""
-        if self.btn_crop_select.isChecked():
+        """Leave crop mode if active — used when the crop target (active tab)
+        changes, so the overlay can't be stranded on the wrong feed."""
+        if getattr(self, "btn_crop_select", None) is not None and self.btn_crop_select.isChecked():
             self.btn_crop_select.setChecked(False)  # fires _toggle_crop_mode(False)
 
     # ==========================
@@ -527,20 +447,6 @@ class MainWindow(QMainWindow):
         """Suffix noting how many runs the estimate was calibrated from."""
         return f"  · calibrated from {runs} run{'s' if runs != 1 else ''}" if runs else ""
 
-    def _evk4_predicted_s(self):
-        """Cold-start estimate (s) for a single EVK4 acquisition: the fixed
-        recording duration plus device init + post-processing overhead."""
-        return EVK4_PLANE_OVERHEAD_S + self.evk4_params.spin_time.value()
-
-    def _update_evk4_time(self):
-        if self._acq_label is self.lbl_evk4_time:
-            return  # acquisition running: leave the live elapsed readout alone
-        t = self.evk4_params.spin_time.value()
-        total_s, runs = self._calibrate(self._evk4_predicted_s(), "evk4_single")
-        self.lbl_evk4_time.setText(
-            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({t} s recording + overhead){self._calib_note(runs)}"
-        )
-
     @staticmethod
     def _fmt_dur(seconds):
         """Format a duration in seconds as a compact human-readable string."""
@@ -553,54 +459,42 @@ class MainWindow(QMainWindow):
             return f"{m} min {s:02d} s"
         return f"{s} s"
 
-    def _orca_predicted_s(self):
-        """Cold-start estimate (s) for a single-Z ORCA DSI acquisition: camera
-        start-up + capture + DSI reconstruction + (optional) raw-stack write."""
+    def _orca_zstack_predicted_s(self):
+        """Cold-start estimate (s) for an ORCA Z-stack: camera start-up plus, per
+        plane, motor move + settle, capture, DSI reconstruction and raw write."""
+        steps = self.pi_stage_widget.spin_steps.value()
         n = self.orca_params.spin_frames.value()
         frame_s = self.orca_params.estimated_frame_time_s()
         compute_s = self.orca_params.estimated_compute_s(n)
         save_s = self.orca_params.estimated_raw_save_s(n) if self.chk_orca_raw.isChecked() else 0.0
-        return ORCA_CAMERA_INIT_S + n * frame_s + compute_s + save_s
+        plane_s = ORCA_PLANE_OVERHEAD_S + n * frame_s + compute_s + save_s
+        return ORCA_CAMERA_INIT_S + steps * plane_s
+
+    def _evk4_zstack_predicted_s(self):
+        """Cold-start estimate (s) for an EVK4 Z-stack: per plane the device is
+        re-opened and events accumulated for the fixed recording duration."""
+        steps = self.pi_stage_widget.spin_steps.value()
+        plane_s = EVK4_PLANE_OVERHEAD_S + self.evk4_params.spin_time.value()
+        return steps * plane_s
 
     def _update_orca_time(self):
         if self._acq_label is self.lbl_orca_time:
             return  # acquisition running: leave the live elapsed readout alone
-        n = self.orca_params.spin_frames.value()
-        fps = 1.0 / self.orca_params.estimated_frame_time_s()
-        total_s, runs = self._calibrate(self._orca_predicted_s(), "orca_single")
+        steps = self.pi_stage_widget.spin_steps.value()
+        total_s, runs = self._calibrate(self._orca_zstack_predicted_s(), "orca_zstack")
+        plane_s = total_s / max(1, steps)
         self.lbl_orca_time.setText(
-            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({n} frames @ ≈ {fps:.0f} fps + overhead)"
+            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
             f"{self._calib_note(runs)}"
         )
 
-    def _zstack_predicted_s(self):
-        """Cold-start estimate (s) for a Z-stack with the selected camera."""
-        steps = self.pi_stage_widget.spin_steps.value()
-        if self.combo_zstack_camera.currentData() == "orca":
-            n = self.zstack_orca_params.spin_frames.value()
-            frame_s = self.zstack_orca_params.estimated_frame_time_s()
-            compute_s = self.zstack_orca_params.estimated_compute_s(n)
-            save_s = (
-                self.zstack_orca_params.estimated_raw_save_s(n)
-                if self.chk_zstack_raw.isChecked() else 0.0
-            )
-            # Per plane: motor move + settle, capture, DSI reconstruction, raw write.
-            plane_s = ORCA_PLANE_OVERHEAD_S + n * frame_s + compute_s + save_s
-            init_s = ORCA_CAMERA_INIT_S
-        else:
-            # Per plane the EVK4 is re-opened and the events accumulated.
-            plane_s = EVK4_PLANE_OVERHEAD_S + self.zstack_evk4_params.spin_time.value()
-            init_s = 0.0
-        return init_s + steps * plane_s
-
-    def _update_zstack_time(self):
-        if self._acq_label is self.lbl_zstack_time:
+    def _update_evk4_time(self):
+        if self._acq_label is self.lbl_evk4_time:
             return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
-        acq_type = "orca_zstack" if self.combo_zstack_camera.currentData() == "orca" else "evk4_zstack"
-        total_s, runs = self._calibrate(self._zstack_predicted_s(), acq_type)
+        total_s, runs = self._calibrate(self._evk4_zstack_predicted_s(), "evk4_zstack")
         plane_s = total_s / max(1, steps)
-        self.lbl_zstack_time.setText(
+        self.lbl_evk4_time.setText(
             f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
             f"{self._calib_note(runs)}"
         )
@@ -741,21 +635,10 @@ class MainWindow(QMainWindow):
         # Persist the current parameters so the next launch restores them.
         self._save_session()
 
-        if self.evk4_worker is not None and self.evk4_worker.isRunning():
-            self.evk4_worker.stop()
-            self.evk4_worker.wait(2000)
-
-        if self.orca_worker is not None and self.orca_worker.isRunning():
-            self.orca_worker.stop()
-            self.orca_worker.wait(2000)
-
-        if self.zstack_worker is not None and self.zstack_worker.isRunning():
-            self.zstack_worker.stop()
-            self.zstack_worker.wait(2000)
-
-        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            self.zstack_live_worker.stop()
-            self.zstack_live_worker.wait(2000)
+        for worker in (self.orca_worker, self.evk4_worker, self.zstack_worker):
+            if worker is not None and worker.isRunning():
+                worker.stop()
+                worker.wait(2000)
 
         self.awg_widget.close_device()
         self.pi_stage_widget.close_device()
@@ -770,57 +653,43 @@ class MainWindow(QMainWindow):
         Shared by the manual *Save Preset* button and the automatic session-state
         save on exit, so both write exactly the same structure.
         """
-        # Each camera params widget exists twice — once in its own tab and once
-        # in the Z-Stack tab — and the two are fully independent. Persist *both*
-        # copies, or a Camera Mode & Readout (or any) change made in the Z-Stack
-        # tab would be silently dropped (only the standalone copy was saved).
         return {
             "version": 1,
             "evk4": self.evk4_params.get_preset(),
-            "evk4_zstack": self.zstack_evk4_params.get_preset(),
             "orca": self.orca_params.get_preset(),
-            "orca_zstack": self.zstack_orca_params.get_preset(),
             "awg": self.awg_widget.get_preset(),
             "zstack": {
-                "camera": self.combo_zstack_camera.currentData(),
                 "step_size": self.pi_stage_widget.spin_step_size.value(),
                 "num_steps": self.pi_stage_widget.spin_steps.value(),
                 "focus": self.pi_stage_widget.spin_focus.value(),
             },
             "save_raw": {
-                # EVK4 .raw is always saved now, so there is no toggle to persist.
+                # EVK4 .raw is always saved; only the ORCA raw-stack toggle persists.
                 "orca": self.chk_orca_raw.isChecked(),
-                "zstack": self.chk_zstack_raw.isChecked(),
             },
             "output_dirs": {
-                "evk4": self.txt_dir.text(),
+                "evk4": self.txt_evk4_dir.text(),
                 "orca": self.txt_orca_dir.text(),
-                "zstack": self.txt_zstack_dir.text(),
             },
         }
 
     def _apply_preset(self, preset):
-        """Apply a preset/session dict to every control. Unknown keys are ignored."""
-        # Restore each tab's copy independently. Older session/preset files only
-        # stored one set per camera; fall back to it for the Z-Stack copy so they
-        # still load (and keep the previous "applied to both" behaviour).
-        if "evk4" in preset:
-            self.evk4_params.set_preset(preset["evk4"])
-            self.zstack_evk4_params.set_preset(preset.get("evk4_zstack", preset["evk4"]))
+        """Apply a preset/session dict to every control. Unknown keys are ignored.
 
-        if "orca" in preset:
-            self.orca_params.set_preset(preset["orca"])
-            self.zstack_orca_params.set_preset(preset.get("orca_zstack", preset["orca"]))
+        Older files stored separate standalone/Z-stack copies per camera
+        (``orca``/``orca_zstack``); prefer the Z-stack copy, falling back to the
+        standalone one, so they still load.
+        """
+        if "orca" in preset or "orca_zstack" in preset:
+            self.orca_params.set_preset(preset.get("orca_zstack") or preset.get("orca"))
+        if "evk4" in preset or "evk4_zstack" in preset:
+            self.evk4_params.set_preset(preset.get("evk4_zstack") or preset.get("evk4"))
 
         if "awg" in preset:
             self.awg_widget.set_preset(preset["awg"])
 
         if "zstack" in preset:
             z = preset["zstack"]
-            if "camera" in z:
-                idx = self.combo_zstack_camera.findData(z["camera"])
-                if idx >= 0:
-                    self.combo_zstack_camera.setCurrentIndex(idx)
             if "step_size" in z:
                 self.pi_stage_widget.spin_step_size.setValue(float(z["step_size"]))
             if "num_steps" in z:
@@ -830,22 +699,17 @@ class MainWindow(QMainWindow):
 
         if "save_raw" in preset:
             sr = preset["save_raw"]
-            # "evk4" may appear in older preset/session files; ignored — the EVK4
-            # .raw is always saved now.
-            if "orca" in sr:
-                self.chk_orca_raw.setChecked(bool(sr["orca"]))
-            if "zstack" in sr:
-                self.chk_zstack_raw.setChecked(bool(sr["zstack"]))
+            val = sr.get("orca", sr.get("zstack"))  # old files used "zstack" for the ORCA toggle
+            if val is not None:
+                self.chk_orca_raw.setChecked(bool(val))
 
         # Output directories are restored (the filename bases stay timestamped).
         if "output_dirs" in preset:
             od = preset["output_dirs"]
-            if od.get("evk4"):
-                self.txt_dir.setText(od["evk4"])
-            if od.get("orca"):
-                self.txt_orca_dir.setText(od["orca"])
-            if od.get("zstack"):
-                self.txt_zstack_dir.setText(od["zstack"])
+            if od.get("orca") or od.get("zstack"):
+                self.txt_orca_dir.setText(od.get("orca") or od.get("zstack"))
+            if od.get("evk4") or od.get("zstack"):
+                self.txt_evk4_dir.setText(od.get("evk4") or od.get("zstack"))
 
     def save_preset(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -947,20 +811,15 @@ class MainWindow(QMainWindow):
         if self._fn_defaults.get(field) == field.text():
             self._stamp_default_filename(field, prefix)
 
-    def browse_dir(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if folder:
-            self.txt_dir.setText(folder)
-
     def browse_orca_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if folder:
             self.txt_orca_dir.setText(folder)
 
-    def browse_zstack_dir(self):
+    def browse_evk4_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if folder:
-            self.txt_zstack_dir.setText(folder)
+            self.txt_evk4_dir.setText(folder)
 
     # ==========================
     # Parameter collection
@@ -1027,9 +886,121 @@ class MainWindow(QMainWindow):
         }
 
     # ==========================
-    # EVK4 Logic
+    # Button state
     # ==========================
-    def start_evk4(self, mode):
+    def _refresh_buttons(self):
+        """Centralised enable/disable for the per-tab live and Z-stack buttons,
+        derived from the current worker states.
+
+        While a Z-stack runs (on either camera) no new live feed or stack can be
+        started; the running camera's Stop button is the abort. A camera's live
+        Start is disabled while that camera is already live; its Stop then aborts
+        the live feed.
+        """
+        orca_live = self._orca_live_running()
+        evk4_live = self._evk4_live_running()
+        zstack = self.zstack_worker is not None and self.zstack_worker.isRunning()
+        zcam = self._zstack_camera if zstack else None
+
+        self.btn_orca_live.setEnabled(not orca_live and not zstack)
+        self.btn_evk4_live.setEnabled(not evk4_live and not zstack)
+        self.btn_orca_zstack.setEnabled(not zstack)
+        self.btn_evk4_zstack.setEnabled(not zstack)
+        self.btn_orca_stop.setEnabled(orca_live or (zstack and zcam == "orca"))
+        self.btn_evk4_stop.setEnabled(evk4_live or (zstack and zcam == "event"))
+
+    # ==========================
+    # ORCA live preview
+    # ==========================
+    def start_orca_live(self):
+        if not DCAM_AVAILABLE:
+            QMessageBox.warning(
+                self, "ORCA Camera Unavailable",
+                "The Hamamatsu DCAM API (dcam.py) was not found.\n\n"
+                "Download and install the DCAM-API SDK from Hamamatsu, then set the "
+                "HAMAMATSU_SDK_PATH environment variable to the folder containing dcam.py "
+                "(e.g. …\\dcamsdk4\\samples\\python).\n\n"
+                "Open a new terminal after running 'setx' and restart the app.\n\n"
+                "See README.md for full setup instructions.",
+            )
+            return
+        if self._orca_live_running():
+            return
+
+        params = self.orca_params.get_params()
+        self.orca_worker = OrcaWorker("live", params)
+        self.orca_worker.image_ready.connect(self.update_orca_image)
+        self.orca_worker.status_update.connect(self.lbl_status.setText)
+        self.orca_worker.error_signal.connect(self.show_error)
+        self.orca_worker.finished_signal.connect(self.on_orca_live_finished)
+        self.orca_worker.start()
+
+        # Live-apply wiring: the Apply button pushes ALL settings; only the crop
+        # is applied in real time as the ROI controls change.
+        self._orca_live_params = params
+        self.orca_params.btn_apply_live.setEnabled(True)
+        self.orca_params.btn_apply_live.clicked.connect(self._apply_orca_params_live)
+        self.orca_params.roi_changed.connect(self._apply_orca_roi_live)
+
+        self._refresh_buttons()
+        self._sync_both_live_button()
+
+    def stop_orca(self):
+        """Stop the ORCA — its running Z-stack if one is active, else its live feed."""
+        self._acq_aborted = True  # a stopped run is partial — don't learn its time
+        if self.zstack_worker is not None and self.zstack_worker.isRunning() and self._zstack_camera == "orca":
+            self.zstack_worker.stop()
+            self.lbl_status.setText("Aborting Z-Stack...")
+            return
+        if self.orca_worker is not None and self.orca_worker.isRunning():
+            self.orca_worker.stop()
+            self.orca_worker.wait(3000)
+
+    def on_orca_live_finished(self):
+        # Live mode never owns the elapsed timer (only a Z-stack does), so don't
+        # touch it here — a Z-stack on the other camera may be timing.
+        self._reset_orca_live_apply()
+        self._refresh_buttons()
+        self._sync_both_live_button()
+
+    def _reset_orca_live_apply(self):
+        """Disable + disconnect the ORCA live-apply button and live re-cropping."""
+        self.orca_params.btn_apply_live.setEnabled(False)
+        try:
+            self.orca_params.btn_apply_live.clicked.disconnect(self._apply_orca_params_live)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.orca_params.roi_changed.disconnect(self._apply_orca_roi_live)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _apply_orca_params_live(self):
+        """Apply ALL ORCA settings to the live feed — triggered by the Apply button."""
+        if self.orca_worker is not None and self.orca_worker.isRunning():
+            params = self.orca_params.get_params()
+            self._orca_live_params = params
+            self.orca_worker.apply_params(params)
+
+    def _apply_orca_roi_live(self):
+        """Apply only the crop/ROI to the running ORCA live feed, in real time.
+
+        Other parameter edits (exposure, mode, readout) are deliberately left for
+        the Apply button: a live crop change merges the new ROI onto the
+        last-applied settings, so dragging the crop never pushes un-applied edits.
+        """
+        if not (self.orca_worker is not None and self.orca_worker.isRunning()):
+            return
+        base = self._orca_live_params or self.orca_params.get_params()
+        params = dict(base)
+        params["orca_roi"] = self.orca_params._compute_roi()
+        self._orca_live_params = params
+        self.orca_worker.apply_params(params)
+
+    # ==========================
+    # EVK4 live preview
+    # ==========================
+    def start_evk4_live(self):
         if not METAVISION_AVAILABLE:
             QMessageBox.warning(
                 self, "Event Camera Unavailable",
@@ -1039,73 +1010,40 @@ class MainWindow(QMainWindow):
                 "See README.md for setup instructions.",
             )
             return
-        # Refuse a second handle if the Z-Stack tab already has the event camera live.
-        if isinstance(self.zstack_live_worker, CameraWorker) and self.zstack_live_worker.isRunning():
-            self.lbl_status.setText(
-                "The event camera is already live from the 3D Z-Stack tab — stop it there first."
-            )
+        if self._evk4_live_running():
             return
+
         params = self.evk4_params.get_params()
-        params["output_dir"] = self.txt_dir.text()
-        if mode == "acquire" and not params["output_dir"]:
-            QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the acquisition.")
-            return
-        if mode == "acquire":
-            # Stamp a default filename with the acquisition time; a custom name is kept.
-            self._refresh_default_filename(self.txt_filename, "recording")
-        params["filename"] = self.txt_filename.text()
-
-        if mode == "acquire":
-            params["metadata"] = self.collect_acquisition_metadata(
-                "Event Camera (EVK4) - 2D event-DSI", params["output_dir"], params["filename"],
-                self.evk4_params, self.orca_params,
-            )
-            # Auto-stop a running live feed so the user doesn't have to click Stop
-            # first; this releases the camera before the acquisition opens it.
-            if self._stop_worker_silently(self.evk4_worker, self.on_evk4_finished):
-                self._reset_evk4_apply()
-
-        self.btn_live.setEnabled(False)
-        self.btn_acquire.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-
-        self.evk4_worker = CameraWorker(mode, params)
+        self.evk4_worker = CameraWorker("live", params)
         self.evk4_worker.frame_ready.connect(self.update_evk4_image)
         self.evk4_worker.status_update.connect(self.lbl_status.setText)
         self.evk4_worker.error_signal.connect(self.show_error)
-        self.evk4_worker.finished_signal.connect(self.on_evk4_finished)
+        self.evk4_worker.finished_signal.connect(self.on_evk4_live_finished)
         self.evk4_worker.start()
+
+        # Live-apply wiring: biases on the Apply button; crop in real time.
+        self.evk4_params.btn_apply_biases.setEnabled(True)
+        self.evk4_params.btn_apply_biases.clicked.connect(self._apply_evk4_biases_live)
+        self.evk4_params.roi_changed.connect(self._apply_evk4_roi_live)
+
+        self._refresh_buttons()
         self._sync_both_live_button()
 
-        if mode == "live":
-            self.evk4_params.btn_apply_biases.setEnabled(True)
-            self.evk4_params.btn_apply_biases.clicked.connect(self._apply_evk4_biases_live)
-            # Live re-cropping: dragging the ROI controls (or the crop tool)
-            # re-frames the live feed automatically (debounced in the widget).
-            self.evk4_params.roi_changed.connect(self._apply_evk4_roi_live)
-        else:
-            self._begin_acq_record(
-                "evk4_single", self._evk4_predicted_s(), planes=1,
-                frames=params.get("acqu_time"), out_dir=params["output_dir"],
-                filename=params["filename"],
-            )
-            self._start_elapsed(self.lbl_evk4_time, self._update_evk4_time)
-
     def stop_evk4(self):
-        if self.evk4_worker is not None:
-            self._acq_aborted = True  # a stopped run is partial — don't learn its time
+        """Stop the EVK4 — its running Z-stack if one is active, else its live feed."""
+        self._acq_aborted = True
+        if self.zstack_worker is not None and self.zstack_worker.isRunning() and self._zstack_camera == "event":
+            self.zstack_worker.stop()
+            self.lbl_status.setText("Aborting Z-Stack...")
+            return
+        if self.evk4_worker is not None and self.evk4_worker.isRunning():
             self.evk4_worker.stop()
             self.lbl_status.setText("Stopping EVK4...")
             self.evk4_worker.wait(3000)
 
-    def on_evk4_finished(self):
-        self._stop_elapsed()
-        self.btn_live.setEnabled(True)
-        self.btn_acquire.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        # The filename is re-stamped at the start of the next acquisition (if it is
-        # still the auto-default), so stopping a live feed never wipes a typed name.
+    def on_evk4_live_finished(self):
         self._reset_evk4_apply()
+        self._refresh_buttons()
         self._sync_both_live_button()
 
     def _reset_evk4_apply(self):
@@ -1129,179 +1067,38 @@ class MainWindow(QMainWindow):
             self.evk4_worker.apply_roi(self.evk4_params._compute_roi())
 
     # ==========================
-    # ORCA Logic
+    # Dual-camera live (both feeds at once)
     # ==========================
-    def start_orca(self, mode):
-        if not DCAM_AVAILABLE:
-            QMessageBox.warning(
-                self, "ORCA Camera Unavailable",
-                "The Hamamatsu DCAM API (dcam.py) was not found.\n\n"
-                "Download and install the DCAM-API SDK from Hamamatsu, then set the "
-                "HAMAMATSU_SDK_PATH environment variable to the folder containing dcam.py "
-                "(e.g. …\\dcamsdk4\\samples\\python).\n\n"
-                "Open a new terminal after running 'setx' and restart the app.\n\n"
-                "See README.md for full setup instructions.",
-            )
+    def _orca_live_running(self):
+        return self.orca_worker is not None and self.orca_worker.isRunning()
+
+    def _evk4_live_running(self):
+        return self.evk4_worker is not None and self.evk4_worker.isRunning()
+
+    def _toggle_both_live(self):
+        """Start both camera live feeds, or stop both if both are already running."""
+        if self._orca_live_running() and self._evk4_live_running():
+            self.stop_orca()
+            self.stop_evk4()
+            self._sync_both_live_button()
             return
-        # The ORCA can be open in only one place at a time; refuse to open a second
-        # handle if the Z-Stack tab already has it live (that would conflict and can
-        # freeze the feed).
-        if isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning():
-            self.lbl_status.setText(
-                "ORCA is already live from the 3D Z-Stack tab — stop it there before starting it here."
-            )
-            return
-        params = self.orca_params.get_params()
-        params["save_raw_stack"] = self.chk_orca_raw.isChecked()
-        params["output_dir"] = self.txt_orca_dir.text()
-        if mode == "acquire" and not params["output_dir"]:
-            QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the DSI acquisition.")
-            return
-        if mode == "acquire":
-            # Stamp a default filename with the acquisition time; a custom name is kept.
-            self._refresh_default_filename(self.txt_orca_filename, "dsi")
-        params["filename"] = self.txt_orca_filename.text()
-
-        if mode == "acquire":
-            # Pre-flight memory check (see start_zstack): the frame stack is held
-            # in RAM (camera ring buffer + our copy); a high frame count at full
-            # sensor can exceed physical memory. Warn rather than freeze.
-            roi = params["orca_roi"]
-            px = max(1, roi["x_max"] - roi["x_min"]) * max(1, roi["y_max"] - roi["y_min"])
-            need = 2 * params["orca_frames"] * px * 2 + 128 * 1024 * 1024
-            avail = self._available_memory_bytes()
-            if avail is not None and need > 0.85 * avail:
-                resp = QMessageBox.warning(
-                    self, "Acquisition may exhaust memory",
-                    f"This acquisition is estimated to need about {self._format_bytes(need)} of RAM, "
-                    f"but only {self._format_bytes(avail)} is currently free.\n\n"
-                    "Running it may make the computer unresponsive. Reduce the frame count (N) "
-                    "or the ROI size before retrying.\n\nStart anyway?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if resp != QMessageBox.StandardButton.Yes:
-                    return
-
-            params["metadata"] = self.collect_acquisition_metadata(
-                "Scientific Camera (ORCA) - Single-Z DSI", params["output_dir"], params["filename"],
-                self.evk4_params, self.orca_params,
-            )
-            # Auto-stop a running live feed so the user doesn't have to click Stop
-            # first; this releases the camera before the acquisition opens it.
-            if self._stop_worker_silently(self.orca_worker, self.on_orca_finished):
-                self._reset_orca_live_apply()
-
-        self.btn_orca_live.setEnabled(False)
-        self.btn_orca_acquire.setEnabled(False)
-        self.btn_orca_stop.setEnabled(True)
-
-        self.orca_worker = OrcaWorker(mode, params)
-        self.orca_worker.image_ready.connect(self.update_orca_image)
-        self.orca_worker.status_update.connect(self.lbl_status.setText)
-        self.orca_worker.error_signal.connect(self.show_error)
-        self.orca_worker.finished_signal.connect(self.on_orca_finished)
-        self.orca_worker.start()
+        # Show both feeds so the result is visible immediately.
+        self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData("both"))
+        if not self._orca_live_running():
+            self.start_orca_live()
+        if not self._evk4_live_running():
+            self.start_evk4_live()
         self._sync_both_live_button()
 
-        if mode == "live":
-            self.orca_params.btn_apply_live.setEnabled(True)
-            self.orca_params.btn_apply_live.clicked.connect(self._apply_orca_params_live)
-            # Live re-framing: dragging the ROI size / centre-offset controls
-            # re-applies to the live feed automatically (debounced in the widget).
-            self.orca_params.roi_changed.connect(self._apply_orca_params_live)
-        else:
-            self._begin_acq_record(
-                "orca_single", self._orca_predicted_s(), planes=1,
-                frames=params["orca_frames"], out_dir=params["output_dir"],
-                filename=params["filename"],
-            )
-            self._start_elapsed(self.lbl_orca_time, self._update_orca_time)
-
-    def stop_orca(self):
-        if self.orca_worker is not None:
-            self._acq_aborted = True  # a stopped run is partial — don't learn its time
-            self.orca_worker.stop()
-            self.orca_worker.wait(3000)
-
-    def on_orca_finished(self):
-        self._stop_elapsed()
-        self.btn_orca_live.setEnabled(True)
-        self.btn_orca_acquire.setEnabled(True)
-        self.btn_orca_stop.setEnabled(False)
-        # Filename is re-stamped at the next acquisition start (if still the auto-
-        # default), so stopping live focus mode never wipes a typed name.
-        self._reset_orca_live_apply()
-        self._sync_both_live_button()
-
-    def _reset_orca_live_apply(self):
-        """Disable + disconnect the ORCA live-apply button and live re-framing."""
-        self.orca_params.btn_apply_live.setEnabled(False)
-        for sig in (self.orca_params.btn_apply_live.clicked, self.orca_params.roi_changed):
-            try:
-                sig.disconnect(self._apply_orca_params_live)
-            except (RuntimeError, TypeError):
-                pass
-
-    def _apply_orca_params_live(self):
-        if self.orca_worker is not None and self.orca_worker.isRunning():
-            self.orca_worker.apply_params(self.orca_params.get_params())
+    def _sync_both_live_button(self):
+        """Reflect the combined live state in the Start/Stop Both button label, so
+        it stays correct even when feeds are started/stopped from their own tabs."""
+        both = self._orca_live_running() and self._evk4_live_running()
+        self.btn_both_live.setText("■  Stop Both Cameras" if both else "▶  Start Both Cameras")
 
     # ==========================
-    # Automated Z-Stack Logic
+    # Automated Z-Stack
     # ==========================
-    def _set_zstack_busy(self, busy):
-        self.btn_zstack_live.setEnabled(not busy)
-        self.btn_start_zstack.setEnabled(not busy)
-        self.btn_stop_zstack.setEnabled(busy)
-
-    def start_zstack_live(self):
-        """Live preview with the selected camera, for focusing before a stack."""
-        camera = self.combo_zstack_camera.currentData()
-        if camera == "orca" and not DCAM_AVAILABLE:
-            QMessageBox.warning(self, "ORCA Camera Unavailable",
-                "The Hamamatsu DCAM API was not found. See README.md for setup instructions.")
-            return
-        if camera == "event" and not METAVISION_AVAILABLE:
-            QMessageBox.warning(self, "Event Camera Unavailable",
-                "The Prophesee Metavision SDK was not found. See README.md for setup instructions.")
-            return
-        # Don't open a camera that is already live from its own tab (or via Start
-        # Both Cameras) — a second handle to the same device conflicts.
-        if camera == "orca" and self.orca_worker is not None and self.orca_worker.isRunning():
-            self.lbl_status.setText(
-                "ORCA is already live from the Scientific Camera tab — stop it there first."
-            )
-            return
-        if camera == "event" and self.evk4_worker is not None and self.evk4_worker.isRunning():
-            self.lbl_status.setText(
-                "The event camera is already live from the Event Camera tab — stop it there first."
-            )
-            return
-        self._set_zstack_busy(True)
-
-        if camera == "orca":
-            self.zstack_live_worker = OrcaWorker("live", self.zstack_orca_params.get_params())
-            self.zstack_live_worker.image_ready.connect(self.update_orca_image)
-            # Remember what is currently applied to the live feed: the Apply button
-            # pushes ALL settings (exposure, mode, ROI), but a live crop change must
-            # apply only the ROI and leave any un-applied edits untouched.
-            self._zstack_orca_live_params = self.zstack_orca_params.get_params()
-            self.zstack_orca_params.btn_apply_live.setEnabled(True)
-            self.zstack_orca_params.btn_apply_live.clicked.connect(self._apply_zstack_orca_params_live)
-            self.zstack_orca_params.roi_changed.connect(self._apply_zstack_orca_roi_live)
-        else:
-            self.zstack_live_worker = CameraWorker("live", self.zstack_evk4_params.get_params())
-            self.zstack_live_worker.frame_ready.connect(self.update_evk4_image)
-            self.zstack_evk4_params.btn_apply_biases.setEnabled(True)
-            self.zstack_evk4_params.btn_apply_biases.clicked.connect(self._apply_zstack_evk4_biases_live)
-            self.zstack_evk4_params.roi_changed.connect(self._apply_zstack_evk4_roi_live)
-
-        self.zstack_live_worker.status_update.connect(self.lbl_status.setText)
-        self.zstack_live_worker.error_signal.connect(self.show_error)
-        self.zstack_live_worker.finished_signal.connect(self.on_zstack_finished)
-        self.zstack_live_worker.start()
-
     def _zstack_orca_peak_bytes(self):
         """Rough estimate of the peak RAM an ORCA Z-stack needs, in bytes.
 
@@ -1311,7 +1108,7 @@ class MainWindow(QMainWindow):
         transient copy when they are written). Deliberately rough — it only needs
         to be good enough to catch a configuration that clearly won't fit.
         """
-        p = self.zstack_orca_params.get_params()
+        p = self.orca_params.get_params()
         roi = p["orca_roi"]
         w = max(1, roi["x_max"] - roi["x_min"])
         h = max(1, roi["y_max"] - roi["y_min"])
@@ -1363,8 +1160,8 @@ class MainWindow(QMainWindow):
                 return f"{value:.1f} {unit}"
             value /= 1024.0
 
-    def start_zstack(self):
-        camera = self.combo_zstack_camera.currentData()
+    def start_zstack(self, camera):
+        """Launch the automated Z-stack for ``camera`` ("orca" or "event")."""
         if camera == "orca" and not DCAM_AVAILABLE:
             QMessageBox.warning(self, "ORCA Camera Unavailable",
                 "The Hamamatsu DCAM API was not found. See README.md for setup instructions.")
@@ -1376,17 +1173,17 @@ class MainWindow(QMainWindow):
         if not self.pi_stage_widget.pidevice:
             QMessageBox.warning(self, "Connection Error", "Please connect the PI Stage before starting a Z-Stack.")
             return
+        if self.zstack_worker is not None and self.zstack_worker.isRunning():
+            self.lbl_status.setText("A Z-Stack is already running — stop it before starting another.")
+            return
 
-        output_dir = self.txt_zstack_dir.text()
-        if not output_dir:
+        out_dir = self.txt_orca_dir.text() if camera == "orca" else self.txt_evk4_dir.text()
+        if not out_dir:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the Z-Stack.")
             return
 
-        # Pre-flight memory check: an ORCA Z-stack holds a whole frame stack in
-        # RAM at each plane (the camera ring buffer plus our copy) and grows the
-        # depth volumes plane by plane. A high frame count at full sensor can
-        # exceed physical memory and swap the machine to a standstill, so warn
-        # before launching a run that would not fit.
+        # Pre-flight memory check for ORCA (each plane holds a whole frame stack in
+        # RAM; a high frame count at full sensor can exceed physical memory).
         if camera == "orca":
             need = self._zstack_orca_peak_bytes()
             avail = self._available_memory_bytes()
@@ -1404,29 +1201,35 @@ class MainWindow(QMainWindow):
                 if resp != QMessageBox.StandardButton.Yes:
                     return
 
-        # Stamp a default filename with the acquisition time; a custom name is kept.
-        self._refresh_default_filename(self.txt_zstack_filename, "zstack")
-        filename = self.txt_zstack_filename.text()
+        fn_field = self.txt_orca_filename if camera == "orca" else self.txt_evk4_filename
+        fn_prefix = "zstack_orca" if camera == "orca" else "zstack_evk4"
+        self._refresh_default_filename(fn_field, fn_prefix)
+        filename = fn_field.text()
         source = (
             "3D Z-Stack (ORCA) - per-plane DSI" if camera == "orca"
             else "3D Z-Stack (EVK4) - per-plane event-DSI"
         )
 
         save_params = {
-            "output_dir": output_dir,
+            "output_dir": out_dir,
             "filename": filename,
-            "save_raw": self.chk_zstack_raw.isChecked(),
+            # ORCA raw-stack TIFF is optional; the EVK4 per-plane .raw is always saved.
+            "save_raw": self.chk_orca_raw.isChecked() if camera == "orca" else True,
             "metadata": self.collect_acquisition_metadata(
-                source, output_dir, filename, self.zstack_evk4_params, self.zstack_orca_params
+                source, out_dir, filename, self.evk4_params, self.orca_params
             ),
         }
 
-        # Auto-stop a running live preview so its camera handle is released before
-        # the orchestrator opens the camera; the user no longer needs to click Stop.
-        if self._stop_worker_silently(self.zstack_live_worker, self.on_zstack_finished):
-            self._reset_zstack_live_apply()
+        # Auto-stop a running live preview for this camera so its handle is released
+        # before the orchestrator opens the camera.
+        if camera == "orca":
+            if self._stop_worker_silently(self.orca_worker, self.on_orca_live_finished):
+                self._reset_orca_live_apply()
+        else:
+            if self._stop_worker_silently(self.evk4_worker, self.on_evk4_live_finished):
+                self._reset_evk4_apply()
 
-        self._set_zstack_busy(True)
+        self._zstack_camera = camera
 
         # The orchestrator thread now owns the stage; pause the widget's idle
         # polling so the two don't query the GCS link concurrently.
@@ -1436,10 +1239,10 @@ class MainWindow(QMainWindow):
             self.pi_stage_widget.pidevice,
             self.pi_stage_widget.axis,
             self.get_motor_params(),
-            self.zstack_orca_params.get_params(),
+            self.orca_params.get_params(),
             save_params,
             camera=camera,
-            evk4_params=self.zstack_evk4_params.get_params(),
+            evk4_params=self.evk4_params.get_params(),
         )
         self.zstack_worker.image_ready.connect(
             self.update_orca_image if camera == "orca" else self.update_evk4_image
@@ -1450,86 +1253,33 @@ class MainWindow(QMainWindow):
         self.zstack_worker.error_signal.connect(self.show_error)
         self.zstack_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_worker.start()
-        frames = (self.zstack_orca_params.get_params()["orca_frames"] if camera == "orca"
-                  else self.zstack_evk4_params.get_params()["acqu_time"])
+        self._refresh_buttons()
+        self._sync_both_live_button()
+
+        if camera == "orca":
+            predicted = self._orca_zstack_predicted_s()
+            frames = self.orca_params.get_params()["orca_frames"]
+            label, restore = self.lbl_orca_time, self._update_orca_time
+        else:
+            predicted = self._evk4_zstack_predicted_s()
+            frames = self.evk4_params.get_params()["acqu_time"]
+            label, restore = self.lbl_evk4_time, self._update_evk4_time
         self._begin_acq_record(
             "orca_zstack" if camera == "orca" else "evk4_zstack",
-            self._zstack_predicted_s(), planes=self.pi_stage_widget.spin_steps.value(),
-            frames=frames, out_dir=output_dir, filename=filename,
+            predicted, planes=self.pi_stage_widget.spin_steps.value(),
+            frames=frames, out_dir=out_dir, filename=filename,
         )
-        self._start_elapsed(self.lbl_zstack_time, self._update_zstack_time)
-
-    def stop_zstack(self):
-        if self.zstack_worker is not None and self.zstack_worker.isRunning():
-            self._acq_aborted = True  # a stopped stack is partial — don't learn its time
-            self.zstack_worker.stop()
-            self.lbl_status.setText("Aborting Z-Stack...")
-        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            self.zstack_live_worker.stop()
-            self.zstack_live_worker.wait(3000)
+        self._start_elapsed(label, restore)
 
     def handle_z_profile(self, z_val, step_num):
         print(f"Step {step_num} | Computed Z-Profile value: {z_val}")
 
     def on_zstack_finished(self):
         self._stop_elapsed()
-        self._set_zstack_busy(False)
         self.pi_stage_widget.resume_position_updates()
-        # Filename is re-stamped at the next Z-stack start (if still the auto-
-        # default), so stopping the live preview never wipes a typed name.
-        self._reset_zstack_live_apply()
-
-    def _reset_zstack_live_apply(self):
-        """Disable + disconnect both Z-stack live-apply buttons and live re-framing."""
-        self.zstack_orca_params.btn_apply_live.setEnabled(False)
-        self.zstack_evk4_params.btn_apply_biases.setEnabled(False)
-        try:
-            self.zstack_orca_params.roi_changed.disconnect(self._apply_zstack_orca_roi_live)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            self.zstack_evk4_params.roi_changed.disconnect(self._apply_zstack_evk4_roi_live)
-        except (RuntimeError, TypeError):
-            pass
-        for slot in (self._apply_zstack_orca_params_live, self._apply_zstack_evk4_biases_live):
-            try:
-                self.zstack_orca_params.btn_apply_live.clicked.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self.zstack_evk4_params.btn_apply_biases.clicked.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
-
-    def _apply_zstack_orca_params_live(self):
-        """Apply ALL ORCA settings to the live feed — triggered by the Apply button."""
-        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            params = self.zstack_orca_params.get_params()
-            self._zstack_orca_live_params = params
-            self.zstack_live_worker.apply_params(params)
-
-    def _apply_zstack_orca_roi_live(self):
-        """Apply only the crop/ROI to the running ORCA live feed, in real time.
-
-        Other parameter edits (exposure, mode, readout) are deliberately left for
-        the Apply button: a live crop change merges the new ROI onto the
-        last-applied settings, so dragging the crop never pushes un-applied edits.
-        """
-        if not (isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning()):
-            return
-        base = self._zstack_orca_live_params or self.zstack_orca_params.get_params()
-        params = dict(base)
-        params["orca_roi"] = self.zstack_orca_params._compute_roi()
-        self._zstack_orca_live_params = params
-        self.zstack_live_worker.apply_params(params)
-
-    def _apply_zstack_evk4_biases_live(self):
-        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            self.zstack_live_worker.apply_biases(self.zstack_evk4_params.get_params())
-
-    def _apply_zstack_evk4_roi_live(self):
-        if self.zstack_live_worker is not None and self.zstack_live_worker.isRunning():
-            self.zstack_live_worker.apply_roi(self.zstack_evk4_params._compute_roi())
+        self._zstack_camera = None
+        self._refresh_buttons()
+        self._sync_both_live_button()
 
     # ==========================
     # General UI Handling
@@ -1537,8 +1287,8 @@ class MainWindow(QMainWindow):
     def show_error(self, err_msg):
         self._acq_aborted = True  # an errored run is partial — don't learn its time
         QMessageBox.critical(self, "System Error", err_msg)
-        self.on_evk4_finished()
-        self.on_orca_finished()
+        self.on_orca_live_finished()
+        self.on_evk4_live_finished()
         self.on_zstack_finished()
 
     def _apply_feed_view(self):
@@ -1550,51 +1300,6 @@ class MainWindow(QMainWindow):
         self.video_label_orca.setVisible(show_orca)
         self.lbl_evk4_feed_title.setVisible(show_evk4)
         self.video_label_evk4.setVisible(show_evk4)
-
-    # ==========================
-    # Dual-camera live (both feeds at once)
-    # ==========================
-    def _orca_live_running(self):
-        """True if the ORCA is held by any live feed — its own tab or the Z-Stack
-        tab — so we never open the same camera twice."""
-        if self.orca_worker is not None and self.orca_worker.isRunning():
-            return True
-        return isinstance(self.zstack_live_worker, OrcaWorker) and self.zstack_live_worker.isRunning()
-
-    def _evk4_live_running(self):
-        """True if the event camera is held by any live feed (its own tab or the
-        Z-Stack tab)."""
-        if self.evk4_worker is not None and self.evk4_worker.isRunning():
-            return True
-        return isinstance(self.zstack_live_worker, CameraWorker) and self.zstack_live_worker.isRunning()
-
-    def _toggle_both_live(self):
-        """Start both camera live feeds, or stop both if both are already running.
-
-        Reuses the existing per-camera start/stop paths (so live-apply wiring,
-        status routing and finished handlers all behave exactly as on the tabs);
-        each start_* call guards its own SDK availability and warns if missing.
-        """
-        if self._orca_live_running() and self._evk4_live_running():
-            self.stop_orca()
-            self.stop_evk4()
-            self._sync_both_live_button()
-            return
-        # Show both feeds so the result is visible immediately.
-        self.combo_feed_view.setCurrentIndex(self.combo_feed_view.findData("both"))
-        # Start only the camera(s) not already running, so a feed already live on
-        # its own tab isn't reopened (which would leak a second camera handle).
-        if not self._orca_live_running():
-            self.start_orca("live")
-        if not self._evk4_live_running():
-            self.start_evk4("live")
-        self._sync_both_live_button()
-
-    def _sync_both_live_button(self):
-        """Reflect the combined live state in the Start/Stop Both button label, so
-        it stays correct even when feeds are started/stopped from their own tabs."""
-        both = self._orca_live_running() and self._evk4_live_running()
-        self.btn_both_live.setText("■  Stop Both Cameras" if both else "▶  Start Both Cameras")
 
     def _render_to_label(self, label, cv_img):
         """Render a NumPy frame into a feed label, scaled with KeepAspectRatio."""
@@ -1611,9 +1316,10 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(qt_img)
         # Let the crop overlay map widget <-> image pixels for this frame size.
         label.set_source_size(w, h)
-        label.setPixmap(
-            pixmap.scaled(label.width(), label.height(), Qt.AspectRatioMode.KeepAspectRatio)
-        )
+        # Hand the full-resolution pixmap to the label, which scales it to fit and
+        # re-scales on resize — so switching tabs / Display mode never leaves a
+        # stale, wrongly-sized frame.
+        label.set_frame_pixmap(pixmap)
 
     @pyqtSlot(np.ndarray)
     def update_orca_image(self, cv_img):
@@ -1664,27 +1370,18 @@ class MainWindow(QMainWindow):
 
     def _active_crop_target(self):
         """Return (params_widget, sensor_w, sensor_h) for the camera the crop tool
-        should drive, based on the active tab (and the Z-stack camera selector).
+        should drive, based on the active tab.
 
         Both ORCA and EVK4 params widgets expose the same ROI interface
         (``spin_roi_width``/``spin_roi_height``, ``slider_offset_x``/``_y``,
         ``_compute_roi``), so the crop tool treats them uniformly — only the
         sensor dimensions differ between cameras."""
-        if self.tabs.currentWidget() is self.tab_zstack:
-            if self.combo_zstack_camera.currentData() == "orca":
-                return self.zstack_orca_params, ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
-            return self.zstack_evk4_params, EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
         if self.tabs.currentWidget() is self.tab_evk4:
             return self.evk4_params, EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
         return self.orca_params, ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
 
     def _active_crop_label(self):
-        """Return the VideoFeedLabel for the camera the crop tool should drive,
-        mirroring _active_crop_target (same active-tab / Z-stack-camera logic)."""
-        if self.tabs.currentWidget() is self.tab_zstack:
-            if self.combo_zstack_camera.currentData() == "orca":
-                return self.video_label_orca
-            return self.video_label_evk4
+        """Return the VideoFeedLabel for the camera the crop tool should drive."""
         if self.tabs.currentWidget() is self.tab_evk4:
             return self.video_label_evk4
         return self.video_label_orca
