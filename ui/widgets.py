@@ -76,10 +76,11 @@ class Evk4ParamsWidget(QWidget):
 
         bias_group = QGroupBox("EVK4 Biases")
         bias_form = QFormLayout()
-        self.spin_fo = QSpinBox(); self.spin_fo.setRange(-100, 100); self.spin_fo.setValue(5)
-        self.spin_hpf = QSpinBox(); self.spin_hpf.setRange(-100, 100); self.spin_hpf.setValue(30)
-        self.spin_on = QSpinBox(); self.spin_on.setRange(0, 255); self.spin_on.setValue(5)
-        self.spin_off = QSpinBox(); self.spin_off.setRange(0, 255); self.spin_off.setValue(5)
+        # Ranges per the IMX636 datasheet (cf. EVK4 reference, Table II).
+        self.spin_fo = QSpinBox(); self.spin_fo.setRange(-35, 55); self.spin_fo.setValue(5)
+        self.spin_hpf = QSpinBox(); self.spin_hpf.setRange(0, 120); self.spin_hpf.setValue(30)
+        self.spin_on = QSpinBox(); self.spin_on.setRange(-85, 140); self.spin_on.setValue(5)
+        self.spin_off = QSpinBox(); self.spin_off.setRange(-35, 190); self.spin_off.setValue(5)
         bias_form.addRow("bias_fo (low-pass):", self.spin_fo)
         bias_form.addRow("bias_hpf (high-pass):", self.spin_hpf)
         bias_form.addRow("bias_on (positive):", self.spin_on)
@@ -93,7 +94,7 @@ class Evk4ParamsWidget(QWidget):
         dur_group = QGroupBox("EVK4 Acquisition Duration")
         dur_layout = QHBoxLayout()
         dur_layout.addWidget(QLabel("Duration (s):"))
-        self.spin_time = QSpinBox(); self.spin_time.setRange(1, 3600); self.spin_time.setValue(5)
+        self.spin_time = QDoubleSpinBox(); self.spin_time.setRange(0.1, 3600); self.spin_time.setDecimals(2); self.spin_time.setSingleStep(0.5); self.spin_time.setValue(5)
         dur_layout.addWidget(self.spin_time)
         dur_group.setLayout(dur_layout)
         layout.addWidget(dur_group)
@@ -207,7 +208,7 @@ class Evk4ParamsWidget(QWidget):
         if "bias_off" in data:
             self.spin_off.setValue(int(data["bias_off"]))
         if "acqu_time" in data:
-            self.spin_time.setValue(int(data["acqu_time"]))
+            self.spin_time.setValue(float(data["acqu_time"]))
         if "filter_crazy_pixels" in data:
             self.chk_crazy.setChecked(bool(data["filter_crazy_pixels"]))
         if "apply_smoothing" in data:
