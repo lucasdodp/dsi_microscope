@@ -25,7 +25,9 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config import DCAM_EXPOSURE_PROP, EVK4_ERC_RATE
+from config import (
+    DCAM_EXPOSURE_PROP, EVK4_ERC_RATE, EVK4_MAX_RECONNECT_ATTEMPTS, EVK4_RECONNECT_DELAY_S,
+)
 from core import (
     accumulate_event_frame, apply_smoothing, compute_dsi_images, crop_to_roi,
     filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
@@ -47,6 +49,7 @@ class AutomatedZStackWorker(QThread):
     position_update = pyqtSignal(float)
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
+    awaiting_reconnect = pyqtSignal(bool)  # True -> paused, waiting for the user to replug + Resume
 
     def __init__(self, pidevice, axis, motor_params, orca_params, save_params=None,
                  camera="orca", evk4_params=None):
@@ -59,6 +62,7 @@ class AutomatedZStackWorker(QThread):
         self.save_params = save_params or {}
         self.camera = camera  # "orca" or "event"
         self._is_running = True
+        self._resume_requested = False  # set by resume() to continue a paused run
 
     def _prepare_output_dir(self):
         """Create a per-acquisition subfolder named after the filename base.
@@ -164,6 +168,10 @@ class AutomatedZStackWorker(QThread):
             except Exception:
                 pass
             self.error_signal.emit(f"Z-Stack Orchestrator Error: {str(e)}")
+            if self.camera == "event":
+                self._notify_evk4(
+                    "event-camera acquisition error",
+                    f"Your DSI event-camera acquisition stopped with an error: {e}.")
             if dcam is not None:
                 try:
                     Dcamapi.uninit()
@@ -231,15 +239,85 @@ class AutomatedZStackWorker(QThread):
 
     # ----------------------------------------------------------------- EVENT
     def _capture_plane_event(self, step):
-        """Record events for a fixed duration at the current plane, accumulate
-        them into an event image, and always save this plane's raw event stream.
+        """Capture one plane with the EVK4, surviving a communication drop.
 
-        Each plane's events are written to their own ``<filename>_events_zNNN.raw``
-        (one file per plane, z-indexed, mirroring the ORCA's per-plane raw TIFF)
-        in addition to being summed into the consolidated sectioned 3D TIFF depth
-        volume. The device is (re)initialized per plane for a clean state.
+        A brief glitch is absorbed automatically: the device is released and the
+        same plane retried up to ``EVK4_MAX_RECONNECT_ATTEMPTS`` times. If it still
+        can't reconnect, the acquisition does **not** fail — it *pauses*: it emails
+        the user, emits ``awaiting_reconnect(True)`` so the UI shows a Resume
+        button, and waits (for minutes or hours, no time limit) until the user
+        replugs the USB and clicks Resume — or Stops. Because the worker stays
+        alive, every plane already captured is kept and the stack continues from
+        this exact plane. Returns None only if the user aborts.
+        """
+        attempts = max(1, EVK4_MAX_RECONNECT_ATTEMPTS)
+        troubled = False
+        while self._is_running:
+            last_err = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    img = self._capture_plane_event_once(step)
+                    if troubled:  # recovered from a comms drop
+                        msg = (f"Event camera reconnected — resumed at plane "
+                               f"{step + 1}/{self.motor_params['steps']}.")
+                        self.status_update.emit(msg)
+                        self._notify_evk4(
+                            "event camera reconnected",
+                            f"Your DSI acquisition reconnected to the event camera and "
+                            f"resumed at plane {step + 1}.")
+                    return img
+                except Exception as e:
+                    if not self._is_running:
+                        return None
+                    troubled = True
+                    last_err = e
+                    import gc
+                    gc.collect()  # drop the dropped device's refs so the USB link can reopen
+                    self.status_update.emit(
+                        f"Event camera communication error at plane {step + 1} "
+                        f"(attempt {attempt}/{attempts}): {e}")
+                    if attempt < attempts:
+                        self._sleep_interruptible(EVK4_RECONNECT_DELAY_S)
+            if self._is_running:
+                self._await_manual_resume(step, last_err)
+        return None  # user aborted while retrying / waiting
+
+    def _await_manual_resume(self, step, err):
+        """Pause until the user replugs the camera and clicks Resume (or Stops).
+
+        The worker — and every plane captured so far — stays alive, so the run
+        continues from this plane whenever the user is ready. There is no timeout."""
+        self._resume_requested = False
+        self.awaiting_reconnect.emit(True)
+        self.status_update.emit(
+            f"Event camera lost at plane {step + 1}. Replug the USB, then click "
+            f"'Resume Acquisition' (or Stop to abort).")
+        self._notify_evk4(
+            "acquisition paused — event camera lost",
+            f"Your DSI acquisition paused at plane {step + 1} because the event camera "
+            f"disconnected; replug the USB and click Resume to continue.")
+        while self._is_running and not self._resume_requested:
+            time.sleep(0.2)
+        self.awaiting_reconnect.emit(False)
+        if self._is_running and self._resume_requested:
+            self.status_update.emit(f"Resuming acquisition at plane {step + 1}...")
+
+    def resume(self):
+        """Request that a paused (awaiting-reconnect) acquisition continue."""
+        self._resume_requested = True
+
+    def _capture_plane_event_once(self, step):
+        """Single capture attempt: (re)initialise the EVK4, record for the fixed
+        duration, accumulate into an event image, and save this plane's raw stream.
+
+        The device is (re)initialised per plane for a clean state; its local handle
+        is dropped on return/exception so the next plane (or a reconnect) can reopen
+        the USB link. Raw logging is always stopped in a ``finally`` — stopping
+        without a prior ``log_raw_data`` can crash the native library.
         """
         p = self.evk4_params
+        out_dir = self.save_params.get("output_dir", "")
+        filename = self.save_params.get("filename", "zstack")
         device = initiate_device("")
 
         biases = device.get_i_ll_biases()
@@ -259,41 +337,39 @@ class AutomatedZStackWorker(QThread):
         roi = p.get("evk4_roi")
         apply_event_roi(device, roi)
 
-        # Always save this plane's raw event stream (one .raw per plane). Logging
-        # must start before the iterator and be stopped in a finally — stopping
-        # without a prior log_raw_data can crash the native library.
-        out_dir = self.save_params.get("output_dir", "")
-        filename = self.save_params.get("filename", "zstack")
         events_stream = device.get_i_events_stream()
         raw_logging = False
-        if out_dir and events_stream:
-            raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
-            events_stream.log_raw_data(raw_path)
-            raw_logging = True
-
-        mv_iterator = EventsIterator.from_device(device=device)
-        height, width = mv_iterator.get_size()
-
-        self.status_update.emit(f"Recording events at plane {step+1} for {p['acqu_time']} s...")
-
-        def events_for_duration():
-            """Yield event chunks until the acquisition time elapses or the user
-            aborts — so accumulation streams with flat memory."""
-            start = time.time()
-            for evs in mv_iterator:
-                if not self._is_running:
-                    return
-                yield evs
-                if time.time() - start >= p["acqu_time"]:
-                    return
-
         try:
+            if out_dir and events_stream:
+                raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
+                events_stream.log_raw_data(raw_path)
+                raw_logging = True
+
+            mv_iterator = EventsIterator.from_device(device=device)
+            height, width = mv_iterator.get_size()
+            self.status_update.emit(
+                f"Recording events at plane {step + 1} for {p['acqu_time']} s...")
+
+            def events_for_duration():
+                """Yield event chunks until the acquisition time elapses or the user
+                aborts — so accumulation streams with flat memory."""
+                start = time.time()
+                for evs in mv_iterator:
+                    if not self._is_running:
+                        return
+                    yield evs
+                    if time.time() - start >= p["acqu_time"]:
+                        return
+
             event_img = accumulate_event_frame(events_for_duration(), width, height)
         finally:
             if raw_logging:
-                events_stream.stop_log_raw_data()
-        event_img = crop_to_roi(event_img, roi)  # match the live crop framing
+                try:
+                    events_stream.stop_log_raw_data()
+                except Exception:
+                    pass
 
+        event_img = crop_to_roi(event_img, roi)  # match the live crop framing
         if not self._is_running:
             return None
         if p.get("filter_crazy_pixels", True):
@@ -301,6 +377,20 @@ class AutomatedZStackWorker(QThread):
         if p.get("apply_smoothing", True):
             event_img = apply_smoothing(event_img)
         return event_img
+
+    def _sleep_interruptible(self, seconds):
+        """Sleep, but wake early if the user aborts (keeps Stop responsive)."""
+        end = time.time() + max(0.0, seconds)
+        while time.time() < end and self._is_running:
+            time.sleep(0.1)
+
+    def _notify_evk4(self, subject, body):
+        """Best-effort email notification (a no-op unless SMTP is configured)."""
+        try:
+            from hardware.notifier import send_email
+            send_email(f"[DSI Microscope] {subject}", body)
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------- save
     def _save_outputs(self, std_volume, avg_volume, event_volume, z_positions):

@@ -396,6 +396,13 @@ class MainWindow(QMainWindow):
         self.btn_evk4_zstack.setObjectName("btnAcquire")
         self.btn_evk4_zstack.clicked.connect(lambda: self.start_zstack("event"))
         acq_layout.addWidget(self.btn_evk4_zstack)
+        # Shown only when an acquisition has paused after losing the event camera:
+        # replug the USB, then click this to continue from the plane it stopped on.
+        self.btn_evk4_resume = QPushButton("⟳  Resume Acquisition")
+        self.btn_evk4_resume.setObjectName("btnLive")
+        self.btn_evk4_resume.clicked.connect(self._resume_evk4_acquisition)
+        self.btn_evk4_resume.setVisible(False)
+        acq_layout.addWidget(self.btn_evk4_resume)
         self.lbl_evk4_time = QLabel()
         self.lbl_evk4_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
         acq_layout.addWidget(self.lbl_evk4_time)
@@ -1301,6 +1308,7 @@ class MainWindow(QMainWindow):
         self.zstack_worker.z_profile_update.connect(self.handle_z_profile)
         self.zstack_worker.position_update.connect(self.pi_stage_widget.show_position)
         self.zstack_worker.error_signal.connect(self.show_error)
+        self.zstack_worker.awaiting_reconnect.connect(self._on_awaiting_reconnect)
         self.zstack_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_worker.start()
         self._refresh_buttons()
@@ -1324,8 +1332,21 @@ class MainWindow(QMainWindow):
     def handle_z_profile(self, z_val, step_num):
         print(f"Step {step_num} | Computed Z-Profile value: {z_val}")
 
+    def _on_awaiting_reconnect(self, waiting):
+        """Show/hide the Resume button when an event acquisition pauses waiting for
+        the camera to be replugged."""
+        self.btn_evk4_resume.setVisible(waiting)
+        self.btn_evk4_resume.setEnabled(waiting)
+
+    def _resume_evk4_acquisition(self):
+        """User clicked Resume after replugging the event camera."""
+        if self.zstack_worker is not None and self.zstack_worker.isRunning():
+            self.btn_evk4_resume.setEnabled(False)  # debounce; re-shown if it pauses again
+            self.zstack_worker.resume()
+
     def on_zstack_finished(self):
         self._stop_elapsed()
+        self.btn_evk4_resume.setVisible(False)
         self.pi_stage_widget.resume_position_updates()
         self._zstack_camera = None
         self._refresh_buttons()

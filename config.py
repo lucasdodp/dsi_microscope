@@ -187,6 +187,29 @@ EVK4_CRAZY_PIXEL_PERCENTILE = 99.9  # Hot-pixel rejection threshold
 EVK4_SENSOR_WIDTH = 1280
 EVK4_SENSOR_HEIGHT = 720
 
+# Reconnection for long unattended event acquisitions: if the EVK4 USB link drops
+# mid-stack, the orchestrator releases the device, waits, and retries the same
+# plane up to this many times before giving up — so a brief comms glitch no longer
+# loses a multi-hour run. Tunable via env vars.
+EVK4_MAX_RECONNECT_ATTEMPTS = int(os.environ.get("DSI_EVK4_RECONNECT_ATTEMPTS", "3"))
+EVK4_RECONNECT_DELAY_S = float(os.environ.get("DSI_EVK4_RECONNECT_DELAY_S", "5"))
+
+# ---------------------------------------------------------------------------
+# Email notifications (optional, best-effort)
+# ---------------------------------------------------------------------------
+# The app can email when an event-camera acquisition hits a problem (drops out /
+# fails). Disabled unless DSI_NOTIFY_EMAIL is truthy AND a sending account is
+# configured. Use a dedicated SMTP account + app password (e.g. a Gmail "App
+# Password"), set via environment variables so no secret is stored in the repo
+# or session files. The default recipient is the user's address.
+NOTIFY_EMAIL_ENABLED = os.environ.get("DSI_NOTIFY_EMAIL", "0").lower() in ("1", "true", "yes", "on")
+NOTIFY_EMAIL_TO = os.environ.get("DSI_NOTIFY_TO", "naoolhelucas@gmail.com")
+NOTIFY_SMTP_HOST = os.environ.get("DSI_SMTP_HOST", "smtp.gmail.com")
+NOTIFY_SMTP_PORT = int(os.environ.get("DSI_SMTP_PORT", "587"))
+NOTIFY_SMTP_USER = os.environ.get("DSI_SMTP_USER", "")       # sending account (e.g. you@gmail.com)
+NOTIFY_SMTP_PASSWORD = os.environ.get("DSI_SMTP_PASSWORD", "")  # app password, NOT your login password
+NOTIFY_SMTP_TIMEOUT_S = float(os.environ.get("DSI_SMTP_TIMEOUT_S", "15"))
+
 # ---------------------------------------------------------------------------
 # Qt stylesheet (dark theme)
 # ---------------------------------------------------------------------------
