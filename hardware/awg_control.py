@@ -39,15 +39,18 @@ class AWGController:
         return self.awg is not None
 
     # -- parameters ----------------------------------------------------------
-    def set_params(self, freq_hz, amp_vpp, channel=1):
-        """Configure the given channel as a square wave at the freq / amplitude.
+    def set_params(self, freq_hz, amp_vpp, channel=1, waveform="SQUARE"):
+        """Configure the given channel's waveform at the freq / amplitude.
 
-        ``channel`` is 1 or 2 and maps to the instrument's C1 / C2 SCPI prefix,
-        so the two outputs can be driven completely independently.
+        ``waveform`` is the Siglent ``WVTP`` basic-wave type (SQUARE, SINE, RAMP,
+        PULSE …); it defaults to SQUARE so existing callers are unchanged. All of
+        these accept the FRQ/AMP/OFST fields used here. ``channel`` is 1 or 2 and
+        maps to the instrument's C1 / C2 SCPI prefix, so the two outputs can be
+        driven completely independently.
         """
         if not self.awg:
             return
-        cmd = f"C{channel}:BSWV WVTP,SQUARE,FRQ,{freq_hz},AMP,{amp_vpp},OFST,0"
+        cmd = f"C{channel}:BSWV WVTP,{waveform},FRQ,{freq_hz},AMP,{amp_vpp},OFST,0"
         self.awg.write(cmd)
 
     def set_output(self, enabled, channel=1):

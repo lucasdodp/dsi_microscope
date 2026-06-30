@@ -5,8 +5,9 @@ hardware-layer controllers (AWGController, StageController) and workers (PIMoveW
 """
 
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QSlider, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from PyQt6.QtCore import Qt, QRect, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
@@ -221,6 +222,146 @@ class Evk4ParamsWidget(QWidget):
             self.slider_offset_x.setValue(int(data["roi_offset_x"]))
         if "roi_offset_y" in data:
             self.slider_offset_y.setValue(int(data["roi_offset_y"]))
+
+
+class Evk4QueueWidget(QGroupBox):
+    """Batch queue for unattended EVK4 Z-stack acquisitions.
+
+    Each table row is one acquisition setting — the four biases (fo / hpf / on /
+    off) plus the per-plane duration — and ``Repeats`` runs that setting N times
+    (each repeat saved to its own ``<filename>_repNN`` folder, so the analysis
+    can group them). ``Run Queue`` executes every row (and every repeat) back to
+    back without the user restarting each ~6-minute acquisition by hand.
+
+    Everything *not* in the table (ROI, post-processing toggles, Z-stack
+    geometry/focus, output directory, AWG) is inherited from the EVK4 tab at run
+    time. The widget only edits the queue and emits ``run_requested`` /
+    ``stop_requested``; MainWindow owns the actual sequencing.
+    """
+
+    run_requested = pyqtSignal()
+    stop_requested = pyqtSignal()
+
+    COLS = ["Filename", "bias_fo", "bias_hpf", "bias_on", "bias_off", "Duration (s)", "Repeats"]
+    DEFAULTS = (5, 30, 5, 5, 1.0, 1)   # fo, hpf, on, off, duration, repeats
+
+    def __init__(self, parent=None):
+        super().__init__("Batch Queue — run several acquisitions unattended", parent)
+        root = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.setMinimumHeight(150)
+        root.addWidget(self.table)
+
+        edit = QHBoxLayout()
+        for label, slot in (("Add", lambda: self.add_row()), ("Duplicate", self._duplicate),
+                            ("Remove", self._remove), ("Clear", lambda: self.table.setRowCount(0))):
+            b = QPushButton(label); b.clicked.connect(slot); edit.addWidget(b)
+        edit.addStretch()
+        root.addLayout(edit)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Auto-name files by:"))
+        self.combo_name = QComboBox()
+        self.combo_name.addItems(["bias_on_off", "bias_fo", "bias_hpf", "bias_on", "bias_off", "duration"])
+        name_row.addWidget(self.combo_name)
+        b_name = QPushButton("Apply names"); b_name.clicked.connect(self.auto_name)
+        name_row.addWidget(b_name); name_row.addStretch()
+        root.addLayout(name_row)
+
+        run_row = QHBoxLayout()
+        self.btn_run = QPushButton("▶  Run Queue"); self.btn_run.setObjectName("btnAcquire")
+        self.btn_run.clicked.connect(self.run_requested.emit)
+        self.btn_stop = QPushButton("■  Stop Queue"); self.btn_stop.setObjectName("btnStop")
+        self.btn_stop.setEnabled(False); self.btn_stop.clicked.connect(self.stop_requested.emit)
+        run_row.addWidget(self.btn_run); run_row.addWidget(self.btn_stop)
+        root.addLayout(run_row)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #4daaf2; font-size: 11px;")
+        root.addWidget(self.lbl_status)
+
+    # ---------------------------------------------------------- row editing
+    def _set(self, r, c, text):
+        self.table.setItem(r, c, QTableWidgetItem(str(text)))
+
+    def add_row(self, values=None):
+        if values is None:
+            if self.table.rowCount():           # copy the last row, then tweak one value
+                v = self._row_values(self.table.rowCount() - 1)
+                values = ["", v["bias_fo"], v["bias_hpf"], v["bias_on"], v["bias_off"],
+                          v["acqu_time"], v["repeats"]]
+            else:
+                values = ["", *self.DEFAULTS]
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        for c, val in enumerate(values):
+            self._set(r, c, val)
+
+    def _duplicate(self):
+        r = self.table.currentRow()
+        if r < 0:
+            return
+        self.add_row([self._cell(r, c) for c in range(len(self.COLS))])
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        if not rows and self.table.currentRow() >= 0:
+            rows = [self.table.currentRow()]
+        for r in rows:
+            self.table.removeRow(r)
+
+    # ---------------------------------------------------------- reading
+    def _cell(self, r, c, default=""):
+        it = self.table.item(r, c)
+        return it.text().strip() if it and it.text() else default
+
+    def _row_values(self, r):
+        def num(c, cast, default):
+            try:
+                return cast(self._cell(r, c))
+            except (ValueError, TypeError):
+                return default
+        return {
+            "filename": self._cell(r, 0),
+            "bias_fo": num(1, int, 5), "bias_hpf": num(2, int, 30),
+            "bias_on": num(3, int, 5), "bias_off": num(4, int, 5),
+            "acqu_time": num(5, float, 1.0), "repeats": max(1, num(6, int, 1)),
+        }
+
+    def rows(self):
+        return [self._row_values(r) for r in range(self.table.rowCount())]
+
+    # ---------------------------------------------------------- auto-naming
+    @staticmethod
+    def _fmt_dur(v):
+        if v < 1:
+            return f"{int(round(v * 1000))}ms"
+        return f"{int(v)}" if float(v).is_integer() else f"{v:g}"
+
+    def auto_name(self):
+        mode = self.combo_name.currentText()
+        for r in range(self.table.rowCount()):
+            v = self._row_values(r)
+            if mode == "duration":
+                name = f"{self._fmt_dur(v['acqu_time'])}_duration"
+            elif mode == "bias_on_off":
+                name = f"{v['bias_on']}_bias_on_off"
+            else:
+                name = f"{v[mode]}_{mode}"
+            self._set(r, 0, name)
+
+    # ---------------------------------------------------------- run state
+    def set_running(self, running):
+        self.btn_run.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+        self.table.setEnabled(not running)
+
+    def set_status(self, text):
+        self.lbl_status.setText(text)
 
 
 class OrcaParamsWidget(QWidget):
@@ -533,6 +674,10 @@ class AWGWidget(QGroupBox):
         group = QGroupBox(f"Channel {channel}")
         form = QFormLayout()
 
+        combo_wave = QComboBox()
+        combo_wave.addItems(["SQUARE", "SINE", "RAMP", "PULSE"])  # Siglent WVTP types
+        combo_wave.setCurrentText("SQUARE")
+
         spin_freq = QDoubleSpinBox()
         spin_freq.setRange(100, 5000)
         spin_freq.setValue(2000)
@@ -554,6 +699,7 @@ class AWGWidget(QGroupBox):
         btn_output.clicked.connect(lambda checked, c=channel: self.toggle_output(c, checked))
         btn_output.setEnabled(False)
 
+        form.addRow("Waveform:", combo_wave)
         form.addRow("Frequency:", spin_freq)
         form.addRow("Amplitude:", spin_amp)
         form.addRow("", btn_apply)
@@ -561,6 +707,7 @@ class AWGWidget(QGroupBox):
         group.setLayout(form)
 
         self.channels[channel] = {
+            "wave": combo_wave,
             "freq": spin_freq,
             "amp": spin_amp,
             "apply": btn_apply,
@@ -599,7 +746,8 @@ class AWGWidget(QGroupBox):
         if self.controller.is_connected:
             try:
                 widgets = self.channels[channel]
-                self.controller.set_params(widgets["freq"].value(), widgets["amp"].value(), channel)
+                self.controller.set_params(widgets["freq"].value(), widgets["amp"].value(),
+                                           channel, waveform=widgets["wave"].currentText())
             except Exception as e:
                 print(f"Error updating AWG CH{channel} parameters: {e}")
 
@@ -624,6 +772,7 @@ class AWGWidget(QGroupBox):
             "visa_address": self.combo_visa.currentText(),
         }
         for channel, widgets in self.channels.items():
+            settings[f"ch{channel}_waveform"] = widgets["wave"].currentText()
             settings[f"ch{channel}_frequency_hz"] = widgets["freq"].value()
             settings[f"ch{channel}_amplitude_vpp"] = widgets["amp"].value()
             settings[f"ch{channel}_output"] = "ON" if widgets["output"].isChecked() else "OFF"
@@ -638,6 +787,7 @@ class AWGWidget(QGroupBox):
         """
         preset = {"visa_address": self.combo_visa.currentText()}
         for channel, widgets in self.channels.items():
+            preset[f"ch{channel}_wave"] = widgets["wave"].currentText()
             preset[f"ch{channel}_freq"] = widgets["freq"].value()
             preset[f"ch{channel}_amp"] = widgets["amp"].value()
         return preset
@@ -651,6 +801,10 @@ class AWGWidget(QGroupBox):
             if idx >= 0:
                 self.combo_visa.setCurrentIndex(idx)
         for channel, widgets in self.channels.items():
+            if f"ch{channel}_wave" in data:
+                idx = widgets["wave"].findText(str(data[f"ch{channel}_wave"]))
+                if idx >= 0:
+                    widgets["wave"].setCurrentIndex(idx)
             if f"ch{channel}_freq" in data:
                 widgets["freq"].setValue(float(data[f"ch{channel}_freq"]))
             if f"ch{channel}_amp" in data:

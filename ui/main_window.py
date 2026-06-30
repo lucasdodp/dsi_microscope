@@ -33,7 +33,8 @@ from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
 from ui.orchestrator import AutomatedZStackWorker
 from ui.widgets import (
-    AWGWidget, Evk4ParamsWidget, OrcaParamsWidget, PIStageWidget, VideoFeedLabel,
+    AWGWidget, Evk4ParamsWidget, Evk4QueueWidget, OrcaParamsWidget, PIStageWidget,
+    VideoFeedLabel,
 )
 
 
@@ -46,6 +47,10 @@ class MainWindow(QMainWindow):
         self.orca_worker = None     # ORCA live-focus worker
         self.evk4_worker = None     # EVK4 live worker
         self.zstack_worker = None   # automated Z-stack orchestrator (one at a time)
+        # EVK4 batch queue: expanded per-acquisition configs run back-to-back.
+        self._queue = []
+        self._queue_index = 0
+        self._queue_active = False
         self._zstack_camera = None  # "orca"/"event" while a Z-stack runs, else None
         # Snapshot of the ORCA settings currently applied to the live feed, so a
         # real-time crop change re-applies only the ROI (other edits wait for Apply).
@@ -396,6 +401,12 @@ class MainWindow(QMainWindow):
         acq_layout.addWidget(self.lbl_evk4_time)
         acq_group.setLayout(acq_layout)
         layout.addWidget(acq_group)
+
+        # 4. Batch queue — configure several acquisitions and run them unattended.
+        self.evk4_queue = Evk4QueueWidget()
+        self.evk4_queue.run_requested.connect(self._start_evk4_queue)
+        self.evk4_queue.stop_requested.connect(self._stop_evk4_queue)
+        layout.addWidget(self.evk4_queue)
 
         layout.addStretch()
         self.tabs.addTab(self.tab_evk4, "Z-Stack (EVK4)")
@@ -901,13 +912,18 @@ class MainWindow(QMainWindow):
         evk4_live = self._evk4_live_running()
         zstack = self.zstack_worker is not None and self.zstack_worker.isRunning()
         zcam = self._zstack_camera if zstack else None
+        # A running batch queue blocks new manual runs just like a live Z-stack.
+        busy = zstack or self._queue_active
 
-        self.btn_orca_live.setEnabled(not orca_live and not zstack)
-        self.btn_evk4_live.setEnabled(not evk4_live and not zstack)
-        self.btn_orca_zstack.setEnabled(not zstack)
-        self.btn_evk4_zstack.setEnabled(not zstack)
+        self.btn_orca_live.setEnabled(not orca_live and not busy)
+        self.btn_evk4_live.setEnabled(not evk4_live and not busy)
+        self.btn_orca_zstack.setEnabled(not busy)
+        self.btn_evk4_zstack.setEnabled(not busy)
         self.btn_orca_stop.setEnabled(orca_live or (zstack and zcam == "orca"))
-        self.btn_evk4_stop.setEnabled(evk4_live or (zstack and zcam == "event"))
+        self.btn_evk4_stop.setEnabled(evk4_live or (zstack and zcam == "event") or self._queue_active)
+        # Outside a queue, disable 'Run Queue' while any manual Z-stack runs.
+        if getattr(self, "evk4_queue", None) is not None and not self._queue_active:
+            self.evk4_queue.btn_run.setEnabled(not zstack)
 
     # ==========================
     # ORCA live preview
@@ -1032,6 +1048,11 @@ class MainWindow(QMainWindow):
     def stop_evk4(self):
         """Stop the EVK4 — its running Z-stack if one is active, else its live feed."""
         self._acq_aborted = True
+        # If a batch queue is running, the camera Stop button stops the whole queue.
+        if self._queue_active:
+            self._stop_evk4_queue()
+            self.lbl_status.setText("Aborting queue...")
+            return
         if self.zstack_worker is not None and self.zstack_worker.isRunning() and self._zstack_camera == "event":
             self.zstack_worker.stop()
             self.lbl_status.setText("Aborting Z-Stack...")
@@ -1280,12 +1301,105 @@ class MainWindow(QMainWindow):
         self._zstack_camera = None
         self._refresh_buttons()
         self._sync_both_live_button()
+        # If a batch queue is running, advance to the next acquisition.
+        if self._queue_active:
+            self._queue_index += 1
+            QTimer.singleShot(800, self._run_next_queue_item)
+
+    # ==========================
+    # EVK4 batch queue
+    # ==========================
+    def _start_evk4_queue(self):
+        """Validate and launch the EVK4 batch queue (run from the queue widget)."""
+        if not METAVISION_AVAILABLE:
+            QMessageBox.warning(self, "Event Camera Unavailable",
+                "The Prophesee Metavision SDK was not found. See README.md for setup instructions.")
+            return
+        if not self.pi_stage_widget.pidevice:
+            QMessageBox.warning(self, "Connection Error", "Please connect the PI Stage before running the queue.")
+            return
+        if self._queue_active or (self.zstack_worker is not None and self.zstack_worker.isRunning()):
+            self.lbl_status.setText("An acquisition is already running — stop it first.")
+            return
+        if not self.txt_evk4_dir.text():
+            QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the queue.")
+            return
+        rows = self.evk4_queue.rows()
+        if not rows:
+            QMessageBox.warning(self, "Empty Queue", "Add at least one acquisition to the queue.")
+            return
+        if any(not r["filename"] for r in rows):
+            QMessageBox.warning(self, "Missing Filename",
+                "Every queue row needs a filename. Type one, or pick a parameter and click 'Apply names'.")
+            return
+
+        # Expand each row's repeats into uniquely-named acquisitions.
+        self._queue = []
+        for r in rows:
+            n = max(1, r["repeats"])
+            for k in range(n):
+                name = r["filename"] if n == 1 else f"{r['filename']}_rep{k + 1:02d}"
+                self._queue.append({
+                    "filename": name, "bias_fo": r["bias_fo"], "bias_hpf": r["bias_hpf"],
+                    "bias_on": r["bias_on"], "bias_off": r["bias_off"], "acqu_time": r["acqu_time"],
+                })
+        self._queue_index = 0
+        self._queue_active = True
+        self.evk4_queue.set_running(True)
+        self._refresh_buttons()
+        self._run_next_queue_item()
+
+    def _run_next_queue_item(self):
+        """Apply the next queued acquisition's parameters and launch it."""
+        if not self._queue_active:
+            return
+        # Wait for the previous worker thread to fully release before starting.
+        if self.zstack_worker is not None and self.zstack_worker.isRunning():
+            QTimer.singleShot(200, self._run_next_queue_item)
+            return
+        if self._queue_index >= len(self._queue):
+            self._finish_queue(f"Queue complete — {len(self._queue)} acquisition(s) done.")
+            return
+        item = self._queue[self._queue_index]
+        # Push the row's biases + duration into the EVK4 widget; start_zstack reads them.
+        self.evk4_params.set_preset({
+            "bias_fo": item["bias_fo"], "bias_hpf": item["bias_hpf"],
+            "bias_on": item["bias_on"], "bias_off": item["bias_off"],
+            "acqu_time": item["acqu_time"],
+        })
+        self.txt_evk4_filename.setText(item["filename"])
+        self.evk4_queue.set_status(
+            f"Running {self._queue_index + 1} / {len(self._queue)}:  {item['filename']}")
+        self.start_zstack("event")
+
+    def _stop_evk4_queue(self):
+        """Stop the queue: no further acquisitions start; the current one is aborted."""
+        if not self._queue_active:
+            return
+        self._queue_active = False
+        if self.zstack_worker is not None and self.zstack_worker.isRunning() and self._zstack_camera == "event":
+            self.zstack_worker.stop()
+        self._finish_queue(f"Queue stopped at {self._queue_index + 1} / {len(self._queue)}.")
+
+    def _finish_queue(self, message):
+        self._queue_active = False
+        self._queue = []
+        self.evk4_queue.set_running(False)
+        self.evk4_queue.set_status(message)
+        self.lbl_status.setText(message)
+        self._refresh_buttons()
 
     # ==========================
     # General UI Handling
     # ==========================
     def show_error(self, err_msg):
         self._acq_aborted = True  # an errored run is partial — don't learn its time
+        # Halt the batch queue before the finish handlers run (so it won't advance).
+        if self._queue_active:
+            self._queue_active = False
+            self.evk4_queue.set_running(False)
+            self.evk4_queue.set_status(
+                f"Queue stopped — error at {self._queue_index + 1} / {len(self._queue)}.")
         QMessageBox.critical(self, "System Error", err_msg)
         self.on_orca_live_finished()
         self.on_evk4_live_finished()
@@ -1306,14 +1420,20 @@ class MainWindow(QMainWindow):
         # PyQt6 requires bytes, not memoryview; ascontiguousarray packs the
         # ROI-cropped slice before tobytes() serialises it row-by-row.
         img = np.ascontiguousarray(cv_img)
-        if len(img.shape) == 3:
+        # Keep the pixel buffer in a *named* local: a QImage built on a buffer does
+        # not own it, and QPixmap.fromImage copies only on the next line. If the
+        # buffer were an unnamed temporary (``QImage(img.tobytes(), …)``) it could
+        # be freed before that copy, showing garbled frames — intermittently, and
+        # worst under dual-camera load where buffer churn reuses the freed memory.
+        buf = img.tobytes()
+        if img.ndim == 3:
             h, w, ch = img.shape
-            qt_img = QImage(img.tobytes(), w, h, ch * w, QImage.Format.Format_BGR888)
+            qt_img = QImage(buf, w, h, ch * w, QImage.Format.Format_BGR888)
         else:
             h, w = img.shape
-            qt_img = QImage(img.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+            qt_img = QImage(buf, w, h, w, QImage.Format.Format_Grayscale8)
 
-        pixmap = QPixmap.fromImage(qt_img)
+        pixmap = QPixmap.fromImage(qt_img)  # copies now, while ``buf`` is still alive
         # Let the crop overlay map widget <-> image pixels for this frame size.
         label.set_source_size(w, h)
         # Hand the full-resolution pixmap to the label, which scales it to fit and
