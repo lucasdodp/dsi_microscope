@@ -60,6 +60,22 @@ class AutomatedZStackWorker(QThread):
         self.camera = camera  # "orca" or "event"
         self._is_running = True
 
+    def _prepare_output_dir(self):
+        """Create a per-acquisition subfolder named after the filename base.
+
+        A single Z-stack writes many files (one raw per plane, the depth-volume
+        TIFFs, the axial profile, the parameter log). To keep each acquisition
+        self-contained, all of these are placed in ``<output_dir>/<filename>/``.
+        ``output_dir`` is repointed to that subfolder so every save site uses it.
+        """
+        out_dir = self.save_params.get("output_dir", "")
+        filename = self.save_params.get("filename", "zstack")
+        if out_dir and not self.save_params.get("_dir_prepared", False):
+            acq_dir = os.path.join(out_dir, filename)
+            os.makedirs(acq_dir, exist_ok=True)
+            self.save_params["output_dir"] = acq_dir
+            self.save_params["_dir_prepared"] = True
+
     def run(self):
         if not self.pidevice:
             self.error_signal.emit("PI Stage is not connected.")
@@ -70,6 +86,9 @@ class AutomatedZStackWorker(QThread):
         if self.camera == "event" and not METAVISION_AVAILABLE:
             self.error_signal.emit("Metavision SDK not found.")
             return
+
+        # Put every file from this acquisition into its own <filename> subfolder.
+        self._prepare_output_dir()
 
         focus = self.motor_params["focus"]
         step_size = self.motor_params["step_size"]
