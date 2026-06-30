@@ -251,4 +251,14 @@ QScrollBar::handle:vertical { background: #4a5056; min-height: 30px; border-radi
 QScrollBar::handle:vertical:hover { background: #5a616b; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+QTableWidget, QTableView { background-color: #252526; alternate-background-color: #2a2a2c; color: #e0e0e0; gridline-color: #3a3a3a; border: 1px solid #3a3a3a; border-radius: 4px; selection-background-color: #094771; selection-color: #ffffff; }
+QTableWidget::item, QTableView::item { padding: 2px 4px; }
+QHeaderView::section { background-color: #333333; color: #cccccc; padding: 4px 6px; border: none; border-right: 1px solid #3a3a3a; border-bottom: 1px solid #3a3a3a; font-weight: bold; }
+QTableCornerButton::section { background-color: #333333; border: none; }
+QScrollBar:horizontal { background: #252526; height: 10px; margin: 0; border-radius: 5px; }
+QScrollBar::handle:horizontal { background: #4a5056; min-width: 30px; border-radius: 5px; }
+QScrollBar::handle:horizontal:hover { background: #5a616b; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
 """

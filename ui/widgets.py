@@ -241,8 +241,10 @@ class Evk4QueueWidget(QGroupBox):
 
     run_requested = pyqtSignal()
     stop_requested = pyqtSignal()
+    changed = pyqtSignal()             # table edited -> recompute the time estimate
 
-    COLS = ["Filename", "bias_fo", "bias_hpf", "bias_on", "bias_off", "Duration (s)", "Repeats"]
+    # Short header labels so the Filename column gets the room (the panel is narrow).
+    COLS = ["Filename", "fo", "hpf", "on", "off", "dur (s)", "rep"]
     DEFAULTS = (5, 30, 5, 5, 1.0, 1)   # fo, hpf, on, off, duration, repeats
 
     def __init__(self, parent=None):
@@ -252,13 +254,24 @@ class Evk4QueueWidget(QGroupBox):
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr = self.table.horizontalHeader()
+        hdr.setMinimumSectionSize(34)
+        # Filename stretches to fill the leftover width; the numeric columns shrink
+        # to their (short) contents so the filename stays readable.
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in range(1, len(self.COLS)):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setMinimumHeight(150)
+        self.table.itemChanged.connect(lambda *_: self.changed.emit())
         root.addWidget(self.table)
+
+        legend = QLabel("fo / hpf / on / off = biases   ·   dur (s) = duration   ·   rep = repeats")
+        legend.setStyleSheet("color: #888888; font-size: 10px;")
+        root.addWidget(legend)
 
         edit = QHBoxLayout()
         for label, slot in (("Add", lambda: self.add_row()), ("Duplicate", self._duplicate),
-                            ("Remove", self._remove), ("Clear", lambda: self.table.setRowCount(0))):
+                            ("Remove", self._remove), ("Clear", self._clear)):
             b = QPushButton(label); b.clicked.connect(slot); edit.addWidget(b)
         edit.addStretch()
         root.addLayout(edit)
@@ -271,6 +284,10 @@ class Evk4QueueWidget(QGroupBox):
         b_name = QPushButton("Apply names"); b_name.clicked.connect(self.auto_name)
         name_row.addWidget(b_name); name_row.addStretch()
         root.addLayout(name_row)
+
+        self.lbl_estimate = QLabel("")
+        self.lbl_estimate.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
+        root.addWidget(self.lbl_estimate)
 
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("▶  Run Queue"); self.btn_run.setObjectName("btnAcquire")
@@ -313,6 +330,11 @@ class Evk4QueueWidget(QGroupBox):
             rows = [self.table.currentRow()]
         for r in rows:
             self.table.removeRow(r)
+        self.changed.emit()
+
+    def _clear(self):
+        self.table.setRowCount(0)
+        self.changed.emit()
 
     # ---------------------------------------------------------- reading
     def _cell(self, r, c, default=""):
@@ -362,6 +384,9 @@ class Evk4QueueWidget(QGroupBox):
 
     def set_status(self, text):
         self.lbl_status.setText(text)
+
+    def set_estimate(self, text):
+        self.lbl_estimate.setText(text)
 
 
 class OrcaParamsWidget(QWidget):

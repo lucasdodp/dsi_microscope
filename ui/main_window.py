@@ -406,7 +406,11 @@ class MainWindow(QMainWindow):
         self.evk4_queue = Evk4QueueWidget()
         self.evk4_queue.run_requested.connect(self._start_evk4_queue)
         self.evk4_queue.stop_requested.connect(self._stop_evk4_queue)
+        # Keep the queue's total-time estimate live as rows or the step count change.
+        self.evk4_queue.changed.connect(self._update_queue_estimate)
+        self.pi_stage_widget.spin_steps.valueChanged.connect(self._update_queue_estimate)
         layout.addWidget(self.evk4_queue)
+        self._update_queue_estimate()
 
         layout.addStretch()
         self.tabs.addTab(self.tab_evk4, "Z-Stack (EVK4)")
@@ -508,6 +512,31 @@ class MainWindow(QMainWindow):
         self.lbl_evk4_time.setText(
             f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
             f"{self._calib_note(runs)}"
+        )
+
+    def _evk4_queue_total_predicted_s(self):
+        """Total predicted time for the whole batch queue, summed over every row and
+        repeat. Each acquisition uses its row's duration and the shared step count;
+        the same EVK4 model + calibration as a single Z-stack is applied."""
+        steps = self.pi_stage_widget.spin_steps.value()
+        total_raw, n_acq = 0.0, 0
+        for r in self.evk4_queue.rows():
+            total_raw += r["repeats"] * steps * (EVK4_PLANE_OVERHEAD_S + r["acqu_time"])
+            n_acq += r["repeats"]
+        total_s, runs = self._calibrate(total_raw, "evk4_zstack")  # calibration is linear
+        return total_s, n_acq, runs
+
+    def _update_queue_estimate(self):
+        """Refresh the batch-queue total-time label (rows or step count changed)."""
+        if getattr(self, "evk4_queue", None) is None:
+            return
+        total_s, n_acq, runs = self._evk4_queue_total_predicted_s()
+        if n_acq == 0:
+            self.evk4_queue.set_estimate("")
+            return
+        self.evk4_queue.set_estimate(
+            f"Estimated total: ≈ {self._fmt_dur(total_s)}  "
+            f"({n_acq} acquisition{'s' if n_acq != 1 else ''}){self._calib_note(runs)}"
         )
 
     # ----- live elapsed timer (ground truth during an acquisition) -----
