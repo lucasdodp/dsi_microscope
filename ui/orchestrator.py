@@ -308,12 +308,19 @@ class AutomatedZStackWorker(QThread):
 
     def _capture_plane_event_once(self, step):
         """Single capture attempt: (re)initialise the EVK4, record for the fixed
-        duration, accumulate into an event image, and save this plane's raw stream.
+        duration, reconstruct the event image, and save this plane's raw stream.
 
         The device is (re)initialised per plane for a clean state; its local handle
         is dropped on return/exception so the next plane (or a reconnect) can reopen
         the USB link. Raw logging is always stopped in a ``finally`` — stopping
         without a prior ``log_raw_data`` can crash the native library.
+
+        The saved image is reconstructed by re-reading the plane's raw file (the
+        complete, authoritative event record), not by accumulating the live device
+        iteration, which drops events (and occasionally whole planes) because it
+        competes with the concurrent raw logger. When no raw file is written
+        (unsaved run) it falls back to live accumulation so a run still yields an
+        image.
         """
         p = self.evk4_params
         out_dir = self.save_params.get("output_dir", "")
@@ -338,40 +345,55 @@ class AutomatedZStackWorker(QThread):
         apply_event_roi(device, roi)
 
         events_stream = device.get_i_events_stream()
-        raw_logging = False
+        raw_path = None
+        if out_dir and events_stream:
+            raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
+            events_stream.log_raw_data(raw_path)
+
+        mv_iterator = EventsIterator.from_device(device=device)
+        height, width = mv_iterator.get_size()
+
+        self.status_update.emit(f"Recording events at plane {step+1} for {p['acqu_time']} s...")
+
+        def events_for_duration():
+            """Yield event chunks until the acquisition time elapses or the user
+            aborts — so accumulation streams with flat memory."""
+            start = time.time()
+            for evs in mv_iterator:
+                if not self._is_running:
+                    return
+                yield evs
+                if time.time() - start >= p["acqu_time"]:
+                    return
+
         try:
-            if out_dir and events_stream:
-                raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
-                events_stream.log_raw_data(raw_path)
-                raw_logging = True
-
-            mv_iterator = EventsIterator.from_device(device=device)
-            height, width = mv_iterator.get_size()
-            self.status_update.emit(
-                f"Recording events at plane {step + 1} for {p['acqu_time']} s...")
-
-            def events_for_duration():
-                """Yield event chunks until the acquisition time elapses or the user
-                aborts — so accumulation streams with flat memory."""
-                start = time.time()
-                for evs in mv_iterator:
-                    if not self._is_running:
-                        return
-                    yield evs
-                    if time.time() - start >= p["acqu_time"]:
-                        return
-
-            event_img = accumulate_event_frame(events_for_duration(), width, height)
-        finally:
-            if raw_logging:
-                try:
-                    events_stream.stop_log_raw_data()
-                except Exception:
+            if raw_path is not None:
+                # Raw stream is the authoritative record: just drive the device
+                # for the acquisition window, then reconstruct from the complete
+                # file below (the live iteration is lossy and must not be trusted
+                # for the saved image).
+                for _ in events_for_duration():
                     pass
+                event_img = None
+            else:
+                # No raw file to re-read (unsaved run) — accumulate the live
+                # stream as a best-effort fallback.
+                event_img = accumulate_event_frame(events_for_duration(), width, height)
+        finally:
+            if raw_path is not None:
+                events_stream.stop_log_raw_data()
 
-        event_img = crop_to_roi(event_img, roi)  # match the live crop framing
         if not self._is_running:
             return None
+
+        if event_img is None:
+            # Reconstruct from the plane's saved raw stream — the complete event
+            # record — matching event_camera.process_final_image().
+            reader = EventsIterator(input_path=raw_path, delta_t=1000000)
+            event_img = accumulate_event_frame(reader, width, height)
+
+        event_img = crop_to_roi(event_img, roi)  # match the live crop framing
+
         if p.get("filter_crazy_pixels", True):
             event_img = filter_crazy_pixels(event_img)
         if p.get("apply_smoothing", True):
