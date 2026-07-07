@@ -760,6 +760,12 @@ class AWGWidget(QGroupBox):
             for widgets in self.channels.values():
                 widgets["apply"].setEnabled(True)
                 widgets["output"].setEnabled(True)
+            # Push the displayed parameters to the instrument on connect so the
+            # hardware matches the UI immediately — otherwise the device keeps its
+            # previous/leftover settings and the acquisition parameter log (which
+            # reports the UI values) would not reflect what actually drove the LC.
+            for channel in self.channels:
+                self.update_awg_params(channel)
             self.btn_connect.setText("Connected")
             self.btn_connect.setStyleSheet("background-color: #3a3f44; color: #4daaf2;")
             self.btn_connect.setEnabled(False)
@@ -779,6 +785,11 @@ class AWGWidget(QGroupBox):
     def toggle_output(self, channel, checked):
         if self.controller.is_connected:
             try:
+                # Re-apply the displayed parameters before enabling the output so
+                # the LC is always driven by the freq/amp/waveform shown in the UI
+                # (and recorded in the log), never the device's stale settings.
+                if checked:
+                    self.update_awg_params(channel)
                 self.controller.set_output(checked, channel)
                 btn_output = self.channels[channel]["output"]
                 if checked:

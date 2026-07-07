@@ -227,7 +227,10 @@ def cmd_duration(root, out_png):
         sys.exit("No acquisitions with a readable acquisition_time_s found under: " + root)
 
     def recorded_time(folder):
-        files = sorted(glob.glob(os.path.join(folder, '*_events_z*.raw')))
+        # Raw event streams may sit directly in the acquisition folder (old
+        # layout) or under its ``raw_files/`` subfolder (new layout) — search
+        # recursively so both are found.
+        files = sorted(glob.glob(os.path.join(folder, '**', '*_events_z*.raw'), recursive=True))
         if not files:
             return np.nan
         w, _ = evt3.read_evt3_words(files[len(files) // 2])

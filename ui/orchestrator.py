@@ -67,17 +67,31 @@ class AutomatedZStackWorker(QThread):
     def _prepare_output_dir(self):
         """Create a per-acquisition subfolder named after the filename base.
 
-        A single Z-stack writes many files (one raw per plane, the depth-volume
-        TIFFs, the axial profile, the parameter log). To keep each acquisition
-        self-contained, all of these are placed in ``<output_dir>/<filename>/``.
-        ``output_dir`` is repointed to that subfolder so every save site uses it.
+        A single Z-stack writes many files. To keep each acquisition
+        self-contained and tidy, they are organised as::
+
+            <output_dir>/<filename>/
+                <filename>_params.txt          (parameter log)
+                <filename>_zstack_*.tif        (depth-volume TIFFs)
+                <filename>_*_profile.csv        (event / axial CSV)
+                <filename>_*_fit.png            (Gaussian-fit plots)
+                raw_files/
+                    <filename>_raw_stack_zNNN.tif   (one per plane)
+                    <filename>_events_zNNN.raw      (one per plane)
+
+        ``output_dir`` is repointed to ``<output_dir>/<filename>/`` so the
+        summary save sites use it, and the bulky per-plane raw data is collected
+        under ``raw_dir`` (``.../raw_files``) so it no longer clutters the main
+        folder.
         """
         out_dir = self.save_params.get("output_dir", "")
         filename = self.save_params.get("filename", "zstack")
         if out_dir and not self.save_params.get("_dir_prepared", False):
             acq_dir = os.path.join(out_dir, filename)
-            os.makedirs(acq_dir, exist_ok=True)
+            raw_dir = os.path.join(acq_dir, "raw_files")
+            os.makedirs(raw_dir, exist_ok=True)
             self.save_params["output_dir"] = acq_dir
+            self.save_params["raw_dir"] = raw_dir
             self.save_params["_dir_prepared"] = True
 
     def run(self):
@@ -231,10 +245,10 @@ class AutomatedZStackWorker(QThread):
         if not self._is_running or count != num_frames:
             return None
 
-        out_dir = self.save_params.get("output_dir", "")
-        if out_dir and self.save_params.get("save_raw", True):
+        raw_dir = self.save_params.get("raw_dir") or self.save_params.get("output_dir", "")
+        if raw_dir and self.save_params.get("save_raw", True):
             filename = self.save_params.get("filename", "zstack")
-            save_raw_stack_tiff(raw_stack, out_dir, filename, roi, plane=step)
+            save_raw_stack_tiff(raw_stack, raw_dir, filename, roi, plane=step)
         return compute_dsi_images(raw_stack, roi)
 
     # ----------------------------------------------------------------- EVENT
@@ -323,8 +337,6 @@ class AutomatedZStackWorker(QThread):
         image.
         """
         p = self.evk4_params
-        out_dir = self.save_params.get("output_dir", "")
-        filename = self.save_params.get("filename", "zstack")
         device = initiate_device("")
 
         biases = device.get_i_ll_biases()
@@ -344,10 +356,15 @@ class AutomatedZStackWorker(QThread):
         roi = p.get("evk4_roi")
         apply_event_roi(device, roi)
 
+        # Always save this plane's raw event stream (one .raw per plane). Logging
+        # must start before the iterator and be stopped in a finally — stopping
+        # without a prior log_raw_data can crash the native library.
+        raw_dir = self.save_params.get("raw_dir") or self.save_params.get("output_dir", "")
+        filename = self.save_params.get("filename", "zstack")
         events_stream = device.get_i_events_stream()
         raw_path = None
-        if out_dir and events_stream:
-            raw_path = os.path.join(out_dir, f"{filename}_events_z{step:03d}.raw")
+        if raw_dir and events_stream:
+            raw_path = os.path.join(raw_dir, f"{filename}_events_z{step:03d}.raw")
             events_stream.log_raw_data(raw_path)
 
         mv_iterator = EventsIterator.from_device(device=device)
