@@ -2,7 +2,7 @@
 
 Control software for the **Institut Fresnel event-based Dynamic Speckle Illumination (event-DSI) microscope**. It is a PyQt6 desktop application that drives the full optical setup and reconstructs optically-sectioned wide-field fluorescence images.
 
-> This document is the high-level map kept for context across sessions. When you change behaviour, ALWAYS update the relevant section here too.
+> This document is the high-level map kept for context across sessions. When you change behaviour, ALWAYS update the relevant section here too. If data treatment was performed, ALWAYS update the 
 >
 > For the formal math — every equation behind acquisition and reconstruction, with rendered symbols — see [MATHEMATICS.md](MATHEMATICS.md).
 
