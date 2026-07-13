@@ -4,7 +4,8 @@
       "Bash(python -c \"import PyQt6; from ui.main_window import MainWindow; print\\('import OK'\\)\")",
       "Bash(QT_QPA_PLATFORM=offscreen python -c ' *)",
       "PowerShell(pip show h5py 2>&1)",
-      "PowerShell(pip install h5py 2>&1)"
+      "PowerShell(pip install h5py 2>&1)",
+      "Read(//d/2026-07-08/linearity_analysis/**)"
     ]
   }
 }

@@ -26,6 +26,156 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-10 — Is the EVK4 linear in **log(intensity)**? (sparse different-size beads, two ports)
+
+**Conditions**
+- Sample: fluorescent beads of clearly **different sizes**, sparse and individually
+  resolvable (+ one dense close-packed clump, excluded). The size spread is the brightness
+  axis: within the matched field the beads span **40× (port 2) / 95× (ports 1&3)**.
+- Light power at sample: **1.98 mW** (`Power.txt`).
+- Illumination (AWG): CH1 square **1500 Hz**, 18 Vpp (CH2 off).
+- Camera settings: ORCA 20 ms × 200 frames/plane, full sensor; EVK4 bias fo=5/hpf=40/on=off=40,
+  5 s/plane, full sensor; both **71 planes, 0.2 µm step**.
+- Two configs (`Notes.txt`): **A = port 2** (80 % EVK4 / 20 % ORCA beamsplitter:
+  `differentsizes_orca` ↔ `differentsizes_evk4`); **B = ports 1&3** (100 % each, the "best":
+  `differentsizes_orca_port1` ↔ `differentsizes_evk4_port3`).
+
+**Data treatment**
+- Question (tutor): is the event-camera response linear in **log(intensity)**? Refines the
+  2026-07-08/09 finding (EVK4 sub-linear in intensity) by testing the logarithmic model directly.
+- Per-camera z-MIP → register EVK4→ORCA (masked-NCC). Both configs **θ=317°, scale=0.745**,
+  matching pixel-pitch ratio 4.86/6.5=0.748 to <0.4 % (magnification equal on both ports); NCC
+  0.71 (A) / 0.86 (B). Segmented each bead on the ORCA average MIP; matched per-bead integrated
+  photometry (ORCA avg = true brightness, ORCA DSI std, EVK4 events) through mapped apertures.
+  Bead selection verified against a registered overlay (`overlay_check.png`): every resolvable
+  bead inside the EVK4 field is used (incl. the brightest — cap raised to 15k px after that check;
+  the honeycomb monolayer stays outside the matched window).
+- **Reference OK — ORCA linear:** DSI std vs widefield average per bead **R²=1.00** (both configs),
+  slope~1; brightness axis unsaturated (raw peak ≤8500/65535).
+- **Result — EVK4 compressive/log-like, NOT linear in intensity:** integrated events vs brightness:
+  config A (n=9, 91×) linear R²=0.77, log R²=0.72, **power g=0.44** (r_log=0.85); config B (n=10, 182×)
+  linear R²=0.83 < **log R²=0.92** (r=0.96, power g=0.53); pooled (z-scored, n=19) linear R²=0.80,
+  log R²=0.82 (r=0.91). A **sub-linear power law brightness^0.44–0.53** is the most consistent
+  descriptor in both configs; in the clean 100 % config the compression is explicitly **logarithmic**
+  (linear-axes plot visibly saturates: two brightest beads give ~equal events). Config A is noisier —
+  one bright bead fires anomalously **few** events (1.1e6 a.u.→2900 ev; likely EVK4 rate saturation) —
+  so there log≈linear. Not separable log vs mild power law over ~2 decades, n≈9, but both = strongly
+  compressive, never proportional (90–180× brighter → only ~5–15× more events).
+- **Mechanism — per-pixel flat:** peak-vs-peak EVK4 vs ORCA **R²≈0**; the compression is an **area
+  effect** (brighter beads are larger → more fluctuating pixels), i.e. the sensor fires on
+  log-intensity *changes* (contrast), not absolute level. Reproduces 2026-07-02.
+- **Verdict:** firmly **non-linear in intensity** (compressive, exponent ≈0.5); in the clean data
+  well described as **linear in log(intensity)** (r=0.96) — so **yes, approximately**, as expected
+  from the log front-end — but the effective log transfer is realised spatially (in-focus area), not
+  per-pixel.
+- **Caveats:** small n (EVK4 FOV is a small crop of the ORCA field → only overlapping beads match);
+  the port-2 anomalous-few-events bead makes config A ambiguous; config B (100 %, wider range) is the
+  more reliable.
+
+**Main files generated** (in `D:\2026-07-10\linearity_analysis\`)
+- `EVK4_log_linearity_report.pdf` (standalone report); `README.md`
+- `figures/fig1_fields.png`, `fig2_transfer.png` (the result), `fig3_models.png`,
+  `reg_overlay_*.png`, `overlay_check.png` (bead-selection diagnostic)
+- `beads.csv` (19 beads), `registration.json`, `fit_summary.json`, `scripts/step1…step7`
+
+---
+
+## 2026-07-09 — EVK4 intensity linearity vs ORCA (repeat, single 1 µm field)
+
+**Conditions**
+- Sample: one "1 µm" fluorescent-bead field (dual-camera via beam-splitter). Only one bead size this time.
+- Light power at sample: **0.76 mW**.
+- Illumination (AWG): CH1 square **1500 Hz**, 18 Vpp (same optimum). CH2 also ON (2000 Hz, 18 Vpp).
+- Camera settings: ORCA 20 ms × 200 frames/plane, full sensor; EVK4 bias fo=5/hpf=40/on=off=40, **2 s/plane**; both 51 planes, 0.2 µm step.
+- Notes: per-camera z-MIP used (ports not perfectly co-focal).
+
+**Data treatment** (same pipeline as 2026-07-08)
+- Registered the single EVK4↔ORCA pair (coverage-map + void pattern; **point-ICP avoided** — the periodic bead lattice aliases it). Fine transform maximised bead-match fraction.
+- **Registration changed vs 07-08: mirror + 81° rotation, scale 0.727** (07-08 was 317°, no mirror) → the EVK4 was physically re-mounted between sessions; each session must be registered independently. Bead-match 80%.
+- Matched per-bead photometry on **298 beads**; brightness axis = natural bead-to-bead variation (8.5× spread, 5th–95th pct).
+- **Result 1 — ORCA linear (reference):** DSI std vs widefield average per bead, **r = 1.00, R² = 0.997**, slope 0.79. Validates method + brightness axis.
+- **Result 2 — EVK4 NOT linear (compressed):** events vs ORCA true brightness, **slope 0.33, r = 0.51**. Event signal rises with brightness but strongly sub-linearly (a decade of brightness → ~2× events). Reproduces & sharpens 07-08 (cleaner single field; per-field slopes across both days all <1).
+- **Result 3 — bead size:** this "1 µm" sample measures **5.85 µm** (lattice autocorrelation), same ~6 µm population as 07-08 → label still wrong.
+- **Caveat:** exact exponent (0.33) is indicative (residual focus/registration scatter); direction (sub-linear) is firm. Definitive test still needs a controlled brightness sweep on sparse isolated beads.
+
+**Main files generated** (in `D:\2026-07-09\linearity_analysis\`)
+- `linearity_report.tex`, `README.md`
+- `figures/fig1_fields.png`, `fig2_linearity.png`, `reg_overlay.png`
+- `beads.csv` (298 beads), `registration.json`, `bead_size.json`, `scripts/` (d0709_step1→step6)
+
+---
+
+## 2026-07-08 — EVK4 intensity linearity vs ORCA ground truth (1 / 2 / 3.7 µm beads)
+
+**Conditions**
+- Sample: fluorescent beads, three nominal diameters (1, 2, 3.7 µm), close-packed layers.
+- Light power at sample: **0.88 mW** (from `Power.txt`).
+- Illumination (AWG): CH1 = square, **1500 Hz**, 18 Vpp (the 2026-07-07 event-yield optimum). Identical for all six stacks.
+- Camera settings: **dual-camera, same field via beam-splitter.** ORCA 50 ms × 200 frames/plane, full sensor. EVK4 bias fo=5/hpf=40/on=off=40, 5 s/plane, full sensor. Both: 41 planes, 0.2 µm step. Six z-stacks (orca + evk4 × three sizes).
+- Notes: the two optical ports are not exactly co-focal → used a z-MIP per camera so each bead is measured at its own best-focus plane.
+- Anything that failed: 2 µm cross-camera registration was weak (NCC 0.30) — its per-bead correlation is unreliable.
+
+**Data treatment**
+- Question (tutor): is the event camera linear in intensity? Use the ORCA (linear sCMOS) as ground truth on the *same* beads.
+- **Registration ("cropping" done computationally):** matched the two cameras via coverage-map masked NCC over mirror/rotation/scale. One rigid transform fits all three fields: EVK4→ORCA = **rot 317°, scale 0.743**. Scale matches the pixel-pitch ratio 4.86/6.5 = 0.748 to <1% (independent physics check that magnification is equal on both ports).
+- Matched per-bead photometry on **569 beads**: background-subtracted integrated signal in ORCA average (true brightness), ORCA DSI std, EVK4 events, through scale-matched apertures.
+- **Result 1 — ORCA is linear (reference):** DSI std vs widefield average per bead, Pearson **r = 0.90** (per-sample R² 0.91–0.98), slope ~0.8. Valid ground truth.
+- **Result 2 — EVK4 is NOT linear in intensity:** events vs ORCA true brightness pooled **r = −0.12, slope ≈ 0** (a 10× brighter bead gives ~the same events). Per sample vs ORCA-DSI: r = 0.27 / 0.11 / 0.73 (1/2/3.7 µm); only the largest, best-registered field shows a real but **sub-linear** relation (slope 0.73). Confirms the 2026-07-02 "compressed/log-like" finding, now against a proper linear reference.
+- **Result 3 — the nominal bead sizes are WRONG (all three samples are the same size):** measured the close-packed lattice spacing (nearest-neighbour = diameter, radial autocorrelation over ~16 patches/sample). Diameters: 1µm→35.0±1.0px, 2µm→37.0±1.5px, 3.7µm→36.5±0.5px = ratio **1.00 : 1.06 : 1.04** (identical within ~6%), apparent ~5.9µm at nominal 40× (0.1625µm/px). So the "1/2/3.7µm" labels do not reflect a 1:2:3.7 ratio — likely mislabelled vials / same stock, or true magnification ≠ 40×. Consequence: the dataset does not span a range of sizes, so median per-bead signal is (correctly) non-monotonic in nominal size; the per-bead brightness test is the well-posed one.
+- **Caveat:** some scatter in Result 2 is experimental (focal-plane offset, ~5 px registration residual, poor 2 µm match); correlation tracks registration quality, so the intrinsic relation may be a bit tighter — but still clearly compressive, never proportional.
+- **Follow-up recommended:** sparse isolated beads; one-time grid/graticule cross-camera calibration; sweep true brightness directly (laser power / ORCA exposure) to trace the transfer curve and its saturation knee.
+
+**Main files generated** (in the data folder `D:\2026-07-08\linearity_analysis\`)
+- `linearity_report.tex` — full LaTeX report; `README.md` — summary
+- `figures/fig1_fields.png` … `fig4_aggregate.png`, `fig5_beadsize.png`/`fig6_beadsize_zoom.png` (bead size), plus `joint_verify.png`, `match_check.png`
+- `beads.csv` (569 beads), `joint_registration.json`, `bead_size.json`, `scripts/` (step1→step9)
+
+---
+
+## 2026-07-07 — LC decorrelation × high-pass: event yield vs AWG frequency
+
+**Conditions**
+- Sample: fluorescent marker _(confirm)_
+- Light power at sample: **0.51 mW**
+- Illumination (AWG): CH1 = 18 Vpp, **frequency swept 500 / 1000 / 1500 / 2000 / 2500 Hz**
+- Camera settings: EVK4, bias_fo = 5, bias_on/off = 40, 5 s/plane; **bias_hpf swept 20→110** at each frequency. (Plane count inconsistent: 61 for 500/1500 Hz, 25 for the others — focus confirmed centered in all.)
+- Notes / what happened during acquisition: _(fill in)_
+- Anything that failed: _(fill in)_
+
+**Data treatment**
+- For each AWG frequency, plotted the in-focus event rate (peak of the axial mean event count — normalises out plane count) vs bias_hpf.
+- **Result 1 — event yield peaks at ~1500 Hz** (at hpf=20: 500 Hz → 0.40, 1000 → 6.2, **1500 → 16.4**, 2000 → 10.3, 2500 → 7.5 ev/px). There is an optimal LC drive frequency for event generation.
+- **Result 2 — the high-pass cut-off barely shifts** with frequency (half-max ≈ 62–69, full collapse by hpf ≈ 100 at every frequency).
+- **Interpretation:** over 500–2500 Hz the AWG frequency mainly tunes the *strength* of the speckle decorrelation (peaked ~1500 Hz), not its *rate* (cut-off ≈ constant). To confirm, measure the decorrelation time directly (ORCA autocorrelation).
+
+**Main files generated** (in the data folder `D:\2026-07-07\`)
+- `decorrelation_bandpass.png` — event rate vs hpf (per frequency) + yield vs AWG frequency
+- `make_decorrelation_figures.py` — the analysis script
+
+---
+
+## 2026-07-03 — Band-pass biases: events vs high-pass / low-pass (fluorescent marker)
+
+**Conditions**
+- Sample: fluorescent marker (uniform) _(confirm)_
+- Light power at sample: **0.43 mW** (from `Power.txt`)
+- Illumination (AWG): CH1 = 2500 Hz, 18 Vpp (single decorrelation — AWG frequency NOT yet swept)
+- Camera settings: EVK4, bias_on/off = 40, 5 s, 71 planes. Two 1-D sweeps: **bias_hpf** 0→120 (fo=0), **bias_fo** −35→55 (hpf=40).
+- Notes / what happened during acquisition: _(fill in)_
+- Anything that failed: _(fill in)_
+
+**Data treatment**
+- Question (tutor): how does the event count depend on the high-pass / low-pass biases (temporal band-pass)?
+- Counted total events per setting (axial CSV proxy). Not saturated (~2.4 Mev/s ≪ ceiling).
+- **Result — clean band-pass behaviour:** raising **bias_hpf** (high-pass) is flat to ~40 then collapses (866 M → ~0 by 110–120) as the rising low-freq cutoff filters out the speckle; raising **bias_fo** (low-pass) rises then plateaus (372 M → ~860 M above fo≈5) once the front-end bandwidth clears the speckle. Useful band ≈ **bias_fo ≳ 5 and bias_hpf ≲ 60**. Bonus: higher hpf also thins the section (FWHM 4.8 → 3.3 µm) until signal starves; fo barely changes FWHM.
+- **Not done yet:** repeat vs LC decorrelation (AWG frequency) — the band-pass edges should shift with it.
+
+**Main files generated** (in the data folder `D:\2026-07-03\`)
+- `bandpass_events.png` — events + FWHM vs bias_hpf and bias_fo
+- `make_bandpass_figures.py` — the analysis script
+
+---
+
 ## 2026-07-02 — Intensity linearity (lots-of-dots + stained samples)
 
 **Conditions**
