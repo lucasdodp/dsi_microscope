@@ -335,17 +335,8 @@ class MainWindow(QMainWindow):
         self.btn_orca_zstack.setObjectName("btnAcquire")
         self.btn_orca_zstack.clicked.connect(lambda: self.start_zstack("orca"))
         acq_layout.addWidget(self.btn_orca_zstack)
-        self.btn_orca_resume = QPushButton("⟳  Resume ORCA Z-Stack…")
-        self.btn_orca_resume.setObjectName("btnLive")
-        self.btn_orca_resume.setToolTip(
-            "Finish an interrupted Z-stack: pick its acquisition folder and this "
-            "captures only the planes still missing, then rebuilds the full depth "
-            "volume. Verify the focus / step / #steps below match the original run first."
-        )
-        self.btn_orca_resume.clicked.connect(self._resume_orca_zstack)
-        acq_layout.addWidget(self.btn_orca_resume)
         # Live pause/resume: appears only while a running ORCA stack is paused waiting
-        # for the camera to be restored (distinct from the cold folder-resume above).
+        # for the camera to be restored (e.g. after replugging the USB).
         self.btn_orca_live_resume = QPushButton("⟳  Resume Acquisition")
         self.btn_orca_live_resume.setObjectName("btnLive")
         self.btn_orca_live_resume.clicked.connect(self._resume_live_acquisition)
@@ -412,15 +403,6 @@ class MainWindow(QMainWindow):
         self.btn_evk4_zstack.setObjectName("btnAcquire")
         self.btn_evk4_zstack.clicked.connect(lambda: self.start_zstack("event"))
         acq_layout.addWidget(self.btn_evk4_zstack)
-        self.btn_evk4_resume_zstack = QPushButton("⟳  Resume Interrupted Z-Stack…")
-        self.btn_evk4_resume_zstack.setObjectName("btnLive")
-        self.btn_evk4_resume_zstack.setToolTip(
-            "Finish an interrupted event Z-stack: pick its acquisition folder and this "
-            "captures only the planes still missing, then rebuilds the full event "
-            "volume. Verify the focus / step / #steps below match the original run first."
-        )
-        self.btn_evk4_resume_zstack.clicked.connect(self._resume_evk4_zstack)
-        acq_layout.addWidget(self.btn_evk4_resume_zstack)
         # Shown only when an acquisition has paused after losing the event camera:
         # replug the USB, then click this to continue from the plane it stopped on.
         self.btn_evk4_resume = QPushButton("⟳  Resume Acquisition")
@@ -979,11 +961,7 @@ class MainWindow(QMainWindow):
         self.btn_orca_live.setEnabled(not orca_live and not busy)
         self.btn_evk4_live.setEnabled(not evk4_live and not busy)
         self.btn_orca_zstack.setEnabled(not busy)
-        if hasattr(self, "btn_orca_resume"):
-            self.btn_orca_resume.setEnabled(not busy)
         self.btn_evk4_zstack.setEnabled(not busy)
-        if hasattr(self, "btn_evk4_resume_zstack"):
-            self.btn_evk4_resume_zstack.setEnabled(not busy)
         self.btn_orca_stop.setEnabled(orca_live or (zstack and zcam == "orca"))
         self.btn_evk4_stop.setEnabled(evk4_live or (zstack and zcam == "event") or self._queue_active)
         # Outside a queue, disable 'Run Queue' while any manual Z-stack runs.
@@ -1246,14 +1224,8 @@ class MainWindow(QMainWindow):
                 return f"{value:.1f} {unit}"
             value /= 1024.0
 
-    def start_zstack(self, camera, start_plane=0, resume_folder=None):
-        """Launch the automated Z-stack for ``camera`` ("orca" or "event").
-
-        ``resume_folder`` (ORCA only) finishes an interrupted stack: it is the
-        existing acquisition folder, ``start_plane`` is the first plane still to
-        capture, and the run rebuilds the full depth volume from every per-plane
-        raw file when it finishes.
-        """
+    def start_zstack(self, camera):
+        """Launch the automated Z-stack for ``camera`` ("orca" or "event")."""
         if camera == "orca" and not DCAM_AVAILABLE:
             QMessageBox.warning(self, "ORCA Camera Unavailable",
                 "The Hamamatsu DCAM API was not found. See README.md for setup instructions.")
@@ -1269,15 +1241,7 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("A Z-Stack is already running — stop it before starting another.")
             return
 
-        resume = resume_folder is not None
-        if resume:
-            # Resume writes into the existing acquisition folder: its own name is the
-            # filename base and its parent is the output directory the orchestrator
-            # would otherwise derive for a fresh run.
-            resume_folder = os.path.normpath(resume_folder)
-            out_dir = os.path.dirname(resume_folder)
-        else:
-            out_dir = self.txt_orca_dir.text() if camera == "orca" else self.txt_evk4_dir.text()
+        out_dir = self.txt_orca_dir.text() if camera == "orca" else self.txt_evk4_dir.text()
         if not out_dir:
             QMessageBox.warning(self, "Missing Parameter", "Please select an output directory for the Z-Stack.")
             return
@@ -1301,13 +1265,10 @@ class MainWindow(QMainWindow):
                 if resp != QMessageBox.StandardButton.Yes:
                     return
 
-        if resume:
-            filename = os.path.basename(resume_folder)
-        else:
-            fn_field = self.txt_orca_filename if camera == "orca" else self.txt_evk4_filename
-            fn_prefix = "zstack_orca" if camera == "orca" else "zstack_evk4"
-            self._refresh_default_filename(fn_field, fn_prefix)
-            filename = fn_field.text()
+        fn_field = self.txt_orca_filename if camera == "orca" else self.txt_evk4_filename
+        fn_prefix = "zstack_orca" if camera == "orca" else "zstack_evk4"
+        self._refresh_default_filename(fn_field, fn_prefix)
+        filename = fn_field.text()
         source = (
             "3D Z-Stack (ORCA) - per-plane DSI" if camera == "orca"
             else "3D Z-Stack (EVK4) - per-plane event-DSI"
@@ -1322,14 +1283,6 @@ class MainWindow(QMainWindow):
                 source, out_dir, filename, self.evk4_params, self.orca_params
             ),
         }
-        if resume:
-            # Point the orchestrator straight at the existing folder (skip the
-            # per-filename subfolder derivation it does for a fresh run), and force
-            # raw saving on — the rebuild at the end reads those per-plane files.
-            save_params["output_dir"] = resume_folder
-            save_params["raw_dir"] = os.path.join(resume_folder, "raw_files")
-            save_params["_dir_prepared"] = True
-            save_params["save_raw"] = True
 
         # Auto-stop a running live preview for this camera so its handle is released
         # before the orchestrator opens the camera.
@@ -1354,7 +1307,6 @@ class MainWindow(QMainWindow):
             save_params,
             camera=camera,
             evk4_params=self.evk4_params.get_params(),
-            start_plane=start_plane,
         )
         self.zstack_worker.image_ready.connect(
             self.update_orca_image if camera == "orca" else self.update_evk4_image
@@ -1379,171 +1331,10 @@ class MainWindow(QMainWindow):
             label, restore = self.lbl_evk4_time, self._update_evk4_time
         self._begin_acq_record(
             "orca_zstack" if camera == "orca" else "evk4_zstack",
-            predicted, planes=self.pi_stage_widget.spin_steps.value() - start_plane,
+            predicted, planes=self.pi_stage_widget.spin_steps.value(),
             frames=frames, out_dir=out_dir, filename=filename,
         )
         self._start_elapsed(label, restore)
-
-    def _resume_orca_zstack(self):
-        """Finish an interrupted ORCA Z-stack.
-
-        The user picks the acquisition folder; this finds the first plane whose raw
-        stack is missing or truncated, confirms the scan geometry (which must match
-        the original run), then launches a resume that captures only the missing
-        tail and rebuilds the full depth volume. The stage is absolute/closed-loop,
-        so re-entering the same focus / step / #steps returns it to the exact planes.
-        """
-        if not DCAM_AVAILABLE:
-            QMessageBox.warning(self, "ORCA Camera Unavailable",
-                "The Hamamatsu DCAM API was not found. See README.md for setup instructions.")
-            return
-        if not self.pi_stage_widget.pidevice:
-            QMessageBox.warning(self, "Connection Error",
-                "Please connect the PI Stage before resuming a Z-Stack.")
-            return
-        if self.zstack_worker is not None and self.zstack_worker.isRunning():
-            self.lbl_status.setText("A Z-Stack is already running — stop it before resuming another.")
-            return
-
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select the Z-Stack acquisition folder to resume", self.txt_orca_dir.text() or "")
-        if not folder:
-            return
-        folder = os.path.normpath(folder)
-        filename = os.path.basename(folder)
-        raw_dir = os.path.join(folder, "raw_files")
-        if not os.path.isdir(raw_dir):
-            QMessageBox.warning(self, "Not a Z-Stack folder",
-                f"No 'raw_files' subfolder was found in:\n{folder}\n\n"
-                "Pick the acquisition folder that contains the per-plane raw stacks.")
-            return
-
-        motor = self.get_motor_params()
-        steps, step_size, focus = int(motor["steps"]), motor["step_size"], motor["focus"]
-        frames = int(self.orca_params.get_params()["orca_frames"])
-
-        from core import find_complete_planes
-        complete, missing = find_complete_planes(raw_dir, filename, steps, frames)
-        if not complete:
-            QMessageBox.warning(self, "No captured planes found",
-                f"No complete per-plane raw stacks were found in:\n{raw_dir}\n\n"
-                f"Expected files named '{filename}_raw_stack_zNNN.tif' with {frames} "
-                "frames each. Check the folder and the frame count (N) before resuming.")
-            return
-        if not missing:
-            QMessageBox.information(self, "Nothing to resume",
-                f"All {steps} planes already have a complete raw stack in:\n{folder}\n\n"
-                "If the depth volume is missing or partial, rebuild it offline with "
-                "tools/rebuild_orca_zstack.py (no camera needed).")
-            return
-
-        start_plane = missing[0]
-        first_z = focus - (step_size * steps / 2) + start_plane * step_size
-
-        resp = QMessageBox.question(
-            self, "Resume ORCA Z-Stack",
-            f"Folder: {folder}\n"
-            f"Complete planes on disk: {len(complete)} of {steps}\n"
-            f"Resume at plane {start_plane + 1}/{steps}  (Z = {first_z:.4f} µm)\n"
-            f"Planes to capture: {steps - start_plane}\n\n"
-            "Scan geometry (from the panel — must match the original run):\n"
-            f"  focus = {focus:.4f} µm,  step = {step_size:.4f} µm,  steps = {steps}\n"
-            f"  frames/plane = {frames}\n\n"
-            "The stage returns to the exact planes only if the sample and stage are "
-            "undisturbed and these values match the original acquisition.\n\n"
-            "Start the resume?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if resp != QMessageBox.StandardButton.Yes:
-            return
-
-        # A gap with later already-present planes means the resume (which runs to the
-        # end) will re-capture and overwrite them. Harmless, but worth flagging.
-        if max(complete) > start_plane:
-            self.lbl_status.setText(
-                f"Note: resuming at plane {start_plane + 1}; already-captured planes "
-                "above it will be re-captured.")
-
-        self.start_zstack("orca", start_plane=start_plane, resume_folder=folder)
-
-    def _resume_evk4_zstack(self):
-        """Finish an interrupted EVK4 event Z-stack.
-
-        Event counterpart of :meth:`_resume_orca_zstack`: the user picks the
-        acquisition folder, this finds the first plane whose raw event stream was
-        never fully written, confirms the scan geometry, then resumes capture of the
-        missing tail and rebuilds the full event volume.
-        """
-        if not METAVISION_AVAILABLE:
-            QMessageBox.warning(self, "Event Camera Unavailable",
-                "The Prophesee Metavision SDK was not found. See README.md for setup instructions.")
-            return
-        if not self.pi_stage_widget.pidevice:
-            QMessageBox.warning(self, "Connection Error",
-                "Please connect the PI Stage before resuming a Z-Stack.")
-            return
-        if self.zstack_worker is not None and self.zstack_worker.isRunning():
-            self.lbl_status.setText("A Z-Stack is already running — stop it before resuming another.")
-            return
-
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select the event Z-Stack acquisition folder to resume", self.txt_evk4_dir.text() or "")
-        if not folder:
-            return
-        folder = os.path.normpath(folder)
-        filename = os.path.basename(folder)
-        raw_dir = os.path.join(folder, "raw_files")
-        if not os.path.isdir(raw_dir):
-            QMessageBox.warning(self, "Not a Z-Stack folder",
-                f"No 'raw_files' subfolder was found in:\n{folder}\n\n"
-                "Pick the acquisition folder that contains the per-plane raw event streams.")
-            return
-
-        motor = self.get_motor_params()
-        steps, step_size, focus = int(motor["steps"]), motor["step_size"], motor["focus"]
-
-        from core import find_complete_event_planes
-        complete, missing = find_complete_event_planes(raw_dir, filename, steps)
-        if not complete:
-            QMessageBox.warning(self, "No captured planes found",
-                f"No completed per-plane event streams were found in:\n{raw_dir}\n\n"
-                f"Expected files named '{filename}_events_zNNN.raw' (+ _xytp.mat). "
-                "Check the folder before resuming.")
-            return
-        if not missing:
-            QMessageBox.information(self, "Nothing to resume",
-                f"All {steps} planes already have a complete event stream in:\n{folder}\n\n"
-                "If the event volume is missing or partial, rebuild it offline with "
-                "tools/rebuild_evk4_zstack.py.")
-            return
-
-        start_plane = missing[0]
-        first_z = focus - (step_size * steps / 2) + start_plane * step_size
-
-        resp = QMessageBox.question(
-            self, "Resume EVK4 Z-Stack",
-            f"Folder: {folder}\n"
-            f"Complete planes on disk: {len(complete)} of {steps}\n"
-            f"Resume at plane {start_plane + 1}/{steps}  (Z = {first_z:.4f} µm)\n"
-            f"Planes to capture: {steps - start_plane}\n\n"
-            "Scan geometry (from the panel — must match the original run):\n"
-            f"  focus = {focus:.4f} µm,  step = {step_size:.4f} µm,  steps = {steps}\n\n"
-            "The stage returns to the exact planes only if the sample and stage are "
-            "undisturbed and these values match the original acquisition.\n\n"
-            "Start the resume?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if resp != QMessageBox.StandardButton.Yes:
-            return
-
-        if max(complete) > start_plane:
-            self.lbl_status.setText(
-                f"Note: resuming at plane {start_plane + 1}; already-captured planes "
-                "above it will be re-captured.")
-
-        self.start_zstack("event", start_plane=start_plane, resume_folder=folder)
 
     def handle_z_profile(self, z_val, step_num):
         print(f"Step {step_num} | Computed Z-Profile value: {z_val}")
