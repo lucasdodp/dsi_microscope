@@ -14,7 +14,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import EVK4_ERC_RATE, EVK4_FPS
 from core import (
     accumulate_event_frame, apply_smoothing, crop_to_roi, filter_crazy_pixels,
-    save_mat_tif, save_parameter_log,
+    save_event_stream, save_mat_tif, save_parameter_log,
 )
 
 try:
@@ -200,6 +200,16 @@ class CameraWorker(QThread):
         # Crop to the same ROI the live view used, so the saved image matches the
         # framing the user selected (the raw log keeps every event for re-use).
         final_image = crop_to_roi(final_image, self._roi)
+
+        # Also save the decoded event stream (x, y, p, t) alongside the .raw log,
+        # as the explicit per-event list requested for downstream analysis. A
+        # second pass over the raw file (decode is cheap) keeps this independent
+        # of the accumulation above; it is always saved, even if the image below
+        # turns out blank.
+        save_event_stream(
+            EventsIterator(input_path=raw_path, delta_t=1000000),
+            self.params["output_dir"], self.params["filename"],
+        )
 
         # Always log the acquisition parameters, even if no events were recorded.
         metadata = self.params.get("metadata")

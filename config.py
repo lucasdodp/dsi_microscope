@@ -174,7 +174,7 @@ ACQUISITION_HISTORY_PATH = os.environ.get(
         "DSIMicroscope", "acquisition_history.json",
     ),
 )
-ACQUISITION_HISTORY_MAX = 40  # most recent runs kept per acquisition type
+ACQUISITION_HISTORY_MAX = 60  # most recent runs kept per acquisition type
 
 # ---------------------------------------------------------------------------
 # Prophesee EVK4 (Metavision)

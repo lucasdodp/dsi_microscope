@@ -17,9 +17,16 @@ from .image_processing import (
     save_parameter_log,
     scale_16bit_image,
     accumulate_event_frame,
+    save_event_stream,
     filter_crazy_pixels,
     apply_smoothing,
     save_mat_tif,
+    raw_stack_plane_path,
+    read_multipage_tiff,
+    find_complete_planes,
+    rebuild_zstack_from_raw,
+    event_raw_plane_path,
+    find_complete_event_planes,
 )
 
 __all__ = [
@@ -35,7 +42,14 @@ __all__ = [
     "save_parameter_log",
     "scale_16bit_image",
     "accumulate_event_frame",
+    "save_event_stream",
     "filter_crazy_pixels",
     "apply_smoothing",
     "save_mat_tif",
+    "raw_stack_plane_path",
+    "read_multipage_tiff",
+    "find_complete_planes",
+    "rebuild_zstack_from_raw",
+    "event_raw_plane_path",
+    "find_complete_event_planes",
 ]

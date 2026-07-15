@@ -569,6 +569,205 @@ def save_parameter_log(out_dir, filename, sections):
     return path
 
 
+# ---------------------------------------------------------------------------
+# Z-stack rebuild — reassemble the depth volumes from the per-plane raw TIFFs
+# ---------------------------------------------------------------------------
+# Every ORCA Z-stack plane is archived as its own ``<name>_raw_stack_zNNN.tif``.
+# That makes the final products (the DSI / average depth volumes and the axial
+# profiles) fully reconstructible from disk — so an acquisition that stopped part
+# way (or whose summary save was interrupted) can be finished after the fact, and
+# a resumed run can stitch its freshly captured tail onto the planes already saved.
+def raw_stack_plane_path(raw_dir, filename, plane):
+    """Path of the per-plane raw-stack TIFF for a given Z-stack plane index."""
+    return os.path.join(raw_dir, f"{filename}_raw_stack_z{plane:03d}.tif")
+
+
+def read_multipage_tiff(path):
+    """Read a multi-page TIFF into an ``(N, H, W)`` array at its native bit depth.
+
+    Prefers ``tifffile`` (which understands the ImageJ contiguous-stack layout the
+    writer produces); falls back to OpenCV's ``imreadmulti``. Raises ``OSError`` on
+    a missing / truncated / unreadable file so callers can treat that plane as
+    absent. A single-page file is returned with a leading length-1 frame axis.
+    """
+    try:
+        import tifffile
+        arr = tifffile.imread(path)
+    except ImportError:
+        ok, frames = cv2.imreadmulti(path, flags=cv2.IMREAD_UNCHANGED)
+        if not ok or not frames:
+            raise OSError(f"could not read TIFF: {path}")
+        arr = np.asarray(frames)
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, ...]
+    return arr
+
+
+def _tiff_num_frames(path):
+    """Number of frames in a multi-page TIFF, read from its headers (no pixels).
+
+    Returns 0 for a missing, truncated, or otherwise unparseable file — e.g. a
+    plane interrupted mid-write — so it is naturally classified as incomplete.
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        import tifffile
+        with tifffile.TiffFile(path) as tf:
+            shape = tf.series[0].shape
+        return int(shape[0]) if len(shape) >= 3 else 1
+    except Exception:
+        # No tifffile, or a header we can't parse: fall back to a coarse "does it
+        # look like more than a stub?" size test so an 8-byte truncation still
+        # reads as incomplete while a real stack reads as present (>=1 frame).
+        try:
+            return 1 if os.path.getsize(path) > 1024 else 0
+        except OSError:
+            return 0
+
+
+def find_complete_planes(raw_dir, filename, steps, expected_frames=None):
+    """Classify plane indices ``0..steps-1`` by whether their raw TIFF is complete.
+
+    A plane is *complete* when its ``<name>_raw_stack_zNNN.tif`` exists and (when
+    ``expected_frames`` is given) holds at least that many frames. A truncated file
+    — such as the plane being written when an acquisition crashed — counts as
+    missing so a resume re-captures it.
+
+    Returns ``(complete, missing)``: two sorted lists of plane indices.
+    """
+    complete, missing = [], []
+    for k in range(steps):
+        n = _tiff_num_frames(raw_stack_plane_path(raw_dir, filename, k))
+        if n > 0 and (expected_frames is None or n >= expected_frames):
+            complete.append(k)
+        else:
+            missing.append(k)
+    return complete, missing
+
+
+def event_raw_plane_path(raw_dir, filename, plane):
+    """Path of the per-plane raw event stream (``.raw``) for a Z-stack plane index."""
+    return os.path.join(raw_dir, f"{filename}_events_z{plane:03d}.raw")
+
+
+def find_complete_event_planes(raw_dir, filename, steps):
+    """Classify EVK4 plane indices ``0..steps-1`` by whether their capture finished.
+
+    A plane is *complete* when both its raw event stream
+    ``<name>_events_zNNN.raw`` and its decoded companion
+    ``<name>_events_zNNN_xytp.mat`` exist. The ``.mat`` is written only after a
+    plane has been fully recorded and reconstructed, so its presence marks a clean
+    finish; a plane whose recording was interrupted (raw present but no ``.mat``, or
+    nothing at all) is reported missing so a resume re-captures it.
+
+    This mirrors :func:`find_complete_planes` (the ORCA equivalent) but keys off the
+    event-stream file pair instead of a multi-page TIFF's page count.
+
+    Returns ``(complete, missing)``: two sorted lists of plane indices.
+    """
+    complete, missing = [], []
+    for k in range(steps):
+        raw = event_raw_plane_path(raw_dir, filename, k)
+        mat = os.path.join(raw_dir, f"{filename}_events_z{k:03d}_xytp.mat")
+        if os.path.exists(raw) and os.path.exists(mat):
+            complete.append(k)
+        else:
+            missing.append(k)
+    return complete, missing
+
+
+def rebuild_zstack_from_raw(raw_dir, out_dir, filename, z_positions,
+                            expected_frames=None, save_average=True,
+                            metadata=None, status=None):
+    """Reassemble the ORCA Z-stack outputs from the per-plane raw speckle TIFFs.
+
+    Reads every present ``<name>_raw_stack_zNNN.tif`` in plane order, computes the
+    average (widefield) and standard-deviation (DSI) image for each, and writes the
+    same products a completed run would: the DSI and average depth volumes (3D
+    TIFF), the axial-sectioning profile (DSI) and axial-average (widefield)
+    CSV/PNG, and — when ``metadata`` is given — the parameter log. Existing summary
+    files (e.g. a partial ``_zstack_dsi.tif``) are overwritten with the full set.
+
+    The raw TIFFs are already ROI-cropped on disk, so no further crop is applied.
+    Planes are loaded one at a time and released before the next, so peak memory is
+    one raw stack plus the accumulating (small) sectioned volumes.
+
+    Parameters
+    ----------
+    raw_dir : str
+        Folder holding the per-plane raw-stack TIFFs (the ``raw_files`` subfolder).
+    out_dir : str
+        Acquisition folder to write the assembled volumes / profiles into.
+    filename : str
+        Filename base shared by every file of the acquisition.
+    z_positions : sequence of float
+        Nominal axial position (µm) of every plane index ``0..len-1`` (from the
+        scan geometry). Only planes actually present on disk are used; ``len``
+        defines the plane range that is scanned.
+    expected_frames : int or None
+        Frames per complete plane; a plane with fewer is skipped as incomplete.
+    save_average : bool
+        Also write the average (widefield) volume + axial-average profile.
+    metadata : dict or None
+        Parameter-log sections; when given, the log is (re)written.
+    status : callable or None
+        Optional progress callback invoked with human-readable strings.
+
+    Returns
+    -------
+    (n_planes, missing) : (int, list[int])
+        Number of planes assembled and the sorted list of plane indices skipped
+        because their raw file was missing or incomplete.
+    """
+    def report(msg):
+        if status is not None:
+            status(msg)
+
+    steps = len(z_positions)
+    complete, missing = find_complete_planes(raw_dir, filename, steps, expected_frames)
+    if not complete:
+        raise RuntimeError(f"No complete per-plane raw stacks found in {raw_dir}")
+
+    std_volume, avg_volume, z_kept = [], [], []
+    for idx, k in enumerate(complete, 1):
+        report(f"Rebuilding plane {k + 1}/{steps} ({idx}/{len(complete)} present)...")
+        stack = read_multipage_tiff(raw_stack_plane_path(raw_dir, filename, k))
+        avg_img, std_img = compute_dsi_images(stack, None)
+        std_volume.append(std_img)
+        if save_average:
+            avg_volume.append(avg_img)
+        z_kept.append(float(z_positions[k]))
+        del stack  # release the ~GB raw stack before loading the next plane
+
+    report(f"Writing DSI depth volume ({len(std_volume)} planes)...")
+    save_volume_tiff(np.array(std_volume, dtype=np.float32), out_dir, filename, "zstack_dsi")
+    if save_average and avg_volume:
+        save_volume_tiff(np.array(avg_volume, dtype=np.float32), out_dir, filename, "zstack_average")
+
+    # Axial-sectioning profile (DSI) + companion widefield-average profile.
+    std_intensities = [float(np.mean(img)) for img in std_volume]
+    save_axial_sectioning_plot(z_kept, std_intensities, out_dir, filename, "dsi")
+    if save_average and avg_volume:
+        avg_intensities = [float(np.mean(img)) for img in avg_volume]
+        save_axial_average_plot(z_kept, avg_intensities, out_dir, filename)
+
+    if metadata:
+        meta = dict(metadata)
+        meta["Z-Stack planes"] = {
+            "camera": "orca",
+            "num_planes_saved": len(std_volume),
+            "missing_planes": ", ".join(str(m) for m in missing) or "none",
+            "z_positions": ", ".join(f"{z:.4f}" for z in z_kept),
+        }
+        save_parameter_log(out_dir, filename, meta)
+
+    report(f"Rebuilt {len(std_volume)} planes"
+           + (f"; {len(missing)} still missing: {missing}" if missing else " (complete)"))
+    return len(std_volume), missing
+
+
 def scale_16bit_image(data):
     """Scale a 16-bit camera frame to an 8-bit display image.
 
@@ -603,6 +802,48 @@ def accumulate_event_frame(event_chunks, width, height):
     for evs in event_chunks:
         np.add.at(final_image, (evs["y"], evs["x"]), 1)
     return final_image
+
+
+def save_event_stream(event_chunks, out_dir, filename):
+    """Persist the decoded event stream (x, y, p, t) as a compressed ``.mat``.
+
+    The Prophesee ``.raw`` file is the camera's *encoded* record; this writes the
+    explicit per-event list for downstream analysis: pixel coordinates ``x``/``y``
+    (uint16), polarity ``p`` (int8, 0/1) and timestamp ``t`` (int64, microseconds).
+    Each chunk is a structured array exposing the ``'x'``, ``'y'``, ``'p'`` and
+    ``'t'`` fields (as produced by a Metavision ``EventsIterator``); this function
+    is SDK-agnostic and only concatenates NumPy arrays, so the iterator is injected
+    by the hardware layer (and reused by the offline backfill tool).
+
+    Written as ``<filename>_xytp.mat``, MATLAB-native and gzip-compressed so the
+    decoded list stays comparable in size to the raw log rather than 4x larger.
+    Each column keeps its native dtype to stay compact. An event-free stream still
+    writes an (empty-array) file, so every ``.raw`` has a stream counterpart.
+
+    Returns the path of the file written.
+    """
+    xs, ys, ps, ts = [], [], [], []
+    for evs in event_chunks:
+        if len(evs):
+            xs.append(evs["x"].copy())
+            ys.append(evs["y"].copy())
+            ps.append(evs["p"].copy())
+            ts.append(evs["t"].copy())
+
+    if xs:
+        x = np.concatenate(xs)
+        y = np.concatenate(ys)
+        p = np.concatenate(ps).astype(np.int8)
+        t = np.concatenate(ts)
+    else:
+        x = np.empty(0, dtype=np.uint16)
+        y = np.empty(0, dtype=np.uint16)
+        p = np.empty(0, dtype=np.int8)
+        t = np.empty(0, dtype=np.int64)
+
+    path = os.path.join(out_dir, f"{filename}_xytp.mat")
+    scipy.io.savemat(path, {"x": x, "y": y, "p": p, "t": t}, do_compression=True)
+    return path
 
 
 def filter_crazy_pixels(image, percentile=EVK4_CRAZY_PIXEL_PERCENTILE):

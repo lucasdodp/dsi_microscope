@@ -27,11 +27,13 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import (
     DCAM_EXPOSURE_PROP, EVK4_ERC_RATE, EVK4_MAX_RECONNECT_ATTEMPTS, EVK4_RECONNECT_DELAY_S,
+    EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT,
 )
 from core import (
     accumulate_event_frame, apply_smoothing, compute_dsi_images, crop_to_roi,
-    filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
-    save_axial_sectioning_plot, save_parameter_log, save_raw_stack_tiff, save_volume_tiff,
+    filter_crazy_pixels, normalize_to_8bit, rebuild_zstack_from_raw,
+    save_axial_average_plot, save_axial_sectioning_plot, save_event_stream,
+    save_parameter_log, save_raw_stack_tiff, save_volume_tiff,
 )
 from hardware.event_camera import (
     apply_event_roi, EventsIterator, METAVISION_AVAILABLE, initiate_device,
@@ -52,7 +54,7 @@ class AutomatedZStackWorker(QThread):
     awaiting_reconnect = pyqtSignal(bool)  # True -> paused, waiting for the user to replug + Resume
 
     def __init__(self, pidevice, axis, motor_params, orca_params, save_params=None,
-                 camera="orca", evk4_params=None):
+                 camera="orca", evk4_params=None, start_plane=0):
         super().__init__()
         self.pidevice = pidevice
         self.axis = axis
@@ -61,8 +63,14 @@ class AutomatedZStackWorker(QThread):
         self.evk4_params = evk4_params or {}
         self.save_params = save_params or {}
         self.camera = camera  # "orca" or "event"
+        # First plane to (re)capture. >0 means this is a *resume*: planes below it
+        # were already written to disk by an earlier run, so this run captures only
+        # the tail and then rebuilds the full depth volume from every per-plane raw
+        # file. ORCA only.
+        self.start_plane = max(0, int(start_plane))
         self._is_running = True
         self._resume_requested = False  # set by resume() to continue a paused run
+        self._dcam = None  # open ORCA handle (kept on self so recovery can reopen it)
 
     def _prepare_output_dir(self):
         """Create a per-acquisition subfolder named after the filename base.
@@ -115,19 +123,27 @@ class AutomatedZStackWorker(QThread):
 
         # Per-plane sectioned images, accumulated into depth volumes.
         std_volume, avg_volume, event_volume, z_positions = [], [], [], []
-        dcam = None
+        self._dcam = None
 
         try:
             if self.camera == "orca":
-                dcam = self._open_orca()
+                self._dcam = self._open_orca()
 
-            # Move to the start of the stack.
-            self.status_update.emit(f"Moving to start position {init_pos:.4f} µm...")
-            self.pidevice.MOV(self.axis, init_pos)
+            # Move to the first plane this run will capture. For a fresh run that is
+            # the bottom of the stack; for a resume it is the first missing plane, so
+            # the stage goes straight there instead of travelling via plane 0.
+            first_pos = init_pos + (self.start_plane * step_size)
+            if self.start_plane > 0:
+                self.status_update.emit(
+                    f"Resuming at plane {self.start_plane + 1}/{steps} "
+                    f"— moving to {first_pos:.4f} µm...")
+            else:
+                self.status_update.emit(f"Moving to start position {first_pos:.4f} µm...")
+            self.pidevice.MOV(self.axis, first_pos)
             pitools.waitontarget(self.pidevice, axes=self.axis)
             self._emit_position()
 
-            for step in range(steps):
+            for step in range(self.start_plane, steps):
                 if not self._is_running:
                     break
 
@@ -140,35 +156,33 @@ class AutomatedZStackWorker(QThread):
 
                 z_now = float(self.pidevice.qPOS(self.axis)[self.axis])
 
-                if self.camera == "orca":
-                    result = self._capture_plane_orca(dcam, step)
-                    if result is not None:
+                # Both cameras go through the same recover-and-pause wrapper, so a
+                # transient fault on either retries the plane and, if needed, pauses
+                # the run for a manual Resume instead of aborting.
+                result = self._capture_plane(step)
+                if result is not None:
+                    if self.camera == "orca":
                         avg_img, std_img = result
                         avg_volume.append(avg_img)
                         std_volume.append(std_img)
                         z_positions.append(z_now)
                         self.image_ready.emit(normalize_to_8bit(std_img))
                         self.z_profile_update.emit(float(np.sum(std_img)), step)
-                else:
-                    event_img = self._capture_plane_event(step)
-                    if event_img is not None:
+                    else:
+                        event_img = result
                         event_volume.append(event_img)
                         z_positions.append(z_now)
                         self.image_ready.emit(normalize_to_8bit(event_img))
                         self.z_profile_update.emit(float(np.sum(event_img)), step)
 
-            if dcam is not None:
-                try:
-                    dcam.dev_close()
-                finally:
-                    Dcamapi.uninit()
+            self._close_orca()
 
             # Recenter the objective on the focus: the scan loop otherwise leaves
             # it parked at the last (top-most) plane, but the user expects it back
             # at the centre of the stack whether the run completed or was stopped.
             self._return_to_focus()
 
-            saved_msg = self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
+            saved_msg = self._finalize_outputs(std_volume, avg_volume, event_volume, z_positions)
             if self._is_running:
                 self.status_update.emit(f"Automated Z-Stack Complete.{saved_msg}")
             else:
@@ -178,19 +192,14 @@ class AutomatedZStackWorker(QThread):
         except Exception as e:
             # Try to preserve whatever planes were captured before failing.
             try:
-                self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
+                self._finalize_outputs(std_volume, avg_volume, event_volume, z_positions)
             except Exception:
                 pass
             self.error_signal.emit(f"Z-Stack Orchestrator Error: {str(e)}")
-            if self.camera == "event":
-                self._notify_evk4(
-                    "event-camera acquisition error",
-                    f"Your DSI event-camera acquisition stopped with an error: {e}.")
-            if dcam is not None:
-                try:
-                    Dcamapi.uninit()
-                except Exception:
-                    pass
+            self._notify(
+                f"{self._camera_label()} acquisition error",
+                f"Your DSI {self._camera_label()} acquisition stopped with an error: {e}.")
+            self._close_orca()
             # Still try to bring the objective back to focus after a failure.
             self._return_to_focus()
 
@@ -205,14 +214,47 @@ class AutomatedZStackWorker(QThread):
         dcam.prop_setvalue(DCAM_EXPOSURE_PROP, self.orca_params["orca_exposure"] / 1000.0)
         return dcam
 
-    def _capture_plane_orca(self, dcam, step):
-        """Acquire a frame stack at the current plane; return (avg, std) images.
+    def _close_orca(self):
+        """Close the DCAM device + uninit the API. Safe to call repeatedly / when
+        the camera was never opened (a no-op for the event camera)."""
+        if self._dcam is not None:
+            try:
+                self._dcam.dev_close()
+            except Exception:
+                pass
+            self._dcam = None
+            try:
+                Dcamapi.uninit()
+            except Exception:
+                pass
+
+    def _recover_orca(self):
+        """Close and reopen the DCAM device so a transient camera fault can clear.
+
+        Never raises: if the reopen fails the handle is left as ``None`` and the
+        next capture attempt fails cleanly, so the retry/pause loop keeps control.
+        """
+        self._close_orca()
+        import gc
+        gc.collect()
+        try:
+            self._dcam = self._open_orca()
+        except Exception as e:
+            self._dcam = None
+            self.status_update.emit(f"ORCA reopen failed: {e}")
+
+    def _capture_plane_orca_once(self, step):
+        """Acquire one frame stack at the current plane; return (avg, std) images.
 
         When raw saving is enabled, this plane's raw frames are written to their
         own multi-page TIFF (``<filename>_raw_stack_zNNN.tif``) — one file per
         plane, so the downstream MATLAB algorithms can consume the planes
-        individually rather than as one combined volume.
+        individually rather than as one combined volume. Raises on any DCAM fault
+        so the recover-and-pause wrapper (``_capture_plane``) can retry the plane.
         """
+        dcam = self._dcam
+        if dcam is None:
+            raise RuntimeError("ORCA device is not open")
         num_frames = self.orca_params["orca_frames"]
         roi = self.orca_params["orca_roi"]
 
@@ -251,44 +293,69 @@ class AutomatedZStackWorker(QThread):
             save_raw_stack_tiff(raw_stack, raw_dir, filename, roi, plane=step)
         return compute_dsi_images(raw_stack, roi)
 
-    # ----------------------------------------------------------------- EVENT
-    def _capture_plane_event(self, step):
-        """Capture one plane with the EVK4, surviving a communication drop.
+    # -------------------------------------------------- capture with recovery
+    def _camera_label(self):
+        """Human-readable name of the active camera for status / notifications."""
+        return "ORCA camera" if self.camera == "orca" else "event camera"
 
-        A brief glitch is absorbed automatically: the device is released and the
+    def _capture_plane_once(self, step):
+        """Single capture attempt for the active camera; raises on any fault."""
+        if self.camera == "orca":
+            return self._capture_plane_orca_once(step)
+        return self._capture_plane_event_once(step)
+
+    def _recover_device(self):
+        """Best-effort recovery of the active camera between retry attempts.
+
+        ORCA closes and reopens its DCAM handle; the event camera reopens per
+        attempt inside ``_capture_plane_event_once``, so here it just drops the
+        dropped device's refs so the USB link can be reacquired.
+        """
+        if self.camera == "orca":
+            self._recover_orca()
+        else:
+            import gc
+            gc.collect()
+
+    def _capture_plane(self, step):
+        """Capture one plane for either camera, surviving a transient fault.
+
+        A brief glitch is absorbed automatically: the device is recovered and the
         same plane retried up to ``EVK4_MAX_RECONNECT_ATTEMPTS`` times. If it still
-        can't reconnect, the acquisition does **not** fail — it *pauses*: it emails
-        the user, emits ``awaiting_reconnect(True)`` so the UI shows a Resume
-        button, and waits (for minutes or hours, no time limit) until the user
-        replugs the USB and clicks Resume — or Stops. Because the worker stays
-        alive, every plane already captured is kept and the stack continues from
-        this exact plane. Returns None only if the user aborts.
+        fails, the acquisition does **not** abort — it *pauses*: it emails the user,
+        emits ``awaiting_reconnect(True)`` so the UI shows a Resume button, and waits
+        (no time limit) until the user fixes the camera and clicks Resume — or Stops.
+        Because the worker stays alive, every plane already captured is kept and the
+        stack continues from this exact plane. Returns None only if the user aborts.
+
+        The return value is the active camera's plane result: an ``(avg, std)`` tuple
+        for the ORCA or an event image for the EVK4.
         """
         attempts = max(1, EVK4_MAX_RECONNECT_ATTEMPTS)
+        cam = self._camera_label()
         troubled = False
         while self._is_running:
             last_err = None
             for attempt in range(1, attempts + 1):
                 try:
-                    img = self._capture_plane_event_once(step)
-                    if troubled:  # recovered from a comms drop
-                        msg = (f"Event camera reconnected — resumed at plane "
-                               f"{step + 1}/{self.motor_params['steps']}.")
-                        self.status_update.emit(msg)
-                        self._notify_evk4(
-                            "event camera reconnected",
-                            f"Your DSI acquisition reconnected to the event camera and "
-                            f"resumed at plane {step + 1}.")
-                    return img
+                    result = self._capture_plane_once(step)
+                    if troubled:  # recovered from a fault
+                        self.status_update.emit(
+                            f"{cam} recovered — resumed at plane "
+                            f"{step + 1}/{self.motor_params['steps']}.")
+                        self._notify(
+                            f"{cam} recovered",
+                            f"Your DSI acquisition recovered the {cam} and resumed at "
+                            f"plane {step + 1}.")
+                    return result
                 except Exception as e:
                     if not self._is_running:
                         return None
                     troubled = True
                     last_err = e
-                    import gc
-                    gc.collect()  # drop the dropped device's refs so the USB link can reopen
+                    self._recover_device()
                     self.status_update.emit(
-                        f"Event camera communication error at plane {step + 1} "
+                        f"{cam} error at plane {step + 1} "
                         f"(attempt {attempt}/{attempts}): {e}")
                     if attempt < attempts:
                         self._sleep_interruptible(EVK4_RECONNECT_DELAY_S)
@@ -297,19 +364,20 @@ class AutomatedZStackWorker(QThread):
         return None  # user aborted while retrying / waiting
 
     def _await_manual_resume(self, step, err):
-        """Pause until the user replugs the camera and clicks Resume (or Stops).
+        """Pause until the user fixes the camera and clicks Resume (or Stops).
 
         The worker — and every plane captured so far — stays alive, so the run
         continues from this plane whenever the user is ready. There is no timeout."""
+        cam = self._camera_label()
         self._resume_requested = False
         self.awaiting_reconnect.emit(True)
         self.status_update.emit(
-            f"Event camera lost at plane {step + 1}. Replug the USB, then click "
+            f"{cam} lost at plane {step + 1}. Restore the camera, then click "
             f"'Resume Acquisition' (or Stop to abort).")
-        self._notify_evk4(
-            "acquisition paused — event camera lost",
-            f"Your DSI acquisition paused at plane {step + 1} because the event camera "
-            f"disconnected; replug the USB and click Resume to continue.")
+        self._notify(
+            f"acquisition paused — {cam} lost",
+            f"Your DSI acquisition paused at plane {step + 1} because the {cam} "
+            f"stopped responding; restore the camera and click Resume to continue.")
         while self._is_running and not self._resume_requested:
             time.sleep(0.2)
         self.awaiting_reconnect.emit(False)
@@ -320,6 +388,7 @@ class AutomatedZStackWorker(QThread):
         """Request that a paused (awaiting-reconnect) acquisition continue."""
         self._resume_requested = True
 
+    # ----------------------------------------------------------------- EVENT
     def _capture_plane_event_once(self, step):
         """Single capture attempt: (re)initialise the EVK4, record for the fixed
         duration, reconstruct the event image, and save this plane's raw stream.
@@ -409,6 +478,14 @@ class AutomatedZStackWorker(QThread):
             reader = EventsIterator(input_path=raw_path, delta_t=1000000)
             event_img = accumulate_event_frame(reader, width, height)
 
+            # Also save this plane's decoded event stream (x, y, p, t) next to its
+            # .raw, mirroring the single-Z acquire — an explicit per-event list for
+            # downstream analysis.
+            save_event_stream(
+                EventsIterator(input_path=raw_path, delta_t=1000000),
+                raw_dir, f"{filename}_events_z{step:03d}",
+            )
+
         event_img = crop_to_roi(event_img, roi)  # match the live crop framing
 
         if p.get("filter_crazy_pixels", True):
@@ -423,7 +500,7 @@ class AutomatedZStackWorker(QThread):
         while time.time() < end and self._is_running:
             time.sleep(0.1)
 
-    def _notify_evk4(self, subject, body):
+    def _notify(self, subject, body):
         """Best-effort email notification (a no-op unless SMTP is configured)."""
         try:
             from hardware.notifier import send_email
@@ -432,6 +509,144 @@ class AutomatedZStackWorker(QThread):
             pass
 
     # ----------------------------------------------------------------- save
+    def _finalize_outputs(self, std_volume, avg_volume, event_volume, z_positions):
+        """Write the run's summary products.
+
+        A *resumed* run holds only its freshly captured tail planes in memory, so
+        the complete depth volume + axial profiles are rebuilt from every per-plane
+        raw file on disk (the earlier run's planes plus this run's) — ORCA raw
+        stacks or EVK4 raw event streams. Any other run saves the volumes it
+        accumulated in memory.
+        """
+        if self.start_plane > 0:
+            if self.camera == "orca":
+                return self._rebuild_orca_outputs()
+            return self._rebuild_event_outputs()
+        return self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
+
+    def _rebuild_orca_outputs(self):
+        """Reassemble the full DSI/average depth volumes + axial profiles from the
+        per-plane raw stacks on disk, after a resumed ORCA run.
+
+        Nominal plane positions come from the scan geometry (the closed-loop stage
+        reproduces them to sub-nm, so they match the earlier run's planes). A
+        rebuild failure is reported but never masks the run's outcome: the raw
+        files stay on disk, so ``tools/rebuild_orca_zstack.py`` can redo it offline.
+        """
+        out_dir = self.save_params.get("output_dir", "")
+        raw_dir = self.save_params.get("raw_dir") or out_dir
+        filename = self.save_params.get("filename", "zstack")
+        if not out_dir:
+            return ""
+
+        focus = self.motor_params["focus"]
+        step_size = self.motor_params["step_size"]
+        steps = self.motor_params["steps"]
+        init_pos = focus - (step_size * steps / 2)
+        z_positions = [init_pos + k * step_size for k in range(steps)]
+
+        self.status_update.emit("Rebuilding full depth volume from per-plane raw files...")
+        try:
+            n, missing = rebuild_zstack_from_raw(
+                raw_dir, out_dir, filename, z_positions,
+                expected_frames=self.orca_params.get("orca_frames"),
+                save_average=True,
+                metadata=self.save_params.get("metadata"),
+                status=self.status_update.emit,
+            )
+        except Exception as e:
+            self.status_update.emit(f"Could not rebuild depth volume from raw files: {e}")
+            return ""
+
+        msg = f" Rebuilt {n} planes into the depth volume."
+        if missing:
+            msg += f" Still missing {len(missing)} plane(s): {missing}."
+        return msg
+
+    def _reconstruct_event_plane(self, raw_path, roi):
+        """Reconstruct one plane's event image from its saved raw stream.
+
+        Mirrors the reconstruction path in ``_capture_plane_event_once``: the raw
+        ``.raw`` is the authoritative record, accumulated into a 2D count image at
+        full sensor size, then cropped to the ROI and (optionally) cleaned — so a
+        rebuilt plane is identical to the one the live run would have produced.
+        """
+        reader = EventsIterator(input_path=raw_path, delta_t=1000000)
+        try:
+            width, height = reader.get_size()
+        except Exception:
+            width, height = EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT
+        event_img = accumulate_event_frame(reader, width, height)
+        event_img = crop_to_roi(event_img, roi)
+        if self.evk4_params.get("filter_crazy_pixels", True):
+            event_img = filter_crazy_pixels(event_img)
+        if self.evk4_params.get("apply_smoothing", True):
+            event_img = apply_smoothing(event_img)
+        return event_img
+
+    def _rebuild_event_outputs(self):
+        """Reassemble the event depth volume + axial profile from the per-plane raw
+        event streams on disk, after a resumed EVK4 run.
+
+        The event counterpart of :meth:`_rebuild_orca_outputs`: it reads every
+        ``<name>_events_zNNN.raw`` present (the earlier run's planes plus this run's)
+        and reconstructs each plane's event image. Nominal plane positions come from
+        the scan geometry. A rebuild failure is reported but never masks the run's
+        outcome — the raw streams stay on disk for ``tools/rebuild_evk4_zstack.py``.
+        """
+        out_dir = self.save_params.get("output_dir", "")
+        raw_dir = self.save_params.get("raw_dir") or out_dir
+        filename = self.save_params.get("filename", "zstack")
+        if not out_dir:
+            return ""
+
+        focus = self.motor_params["focus"]
+        step_size = self.motor_params["step_size"]
+        steps = self.motor_params["steps"]
+        init_pos = focus - (step_size * steps / 2)
+        roi = self.evk4_params.get("evk4_roi")
+
+        self.status_update.emit("Rebuilding event depth volume from per-plane raw streams...")
+        event_volume, z_kept, missing = [], [], []
+        for k in range(steps):
+            raw_path = os.path.join(raw_dir, f"{filename}_events_z{k:03d}.raw")
+            if not os.path.exists(raw_path):
+                missing.append(k)
+                continue
+            try:
+                event_volume.append(self._reconstruct_event_plane(raw_path, roi))
+            except Exception as e:
+                self.status_update.emit(f"Plane {k + 1}: could not reconstruct ({e})")
+                missing.append(k)
+                continue
+            z_kept.append(init_pos + k * step_size)
+            self.status_update.emit(
+                f"Rebuilt event plane {k + 1}/{steps} ({len(event_volume)} present)...")
+
+        if not event_volume:
+            self.status_update.emit("No event raw streams found to rebuild.")
+            return ""
+
+        save_volume_tiff(np.array(event_volume, dtype=np.float32), out_dir, filename, "zstack_event")
+        intensities = [float(np.mean(img)) for img in event_volume]
+        save_axial_sectioning_plot(z_kept, intensities, out_dir, filename, "event")
+
+        metadata = self.save_params.get("metadata")
+        if metadata:
+            meta = dict(metadata)
+            meta["Z-Stack planes"] = {
+                "camera": "event",
+                "num_planes_saved": len(event_volume),
+                "missing_planes": ", ".join(str(m) for m in missing) or "none",
+                "z_positions": ", ".join(f"{z:.4f}" for z in z_kept),
+            }
+            save_parameter_log(out_dir, filename, meta)
+
+        msg = f" Rebuilt {len(event_volume)} planes into the event volume."
+        if missing:
+            msg += f" Still missing {len(missing)} plane(s): {missing}."
+        return msg
+
     def _save_outputs(self, std_volume, avg_volume, event_volume, z_positions):
         """Save the depth volume(s) (3D TIFF) and the parameter log. Returns a
         short message for the status bar (empty if nothing was saved)."""
