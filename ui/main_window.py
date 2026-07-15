@@ -25,16 +25,18 @@ from PyQt6.QtWidgets import (
 
 from config import (
     ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
-    EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH,
+    EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE, FOV_MATCH_PATH,
     ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
     SESSION_STATE_PATH,
 )
+from core import compose_registration_overlay, map_evk4_window_to_orca
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
+from ui.fov_registration import FovRegistrationWorker
 from ui.orchestrator import AutomatedZStackWorker
 from ui.widgets import (
-    AWGWidget, Evk4ParamsWidget, Evk4QueueWidget, OrcaParamsWidget, PIStageWidget,
-    VideoFeedLabel,
+    AWGWidget, Evk4ParamsWidget, Evk4QueueWidget, FovMatchPreviewDialog,
+    OrcaParamsWidget, PIStageWidget, VideoFeedLabel,
 )
 
 
@@ -52,6 +54,12 @@ class MainWindow(QMainWindow):
         self._queue_index = 0
         self._queue_active = False
         self._zstack_camera = None  # "orca"/"event" while a Z-stack runs, else None
+        # EVK4->ORCA FOV matching: the affine currently in force (the last
+        # measured/confirmed one if available, else the built-in calibration)
+        # and the live-measurement worker.
+        self._fov_worker = None
+        saved_fov = self._load_fov_match()
+        self._fov_affine = (saved_fov or {}).get("affine") or EVK4_TO_ORCA_AFFINE
         # Snapshot of the ORCA settings currently applied to the live feed, so a
         # real-time crop change re-applies only the ROI (other edits wait for Apply).
         self._orca_live_params = None
@@ -74,6 +82,17 @@ class MainWindow(QMainWindow):
         self._acq_start = None      # time.time() when the acquisition started
         self._acq_label = None      # QLabel to update with the elapsed time
         self._acq_restore = None    # callable that restores the estimate text
+
+        # Whole-batch elapsed readout: while the queue runs, its status line also
+        # ticks total elapsed + rough remaining time for the entire batch (the
+        # per-item elapsed above resets each acquisition; this one does not).
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(1000)
+        self._queue_timer.timeout.connect(self._tick_queue_elapsed)
+        self._queue_start = None            # time.time() when the batch started
+        self._queue_total_lo = 0.0          # typical whole-batch estimate (remaining calc)
+        self._queue_total_hi = 0.0          # slow whole-batch estimate (remaining calc)
+        self._queue_status_base = ""        # "Running k / N: filename" without the clock
 
         # Acquisition-time learning: each completed run's actual elapsed time is
         # recorded and used to calibrate future estimates (per acquisition type).
@@ -305,6 +324,38 @@ class MainWindow(QMainWindow):
             sig.connect(self._update_orca_time)
         layout.addWidget(self.orca_params)
 
+        # 2b. FOV matching — crop the ORCA to the (rotated) EVK4 footprint, using
+        #     the calibrated EVK4->ORCA registration (2026-07-10 linearity analysis).
+        fov_group = QGroupBox("Match View to Event Camera")
+        fov_layout = QVBoxLayout()
+        self.btn_fov_match = QPushButton("⌖  Match ORCA Crop to EVK4 Field…")
+        self.btn_fov_match.setToolTip(
+            "Compute the ORCA crop that covers the event camera's current field of "
+            "view (via the stored EVK4→ORCA registration), preview it for "
+            "confirmation, then apply it to the ROI controls above."
+        )
+        self.btn_fov_match.clicked.connect(self._match_orca_crop_to_evk4)
+        fov_layout.addWidget(self.btn_fov_match)
+        self.btn_fov_measure = QPushButton("📐  Measure && Match (Capture Both Cameras)…")
+        self.btn_fov_measure.setToolTip(
+            "Re-measure the EVK4→ORCA registration live: captures a short "
+            "full-sensor reference from each camera and registers the images — "
+            "use this when a camera has been moved or rotated since the stored "
+            "calibration. Needs a structured sample (e.g. beads) in view and the "
+            "speckle modulation (AWG) running so the event camera fires; a small "
+            "focus difference between the ports is fine. Takes ~1 minute; the "
+            "result is previewed as a green (ORCA) / magenta (EVK4) overlay for "
+            "confirmation before anything is applied."
+        )
+        self.btn_fov_measure.clicked.connect(self._measure_fov_registration)
+        fov_layout.addWidget(self.btn_fov_measure)
+        self.btn_fov_last = QPushButton("⟲  Use Last Matching Crop")
+        self.btn_fov_last.clicked.connect(self._use_saved_fov_crop)
+        fov_layout.addWidget(self.btn_fov_last)
+        self._refresh_fov_last_button()
+        fov_group.setLayout(fov_layout)
+        layout.addWidget(fov_group)
+
         # 3. Automated Z-stack acquisition.
         acq_group = QGroupBox("Automated 3D Z-Stack (ORCA DSI)")
         acq_layout = QVBoxLayout()
@@ -450,31 +501,53 @@ class MainWindow(QMainWindow):
     # ==========================
     # Acquisition time estimates
     # ==========================
-    def _calibrate(self, predicted_s, acq_type):
-        """Scale a cold-start physics estimate by what past runs of this type
-        actually took. Returns ``(adjusted_s, n_runs)``.
+    def _calibrate_range(self, predicted_s, acq_type):
+        """Turn a cold-start physics estimate into a **(typical, slow) range**.
 
-        The correction is the **median** of the recorded ``actual_s / predicted_s``
-        ratios (robust to the odd outlier). With no history it returns the estimate
-        unchanged, so the model degrades gracefully on a fresh machine and sharpens
-        as runs accumulate.
+        The per-plane cost is dominated by event-count-dependent reconstruction
+        (decode + accumulate + xytp save), which varies 2–3× with the biases /
+        event rate, so a single number is misleading. From past runs of this type
+        we take the ratio ``actual_s / predicted_s`` and scale the estimate by its
+        **50th percentile** (typical) and **90th percentile** (a slow run).
+
+        Records whose actual time is implausibly short — an aborted/stopped run
+        can't take less than half the cold-start floor — are dropped so they can't
+        drag the calibration down. With no history both bounds equal the raw
+        estimate. Returns ``(low_s, high_s, n_runs)``.
         """
-        records = self._acq_history.get(acq_type, [])
-        ratios = sorted(
+        ratios = [
             r["actual_s"] / r["predicted_s"]
-            for r in records
-            if r.get("predicted_s", 0) > 0 and r.get("actual_s", 0) > 0
-        )
+            for r in self._acq_history.get(acq_type, [])
+            if r.get("predicted_s", 0) > 0 and r.get("actual_s", 0) >= 0.5 * r["predicted_s"]
+        ]
         if not ratios:
-            return predicted_s, 0
-        mid = len(ratios) // 2
-        factor = ratios[mid] if len(ratios) % 2 else 0.5 * (ratios[mid - 1] + ratios[mid])
-        return predicted_s * factor, len(ratios)
+            return predicted_s, predicted_s, 0
+        lo, hi = np.percentile(ratios, [50, 90])
+        return predicted_s * float(lo), predicted_s * float(hi), len(ratios)
+
+    def _fmt_range(self, lo, hi):
+        """Format a (typical, slow) duration range, collapsing to a single value
+        when the spread is negligible (e.g. no history yet)."""
+        if hi - lo < max(2.0, 0.08 * lo):
+            return f"≈ {self._fmt_dur(0.5 * (lo + hi))}"
+        return f"≈ {self._fmt_dur(lo)} – {self._fmt_dur(hi)}"
+
+    def _fmt_remaining(self, lo, hi):
+        """Remaining-time suffix for a running batch, from the typical/slow totals
+        minus elapsed. Empty once even the slow estimate is spent; an 'up to'
+        form while only the typical estimate has been passed."""
+        if hi <= 0:
+            return ""
+        if lo <= 0:
+            return f",  ≈ up to {self._fmt_dur(hi)} left"
+        if hi - lo < max(2.0, 0.08 * lo):
+            return f",  ≈ {self._fmt_dur(0.5 * (lo + hi))} left"
+        return f",  ≈ {self._fmt_dur(lo)} – {self._fmt_dur(hi)} left"
 
     @staticmethod
     def _calib_note(runs):
         """Suffix noting how many runs the estimate was calibrated from."""
-        return f"  · calibrated from {runs} run{'s' if runs != 1 else ''}" if runs else ""
+        return f"  · from {runs} run{'s' if runs != 1 else ''}" if runs else ""
 
     @staticmethod
     def _fmt_dur(seconds):
@@ -510,46 +583,43 @@ class MainWindow(QMainWindow):
         if self._acq_label is self.lbl_orca_time:
             return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
-        total_s, runs = self._calibrate(self._orca_zstack_predicted_s(), "orca_zstack")
-        plane_s = total_s / max(1, steps)
+        lo, hi, runs = self._calibrate_range(self._orca_zstack_predicted_s(), "orca_zstack")
         self.lbl_orca_time.setText(
-            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
-            f"{self._calib_note(runs)}"
+            f"Estimated: {self._fmt_range(lo, hi)}  ({steps} planes){self._calib_note(runs)}"
         )
 
     def _update_evk4_time(self):
         if self._acq_label is self.lbl_evk4_time:
             return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
-        total_s, runs = self._calibrate(self._evk4_zstack_predicted_s(), "evk4_zstack")
-        plane_s = total_s / max(1, steps)
+        lo, hi, runs = self._calibrate_range(self._evk4_zstack_predicted_s(), "evk4_zstack")
         self.lbl_evk4_time.setText(
-            f"Estimated: ≈ {self._fmt_dur(total_s)}  ({steps} planes × ≈ {plane_s:.1f} s/plane)"
-            f"{self._calib_note(runs)}"
+            f"Estimated: {self._fmt_range(lo, hi)}  ({steps} planes){self._calib_note(runs)}"
         )
 
     def _evk4_queue_total_predicted_s(self):
-        """Total predicted time for the whole batch queue, summed over every row and
-        repeat. Each acquisition uses its row's duration and the shared step count;
-        the same EVK4 model + calibration as a single Z-stack is applied."""
+        """(typical, slow) predicted time for the whole batch queue, summed over
+        every row and repeat. Each acquisition uses its row's duration and the
+        shared step count; the same EVK4 model + calibration range as a single
+        Z-stack is applied. Returns ``(low_s, high_s, n_acq, n_runs)``."""
         steps = self.pi_stage_widget.spin_steps.value()
         total_raw, n_acq = 0.0, 0
         for r in self.evk4_queue.rows():
             total_raw += r["repeats"] * steps * (EVK4_PLANE_OVERHEAD_S + r["acqu_time"])
             n_acq += r["repeats"]
-        total_s, runs = self._calibrate(total_raw, "evk4_zstack")  # calibration is linear
-        return total_s, n_acq, runs
+        lo, hi, runs = self._calibrate_range(total_raw, "evk4_zstack")  # calibration is linear
+        return lo, hi, n_acq, runs
 
     def _update_queue_estimate(self):
         """Refresh the batch-queue total-time label (rows or step count changed)."""
         if getattr(self, "evk4_queue", None) is None:
             return
-        total_s, n_acq, runs = self._evk4_queue_total_predicted_s()
+        lo, hi, n_acq, runs = self._evk4_queue_total_predicted_s()
         if n_acq == 0:
             self.evk4_queue.set_estimate("")
             return
         self.evk4_queue.set_estimate(
-            f"Estimated total: ≈ {self._fmt_dur(total_s)}  "
+            f"Estimated total: {self._fmt_range(lo, hi)}  "
             f"({n_acq} acquisition{'s' if n_acq != 1 else ''}){self._calib_note(runs)}"
         )
 
@@ -689,7 +759,8 @@ class MainWindow(QMainWindow):
         # Persist the current parameters so the next launch restores them.
         self._save_session()
 
-        for worker in (self.orca_worker, self.evk4_worker, self.zstack_worker):
+        for worker in (self.orca_worker, self.evk4_worker, self.zstack_worker,
+                       self._fov_worker):
             if worker is not None and worker.isRunning():
                 worker.stop()
                 worker.wait(2000)
@@ -955,13 +1026,22 @@ class MainWindow(QMainWindow):
         evk4_live = self._evk4_live_running()
         zstack = self.zstack_worker is not None and self.zstack_worker.isRunning()
         zcam = self._zstack_camera if zstack else None
-        # A running batch queue blocks new manual runs just like a live Z-stack.
-        busy = zstack or self._queue_active
+        # A running batch queue or FOV measurement blocks new manual runs just
+        # like a live Z-stack (the FOV measurement owns both cameras).
+        fov_measuring = self._fov_worker is not None and self._fov_worker.isRunning()
+        busy = zstack or self._queue_active or fov_measuring
 
         self.btn_orca_live.setEnabled(not orca_live and not busy)
         self.btn_evk4_live.setEnabled(not evk4_live and not busy)
         self.btn_orca_zstack.setEnabled(not busy)
         self.btn_evk4_zstack.setEnabled(not busy)
+        if hasattr(self, "btn_fov_match"):
+            self.btn_fov_match.setEnabled(not busy)
+            self.btn_fov_measure.setEnabled(not busy)
+            if busy:
+                self.btn_fov_last.setEnabled(False)
+            else:
+                self._refresh_fov_last_button()
         self.btn_orca_stop.setEnabled(orca_live or (zstack and zcam == "orca"))
         self.btn_evk4_stop.setEnabled(evk4_live or (zstack and zcam == "event") or self._queue_active)
         # Outside a queue, disable 'Run Queue' while any manual Z-stack runs.
@@ -1369,6 +1449,266 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(800, self._run_next_queue_item)
 
     # ==========================
+    # FOV matching — crop the ORCA to the EVK4 field
+    # ==========================
+    def _match_orca_crop_to_evk4(self):
+        """Compute the ORCA crop covering the EVK4's current field of view, show
+        the validation preview, and (only) on confirmation apply + persist it.
+
+        Uses the EVK4->ORCA affine currently in force (``self._fov_affine``: the
+        last measured/confirmed registration, else the built-in 2026-07-10
+        calibration). The EVK4 window is whatever the EVK4 tab's ROI controls
+        currently select (full sensor by default). If the cameras may have been
+        physically moved since the affine was measured, use *Measure & Match*
+        instead — it re-measures the registration from live images.
+        """
+        evk4_roi = self.evk4_params.get_params()["evk4_roi"]
+        try:
+            crop, corners, clipped = map_evk4_window_to_orca(
+                self._fov_affine, evk4_roi,
+                orca_sensor=(ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT))
+        except ValueError as e:
+            QMessageBox.warning(self, "FOV matching failed", str(e))
+            return
+
+        binning = self.orca_params.combo_binning.currentText()
+        dlg = FovMatchPreviewDialog(
+            crop, corners, evk4_roi,
+            sensor=(ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT),
+            background=self._compose_orca_sensor_canvas(),
+            clipped=clipped,
+            warn_binning=None if binning.replace(" ", "") == "1x1" else binning,
+            parent=self,
+        )
+        if not dlg.exec():
+            self.lbl_status.setText("FOV matching cancelled — ORCA crop unchanged.")
+            return
+
+        self.orca_params.set_roi_window(crop)
+        self._save_fov_match(crop, evk4_roi, corners)
+        w = crop["x_max"] - crop["x_min"]
+        h = crop["y_max"] - crop["y_min"]
+        self.lbl_status.setText(
+            f"ORCA crop matched to the EVK4 field: {w} × {h} px at "
+            f"({crop['x_min']}, {crop['y_min']}). Saved as the last matching crop.")
+
+    def _measure_fov_registration(self):
+        """Re-measure the EVK4->ORCA registration from live images (both cameras).
+
+        For when the cameras have been physically moved/rotated since the stored
+        affine was measured. Frees both cameras, captures a short full-sensor
+        reference from each in a worker thread, registers them (seeded by the
+        current affine; widens automatically if the seeded match is weak), and
+        hands the result to the same preview-confirm flow.
+        """
+        if not DCAM_AVAILABLE or not METAVISION_AVAILABLE:
+            QMessageBox.warning(self, "Cameras unavailable",
+                "FOV measurement needs both cameras: the DCAM API and the "
+                "Metavision SDK must both be available.")
+            return
+        if ((self.zstack_worker is not None and self.zstack_worker.isRunning())
+                or self._queue_active):
+            self.lbl_status.setText(
+                "An acquisition is running — stop it before measuring the FOV.")
+            return
+        if self._fov_worker is not None and self._fov_worker.isRunning():
+            return
+
+        # Free both cameras (the measurement opens each exclusively).
+        if self._stop_worker_silently(self.orca_worker, self.on_orca_live_finished):
+            self._reset_orca_live_apply()
+        if self._stop_worker_silently(self.evk4_worker, self.on_evk4_live_finished):
+            self._reset_evk4_apply()
+
+        p = self.evk4_params.get_params()
+        self._fov_worker = FovRegistrationWorker(
+            orca_exposure_ms=self.orca_params.get_params()["orca_exposure"],
+            evk4_biases={k: p[k] for k in ("bias_fo", "bias_hpf", "bias_on", "bias_off")},
+            evk4_duration_s=min(5.0, max(2.0, p["acqu_time"])),
+            seed_affine=self._fov_affine,
+        )
+        self._fov_worker.status_update.connect(self.lbl_status.setText)
+        self._fov_worker.finished_ok.connect(self._on_fov_measured)
+        self._fov_worker.error_signal.connect(self._on_fov_measure_error)
+        self._fov_worker.finished.connect(self._refresh_buttons)
+        self._fov_worker.start()
+        self._refresh_buttons()
+
+    def _on_fov_measured(self, result):
+        """Preview a freshly measured registration; on confirmation adopt the new
+        affine, apply the matching crop, and persist both."""
+        affine, score, params = result["affine"], result["score"], result["params"]
+        evk4_roi = self.evk4_params.get_params()["evk4_roi"]
+        try:
+            crop, corners, clipped = map_evk4_window_to_orca(
+                affine, evk4_roi,
+                orca_sensor=(ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT))
+        except ValueError as e:
+            QMessageBox.warning(self, "FOV measurement failed", str(e))
+            return
+
+        extra = [
+            f"<b>Measured registration:</b> θ = {params['theta']:.1f}°, "
+            f"scale = {params['scale']:.3f}, NCC = {score:.2f}. Background: "
+            f"green = ORCA, magenta = registered EVK4 (overlap ≈ white).",
+        ]
+        if score < 0.5:
+            extra.append(
+                "<b><font color='#e6b422'>Warning:</font></b> low registration "
+                "confidence (NCC &lt; 0.5). Check that both cameras see the same "
+                "structured sample near focus, then re-measure before trusting "
+                "this crop.")
+        binning = self.orca_params.combo_binning.currentText()
+        dlg = FovMatchPreviewDialog(
+            crop, corners, evk4_roi,
+            sensor=(ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT),
+            background=compose_registration_overlay(
+                result["orca_img"], result["evk4_img"], affine),
+            clipped=clipped,
+            warn_binning=None if binning.replace(" ", "") == "1x1" else binning,
+            extra_lines=extra,
+            parent=self,
+        )
+        if not dlg.exec():
+            self.lbl_status.setText(
+                "Measured registration discarded — affine and crop unchanged.")
+            return
+
+        self._fov_affine = affine  # adopt: future 'Match crop' clicks use it
+        self.orca_params.set_roi_window(crop)
+        self._save_fov_match(crop, evk4_roi, corners,
+                             method="measured", score=score, reg_params=params)
+        w = crop["x_max"] - crop["x_min"]
+        h = crop["y_max"] - crop["y_min"]
+        self.lbl_status.setText(
+            f"Measured registration adopted (NCC {score:.2f}) — ORCA crop "
+            f"{w} × {h} px at ({crop['x_min']}, {crop['y_min']}) applied and saved.")
+
+    def _on_fov_measure_error(self, msg):
+        QMessageBox.warning(self, "FOV measurement failed", msg)
+        self.lbl_status.setText(msg)
+
+    def _compose_orca_sensor_canvas(self):
+        """Full-sensor uint8 canvas with the last ORCA frame pasted at its ROI
+        position (dark elsewhere) as the preview background; None if no frame
+        has been displayed yet (the preview then draws on a plain canvas)."""
+        if self._orca_frame is None:
+            return None
+        frame = np.asarray(self._orca_frame)
+        if frame.ndim == 3:
+            frame = frame.mean(axis=2)
+        if frame.dtype != np.uint8:
+            lo, hi = float(frame.min()), float(frame.max())
+            frame = ((frame - lo) / (hi - lo + 1e-12) * 255).astype(np.uint8)
+        canvas = np.full((ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH), 25, dtype=np.uint8)
+        # The displayed frame is already cropped: place it at the ROI that was
+        # active when it was captured (live params if streaming, else the panel).
+        params = self._orca_live_params or self.orca_params.get_params()
+        roi = params.get("orca_roi") or {}
+        x0, y0 = int(roi.get("x_min", 0)), int(roi.get("y_min", 0))
+        h, w = frame.shape
+        if y0 + h <= ORCA_SENSOR_HEIGHT and x0 + w <= ORCA_SENSOR_WIDTH:
+            canvas[y0:y0 + h, x0:x0 + w] = frame
+        else:  # stale ROI bookkeeping — degrade gracefully, never crash the preview
+            canvas[:min(h, ORCA_SENSOR_HEIGHT), :min(w, ORCA_SENSOR_WIDTH)] = \
+                frame[:ORCA_SENSOR_HEIGHT, :ORCA_SENSOR_WIDTH]
+        return canvas
+
+    def _save_fov_match(self, crop, evk4_roi, corners, method="calibrated",
+                        score=None, reg_params=None):
+        """Persist the confirmed matching crop — and the affine it came from —
+        for reuse across sessions. ``method`` is "calibrated" (stored affine) or
+        "measured" (live registration, with its NCC ``score``)."""
+        data = {
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "orca_crop": crop,
+            "evk4_roi": evk4_roi,
+            "corners": np.asarray(corners).tolist(),
+            "affine": self._fov_affine,
+            "method": method,
+        }
+        if score is not None:
+            data["score"] = round(float(score), 4)
+        if reg_params:
+            data["registration"] = reg_params
+        try:
+            os.makedirs(os.path.dirname(FOV_MATCH_PATH), exist_ok=True)
+            with open(FOV_MATCH_PATH, "w") as f:
+                json.dump(data, f, indent=1)
+        except OSError as e:
+            self.lbl_status.setText(f"Could not save the matching crop: {e}")
+        self._refresh_fov_last_button()
+
+    def _load_fov_match(self):
+        """Load the saved matching crop; None if missing or malformed. A
+        malformed affine is dropped (the crop stays usable) so a bad file can
+        never poison ``self._fov_affine``."""
+        try:
+            with open(FOV_MATCH_PATH) as f:
+                data = json.load(f)
+            crop = data["orca_crop"]
+            for key in ("x_min", "x_max", "y_min", "y_max"):
+                crop[key] = int(crop[key])
+            try:
+                if np.asarray(data.get("affine"), dtype=np.float64).shape != (2, 3):
+                    data.pop("affine", None)
+            except (ValueError, TypeError):
+                data.pop("affine", None)
+            return data
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _refresh_fov_last_button(self):
+        """Enable 'Use Last Matching Crop' only when a saved crop exists, and
+        describe it (geometry + when it was confirmed) in the tooltip."""
+        data = self._load_fov_match()
+        if data is None:
+            self.btn_fov_last.setEnabled(False)
+            self.btn_fov_last.setToolTip(
+                "No matching crop has been confirmed yet — run "
+                "'Match ORCA Crop to EVK4 Field…' first.")
+        else:
+            crop = data["orca_crop"]
+            w = crop["x_max"] - crop["x_min"]
+            h = crop["y_max"] - crop["y_min"]
+            self.btn_fov_last.setEnabled(True)
+            self.btn_fov_last.setToolTip(
+                f"Re-apply the last confirmed matching crop: {w} × {h} px at "
+                f"({crop['x_min']}, {crop['y_min']}), confirmed "
+                f"{data.get('saved_at', 'unknown')}.")
+
+    def _use_saved_fov_crop(self):
+        """Apply the last confirmed matching crop directly (no preview).
+
+        The saved crop is a snapshot of the EVK4 window it was computed from;
+        if the EVK4 crop has been changed since, the match is stale — warn so
+        the user knows to re-run the matching instead.
+        """
+        data = self._load_fov_match()
+        if data is None:
+            QMessageBox.information(self, "No saved crop",
+                "No matching crop has been confirmed yet — run "
+                "'Match ORCA Crop to EVK4 Field…' first.")
+            self._refresh_fov_last_button()
+            return
+        crop = data["orca_crop"]
+        self.orca_params.set_roi_window(crop)
+        w = crop["x_max"] - crop["x_min"]
+        h = crop["y_max"] - crop["y_min"]
+        note = ""
+        try:
+            saved_roi = {k: int(v) for k, v in data["evk4_roi"].items()}
+            if saved_roi != self.evk4_params.get_params()["evk4_roi"]:
+                note = ("  Note: the EVK4 crop has changed since this match was "
+                        "saved — re-run the matching for it to follow.")
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass  # older/partial file: apply without the staleness check
+        self.lbl_status.setText(
+            f"Applied the last matching crop: {w} × {h} px at "
+            f"({crop['x_min']}, {crop['y_min']}) — confirmed "
+            f"{data.get('saved_at', 'unknown')}.{note}")
+
+    # ==========================
     # EVK4 batch queue
     # ==========================
     def _start_evk4_queue(self):
@@ -1407,6 +1747,11 @@ class MainWindow(QMainWindow):
                 })
         self._queue_index = 0
         self._queue_active = True
+        # Snapshot the whole-batch estimate now (the table still holds every row)
+        # so the status line can show elapsed / remaining for the entire batch.
+        self._queue_start = time.time()
+        self._queue_total_lo, self._queue_total_hi, _, _ = self._evk4_queue_total_predicted_s()
+        self._queue_timer.start()
         self.evk4_queue.set_running(True)
         self._refresh_buttons()
         self._run_next_queue_item()
@@ -1430,8 +1775,9 @@ class MainWindow(QMainWindow):
             "acqu_time": item["acqu_time"],
         })
         self.txt_evk4_filename.setText(item["filename"])
-        self.evk4_queue.set_status(
+        self._queue_status_base = (
             f"Running {self._queue_index + 1} / {len(self._queue)}:  {item['filename']}")
+        self._tick_queue_elapsed()  # show the base line immediately with the clock
         self.start_zstack("event")
 
     def _stop_evk4_queue(self):
@@ -1443,9 +1789,28 @@ class MainWindow(QMainWindow):
             self.zstack_worker.stop()
         self._finish_queue(f"Queue stopped at {self._queue_index + 1} / {len(self._queue)}.")
 
+    def _tick_queue_elapsed(self):
+        """Refresh the queue status line with total batch elapsed + rough remaining.
+
+        Complements the per-item 'Elapsed' readout on the EVK4 tab (which resets
+        each acquisition): this one measures the whole batch, from the first
+        acquisition to the last."""
+        if not self._queue_active or self._queue_start is None:
+            return
+        elapsed = time.time() - self._queue_start
+        text = f"{self._queue_status_base}   ·   batch elapsed {self._fmt_dur(elapsed)}"
+        text += self._fmt_remaining(self._queue_total_lo - elapsed,
+                                    self._queue_total_hi - elapsed)
+        self.evk4_queue.set_status(text)
+
     def _finish_queue(self, message):
         self._queue_active = False
         self._queue = []
+        self._queue_timer.stop()
+        # Append the whole-batch elapsed time to the final message before clearing it.
+        if self._queue_start is not None:
+            message += f"  (total {self._fmt_dur(time.time() - self._queue_start)})"
+        self._queue_start = None
         self.evk4_queue.set_running(False)
         self.evk4_queue.set_status(message)
         self.lbl_status.setText(message)
@@ -1459,6 +1824,8 @@ class MainWindow(QMainWindow):
         # Halt the batch queue before the finish handlers run (so it won't advance).
         if self._queue_active:
             self._queue_active = False
+            self._queue_timer.stop()
+            self._queue_start = None
             self.evk4_queue.set_running(False)
             self.evk4_queue.set_status(
                 f"Queue stopped — error at {self._queue_index + 1} / {len(self._queue)}.")

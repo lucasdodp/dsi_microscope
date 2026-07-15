@@ -195,6 +195,48 @@ EVK4_MAX_RECONNECT_ATTEMPTS = int(os.environ.get("DSI_EVK4_RECONNECT_ATTEMPTS", 
 EVK4_RECONNECT_DELAY_S = float(os.environ.get("DSI_EVK4_RECONNECT_DELAY_S", "5"))
 
 # ---------------------------------------------------------------------------
+# EVK4 -> ORCA field-of-view registration (FOV matching)
+# ---------------------------------------------------------------------------
+# Affine map from full-sensor EVK4 pixel coordinates (x, y) to full-sensor,
+# unbinned ORCA pixel coordinates: [orca_x, orca_y] = A @ [evk_x, evk_y, 1].
+# Measured by masked-NCC registration of matched bead z-stacks (2026-07-10
+# linearity analysis, "ports_100" config: ORCA on port 1, EVK4 on port 3,
+# NCC = 0.86). theta = 317 deg and scale = 0.745 are fixed by the optics (the
+# 4.86/6.5 um pixel-pitch ratio, verified to < 0.4 %); only the translation
+# drifts when the optical setup is realigned. To re-calibrate: re-run the
+# registration script on a fresh bead pair and point DSI_FOV_AFFINE_PATH at the
+# resulting registration.json (DSI_FOV_AFFINE_KEY selects the entry, default
+# "ports_100") — no code change needed.
+EVK4_TO_ORCA_AFFINE = [
+    [0.5448585077062823, -0.5080887782465614, 1136.1325152367415],
+    [0.5080887782465614, 0.5448585077062823, 550.1741191479392],
+]
+
+_affine_path = os.environ.get("DSI_FOV_AFFINE_PATH", "")
+if _affine_path and os.path.exists(_affine_path):
+    try:
+        import json as _json
+        with open(_affine_path) as _f:
+            _reg = _json.load(_f)
+        _key = os.environ.get("DSI_FOV_AFFINE_KEY", "ports_100")
+        _entry = _reg.get(_key, _reg) if isinstance(_reg, dict) else {}
+        if "affine" in _entry:
+            EVK4_TO_ORCA_AFFINE = _entry["affine"]
+    except Exception:
+        pass  # fall back to the built-in calibration; never block startup
+
+# Last user-confirmed FOV-matching crop (written by the UI after the preview is
+# accepted), so "Use last matching crop" survives restarts. Stored next to the
+# session state; env-override with DSI_FOV_MATCH_PATH.
+FOV_MATCH_PATH = os.environ.get(
+    "DSI_FOV_MATCH_PATH",
+    os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+        "DSIMicroscope", "fov_match.json",
+    ),
+)
+
+# ---------------------------------------------------------------------------
 # Email notifications (optional, best-effort)
 # ---------------------------------------------------------------------------
 # The app can email when an event-camera acquisition hits a problem (drops out /

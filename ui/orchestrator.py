@@ -20,6 +20,7 @@ TIFF — a single consolidated output per stack for either camera.
 """
 
 import os
+import threading
 import time
 
 import numpy as np
@@ -425,7 +426,56 @@ class AutomatedZStackWorker(QThread):
         mv_iterator = EventsIterator.from_device(device=device)
         height, width = mv_iterator.get_size()
 
-        self.status_update.emit(f"Recording events at plane {step+1} for {p['acqu_time']} s...")
+        acqu_time = p["acqu_time"]
+        self.status_update.emit(f"Recording events at plane {step+1} for {acqu_time} s...")
+
+        # Stop the raw logger exactly once, from whichever of the watchdog or the
+        # finally gets there first: stopping it twice — or without a prior
+        # log_raw_data — can crash the Metavision native library.
+        log_lock = threading.Lock()
+        log_stopped = {"done": raw_path is None}
+
+        def stop_logging_once():
+            with log_lock:
+                if not log_stopped["done"]:
+                    log_stopped["done"] = True
+                    try:
+                        events_stream.stop_log_raw_data()
+                    except Exception:
+                        pass
+
+        # The recording should last ~acqu_time of wall-clock, then stop. The
+        # elapsed-time check in events_for_duration does that whenever event chunks
+        # flow, but it can only run once the SDK yields a chunk — so if the camera
+        # delivers *nothing* (a bias_hpf at its ceiling suppresses all events, or a
+        # USB3/connection drop) ``for evs in mv_iterator`` blocks with nothing to
+        # yield and never stops. This watchdog force-stops the event stream a few
+        # seconds past acqu_time (grace for stream start-up / first-chunk latency),
+        # or immediately on a user Stop, which unblocks the iterator — so a plane
+        # that records nothing still finishes in ~acqu_time instead of hanging, and
+        # Stop stays responsive. (It also caps a runaway high-rate plane whose
+        # delivery stalls: a "record for acqu_time" plane is that long either way.)
+        recording_over = threading.Event()
+        ceiling_s = acqu_time + 5.0
+        timed_out = {"flag": False}
+
+        def watchdog():
+            deadline = time.time() + ceiling_s
+            while (not recording_over.is_set() and self._is_running
+                   and time.time() < deadline):
+                time.sleep(0.2)
+            if recording_over.is_set():
+                return
+            timed_out["flag"] = self._is_running  # True: ceiling hit; False: user Stop
+            stop_logging_once()  # flush the partial raw before tearing the stream down
+            for stopper in (
+                lambda: device.get_i_events_stream().stop(),
+                lambda: device.get_i_device_control().stop(),
+            ):
+                try:
+                    stopper()
+                except Exception:
+                    pass
 
         def events_for_duration():
             """Yield event chunks until the acquisition time elapses or the user
@@ -435,9 +485,12 @@ class AutomatedZStackWorker(QThread):
                 if not self._is_running:
                     return
                 yield evs
-                if time.time() - start >= p["acqu_time"]:
+                if time.time() - start >= acqu_time:
                     return
 
+        wd = threading.Thread(target=watchdog, name="evk4-record-watchdog", daemon=True)
+        wd.start()
+        event_img = None
         try:
             if raw_path is not None:
                 # Raw stream is the authoritative record: just drive the device
@@ -446,31 +499,54 @@ class AutomatedZStackWorker(QThread):
                 # for the saved image).
                 for _ in events_for_duration():
                     pass
-                event_img = None
             else:
                 # No raw file to re-read (unsaved run) — accumulate the live
                 # stream as a best-effort fallback.
                 event_img = accumulate_event_frame(events_for_duration(), width, height)
+        except Exception:
+            # A watchdog force-stop surfaces as an iterator error — expected; only
+            # re-raise a genuine fault so the recover/pause logic can act on it.
+            if self._is_running and not timed_out["flag"]:
+                raise
         finally:
-            if raw_path is not None:
-                events_stream.stop_log_raw_data()
+            recording_over.set()
+            stop_logging_once()
+            wd.join(timeout=2.0)
+        if raw_path is not None:
+            event_img = None  # reconstructed from the (possibly partial) raw below
 
         if not self._is_running:
             return None
 
         if event_img is None:
-            # Reconstruct from the plane's saved raw stream — the complete event
-            # record — matching event_camera.process_final_image().
-            reader = EventsIterator(input_path=raw_path, delta_t=1000000)
-            event_img = accumulate_event_frame(reader, width, height)
+            if raw_path is not None:
+                # Reconstruct from the plane's saved raw stream — the complete event
+                # record — matching event_camera.process_final_image().
+                reader = EventsIterator(input_path=raw_path, delta_t=1000000)
+                event_img = accumulate_event_frame(reader, width, height)
 
-            # Also save this plane's decoded event stream (x, y, p, t) next to its
-            # .raw, mirroring the single-Z acquire — an explicit per-event list for
-            # downstream analysis.
-            save_event_stream(
-                EventsIterator(input_path=raw_path, delta_t=1000000),
-                raw_dir, f"{filename}_events_z{step:03d}",
-            )
+                # Also save this plane's decoded event stream (x, y, p, t) next to
+                # its .raw, mirroring the single-Z acquire — an explicit per-event
+                # list for downstream analysis.
+                save_event_stream(
+                    EventsIterator(input_path=raw_path, delta_t=1000000),
+                    raw_dir, f"{filename}_events_z{step:03d}",
+                )
+            else:  # unsaved run force-stopped before any accumulation
+                event_img = np.zeros((height, width), dtype=np.float32)
+
+        # Report empty / stalled planes so the user sees *why* a run underperforms
+        # (the common cause is a bias_hpf near its maximum suppressing all events,
+        # or the camera falling back off USB3) rather than just a slow, blank stack.
+        if float(np.max(event_img)) == 0:
+            self.status_update.emit(
+                f"Plane {step+1}: 0 events recorded — the camera delivered nothing. "
+                f"Check the USB3 connection and lower bias_hpf (a value near its "
+                f"maximum suppresses all events).")
+        elif timed_out["flag"]:
+            self.status_update.emit(
+                f"Plane {step+1}: event delivery stalled — recording capped at "
+                f"{ceiling_s:.0f} s and continuing.")
 
         event_img = crop_to_roi(event_img, roi)  # match the live crop framing
 

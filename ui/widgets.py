@@ -5,12 +5,14 @@ hardware-layer controllers (AWGController, StageController) and workers (PIMoveW
 """
 
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QSlider, QSpinBox,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QSlider,
+    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
-from PyQt6.QtCore import Qt, QRect, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import Qt, QPointF, QRect, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
+
+import numpy as np
 
 from config import (
     DCAM_BINNING_OPTIONS, DCAM_DEFECTCORRECT_OPTIONS, DCAM_READOUTSPEED_OPTIONS,
@@ -584,6 +586,24 @@ class OrcaParamsWidget(QWidget):
         y_min = max(0, min(y_min, sh - h)) // 4 * 4
         return {"x_min": x_min, "x_max": x_min + w, "y_min": y_min, "y_max": y_min + h}
 
+    def set_roi_window(self, roi):
+        """Set the crop controls to an explicit sensor window.
+
+        ``roi`` is ``{x_min, x_max, y_min, y_max}`` in full-sensor pixels — the
+        same format ``_compute_roi`` produces. The width/height and centre-offset
+        controls are derived so that ``_compute_roi()`` reproduces the window
+        exactly (for a 4 px-aligned window, e.g. one from the FOV matcher).
+        Setting the spinboxes fires the normal debounced ``roi_changed``, so a
+        running live feed re-frames automatically.
+        """
+        sw, sh = ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT
+        w = int(roi["x_max"]) - int(roi["x_min"])
+        h = int(roi["y_max"]) - int(roi["y_min"])
+        self.spin_roi_width.setValue(w)
+        self.spin_roi_height.setValue(h)
+        self.slider_offset_x.setValue(int(roi["x_min"]) - (sw - w) // 2)
+        self.slider_offset_y.setValue(int(roi["y_min"]) - (sh - h) // 2)
+
     def get_params(self):
         return {
             "orca_exposure": self.spin_exp.value(),
@@ -649,6 +669,110 @@ class OrcaParamsWidget(QWidget):
                 if combo.itemData(i) == data[key]:
                     combo.setCurrentIndex(i)
                     break
+
+
+class FovMatchPreviewDialog(QDialog):
+    """Validation preview for the EVK4 -> ORCA field-of-view matching crop.
+
+    Shows the ORCA sensor (with the live frame as background when available)
+    with the proposed crop (green rectangle) and the *true* rotated EVK4
+    footprint (magenta outline) inside it, so the user can confirm the match
+    before it is applied. The EVK4 sits rotated ~43 deg in the ORCA field, so
+    the crop is the footprint's bounding box: the four green corner triangles
+    outside the magenta outline are seen by the ORCA but not by the EVK4.
+
+    ``exec()`` returns Accepted only when the user clicks "Apply This Crop";
+    the caller then applies the window and persists it.
+    """
+
+    CANVAS_PX = 620  # on-screen size of the (square) sensor preview
+
+    def __init__(self, crop, corners, evk4_roi, sensor=(2304, 2304),
+                 background=None, clipped=False, warn_binning=None,
+                 extra_lines=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Match ORCA crop to EVK4 field — confirm")
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(self._render_preview(crop, corners, sensor, background))
+
+        w = crop["x_max"] - crop["x_min"]
+        h = crop["y_max"] - crop["y_min"]
+        evw = evk4_roi["x_max"] - evk4_roi["x_min"]
+        evh = evk4_roi["y_max"] - evk4_roi["y_min"]
+        lines = list(extra_lines or [])
+        lines += [
+            f"<b>Proposed ORCA crop:</b> {w} × {h} px at "
+            f"({crop['x_min']}, {crop['y_min']}) — green rectangle.",
+            f"<b>EVK4 field mapped into the ORCA:</b> {evw} × {evh} px window, "
+            f"rotated — magenta outline.",
+            "The crop is the smallest camera rectangle containing the whole EVK4 "
+            "view; the green corners outside the magenta outline are ORCA-only.",
+        ]
+        if clipped:
+            lines.append("<b><font color='#e6b422'>Warning:</font></b> part of the "
+                         "EVK4 footprint falls off the ORCA sensor — the fields "
+                         "will not fully overlap.")
+        if warn_binning:
+            lines.append(f"<b><font color='#e6b422'>Warning:</font></b> ORCA binning "
+                         f"is {warn_binning}; the calibration was measured at 1 × 1.")
+        info = QLabel("<br>".join(lines))
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #cccccc; font-size: 11px;")
+        layout.addWidget(info)
+
+        btns = QHBoxLayout()
+        btn_ok = QPushButton("✓  Apply This Crop")
+        btn_ok.setObjectName("btnAcquire")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btns.addStretch()
+        btns.addWidget(btn_cancel)
+        btns.addWidget(btn_ok)
+        layout.addLayout(btns)
+        btn_ok.setDefault(True)
+
+    def _render_preview(self, crop, corners, sensor, background):
+        """Compose the sensor canvas with the crop + footprint overlays.
+
+        ``background`` may be a 2D grayscale array (live-frame context) or an
+        HxWx3 RGB array (the measured-registration green/magenta overlay)."""
+        sw, sh = int(sensor[0]), int(sensor[1])
+        if background is not None:
+            bg = np.ascontiguousarray(background, dtype=np.uint8)
+            if bg.ndim == 3:
+                img = QImage(bg.data, bg.shape[1], bg.shape[0], bg.shape[1] * 3,
+                             QImage.Format.Format_RGB888)
+            else:
+                img = QImage(bg.data, bg.shape[1], bg.shape[0], bg.shape[1],
+                             QImage.Format.Format_Grayscale8)
+            pixmap = QPixmap.fromImage(img.copy())  # copy: detach from bg buffer
+        else:
+            pixmap = QPixmap(sw, sh)
+            pixmap.fill(QColor(25, 25, 25))
+
+        painter = QPainter(pixmap)
+        # Current full-sensor border, for orientation.
+        painter.setPen(QPen(QColor(90, 90, 90), 6))
+        painter.drawRect(0, 0, sw - 1, sh - 1)
+        # Proposed crop: green rectangle.
+        painter.setPen(QPen(QColor(80, 220, 80), 8))
+        painter.drawRect(crop["x_min"], crop["y_min"],
+                         crop["x_max"] - crop["x_min"], crop["y_max"] - crop["y_min"])
+        # True EVK4 footprint: magenta rotated outline.
+        painter.setPen(QPen(QColor(230, 80, 230), 8))
+        poly = QPolygonF([QPointF(float(x), float(y)) for x, y in corners])
+        painter.drawPolygon(poly)
+        painter.end()
+
+        lbl = QLabel()
+        lbl.setPixmap(pixmap.scaled(
+            self.CANVAS_PX, self.CANVAS_PX,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return lbl
 
 
 class AWGWidget(QGroupBox):

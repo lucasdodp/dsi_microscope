@@ -27,6 +27,10 @@ from .image_processing import (
     rebuild_zstack_from_raw,
     event_raw_plane_path,
     find_complete_event_planes,
+    map_evk4_window_to_orca,
+    register_evk4_to_orca,
+    compose_registration_overlay,
+    decompose_fov_affine,
 )
 
 __all__ = [
@@ -52,4 +56,8 @@ __all__ = [
     "rebuild_zstack_from_raw",
     "event_raw_plane_path",
     "find_complete_event_planes",
+    "map_evk4_window_to_orca",
+    "register_evk4_to_orca",
+    "compose_registration_overlay",
+    "decompose_fov_affine",
 ]

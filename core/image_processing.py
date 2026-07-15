@@ -872,3 +872,247 @@ def save_mat_tif(image, out_dir, filename):
     tif_path = os.path.join(out_dir, f"{filename}_final_image.tif")
     cv2.imwrite(tif_path, image)
     return out_dir
+
+
+# ---------------------------------------------------------------------------
+# EVK4 -> ORCA field-of-view matching
+# ---------------------------------------------------------------------------
+def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4):
+    """Map an EVK4 crop window into ORCA coordinates and derive the matching crop.
+
+    ``affine`` is the calibrated 2x3 EVK4->ORCA map (see
+    ``config.EVK4_TO_ORCA_AFFINE``): ``[orca_x, orca_y] = A @ [evk_x, evk_y, 1]``.
+    Because the EVK4 footprint is *rotated* (~43 deg) in the ORCA field, the
+    matching camera crop is the axis-aligned **bounding box** of the mapped
+    window: it contains the entire EVK4 view plus four corner triangles the
+    EVK4 does not see. The returned corners let the UI draw the true rotated
+    footprint inside the crop so the user can validate the overlap.
+
+    ``evk4_roi`` is the EVK4 window as ``{x_min, x_max, y_min, y_max}`` in
+    full-sensor IMX636 pixels (the widget's native format). The bounding box is
+    expanded outward to the DCAM ``align`` grid (position and size must be
+    multiples of 4 for the hardware subarray) and clamped to the sensor.
+
+    Returns ``(crop, corners, clipped)``:
+      * ``crop`` — ``{x_min, x_max, y_min, y_max}`` in full-sensor unbinned
+        ORCA pixels, aligned and clamped;
+      * ``corners`` — 4x2 float array of the mapped EVK4 window corners
+        (x, y), in EVK4-window order TL, TR, BR, BL;
+      * ``clipped`` — True if the footprint ran off the ORCA sensor and the
+        crop had to be cut back (the fields are then not fully shared).
+    """
+    A = np.asarray(affine, dtype=np.float64)
+    if A.shape != (2, 3):
+        raise ValueError(f"affine must be 2x3, got {A.shape}")
+    x0, x1 = float(evk4_roi["x_min"]), float(evk4_roi["x_max"])
+    y0, y1 = float(evk4_roi["y_min"]), float(evk4_roi["y_max"])
+    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x1, y1, 1.0], [x0, y1, 1.0]])
+    corners = pts @ A.T  # 4x2 (x, y) in ORCA pixels
+
+    sw, sh = int(orca_sensor[0]), int(orca_sensor[1])
+    # Expand outward to the alignment grid so the whole footprint stays inside.
+    bx0 = int(np.floor(corners[:, 0].min() / align) * align)
+    by0 = int(np.floor(corners[:, 1].min() / align) * align)
+    bx1 = int(np.ceil(corners[:, 0].max() / align) * align)
+    by1 = int(np.ceil(corners[:, 1].max() / align) * align)
+    clipped = bx0 < 0 or by0 < 0 or bx1 > sw or by1 > sh
+    bx0, by0 = max(0, bx0), max(0, by0)
+    bx1, by1 = min(sw, bx1), min(sh, by1)
+    if bx1 - bx0 < align or by1 - by0 < align:
+        raise ValueError(
+            "The mapped EVK4 window lies (almost) entirely off the ORCA sensor — "
+            "the registration is likely stale; re-calibrate it.")
+    crop = {"x_min": bx0, "x_max": bx1, "y_min": by0, "y_max": by1}
+    return crop, corners, clipped
+
+
+# --- live EVK4 -> ORCA registration (masked-NCC, from the 2026-07-10 analysis) ---
+def _blobmap(img, sigma=3.0):
+    """Smoothed, robustly-normalised blob-emphasis map in [0, 1].
+
+    The Gaussian smoothing is what makes the registration tolerant to the small
+    focal-plane offset between the two camera ports: mildly defocused beads
+    still produce overlapping blobs.
+    """
+    img = np.asarray(img, dtype=np.float64)
+    sm = cv2.GaussianBlur(img, (0, 0), sigma)
+    lo, hi = np.percentile(sm, [50.0, 99.5])
+    return np.clip((sm - lo) / (hi - lo + 1e-12), 0, 1).astype(np.float32)
+
+
+def _rotate_full(img, flip, theta):
+    """Rotate (optionally x-flipped) ``img`` by ``theta`` deg onto a canvas large
+    enough to hold it, returning (canvas, validity mask, 2x3 original->canvas map)."""
+    F = np.array([[1.0, 0, 0], [0, 1, 0]])
+    if flip:
+        img = np.ascontiguousarray(np.fliplr(img))
+        F = np.array([[-1.0, 0, img.shape[1] - 1], [0, 1, 0]])
+    h, w = img.shape
+    s, c = abs(np.sin(np.deg2rad(theta))), abs(np.cos(np.deg2rad(theta)))
+    bw, bh = int(np.ceil(w * c + h * s)), int(np.ceil(w * s + h * c))
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), theta, 1.0)
+    M[0, 2] += bw / 2 - w / 2
+    M[1, 2] += bh / 2 - h / 2
+    rot = cv2.warpAffine(img, M, (bw, bh), flags=cv2.INTER_LINEAR)
+    mask = cv2.warpAffine(np.ones_like(img), M, (bw, bh), flags=cv2.INTER_NEAREST)
+    A3 = np.vstack([M, [0, 0, 1]]) @ np.vstack([F, [0, 0, 1]])
+    return rot, mask, A3[:2]
+
+
+def _scaled(canvas, mask, scale):
+    th, tw = int(round(canvas.shape[0] * scale)), int(round(canvas.shape[1] * scale))
+    tr = cv2.resize(canvas, (tw, th), interpolation=cv2.INTER_AREA)
+    mr = (cv2.resize(mask, (tw, th), interpolation=cv2.INTER_AREA) > 0.999).astype(np.float32)
+    return tr, mr
+
+
+def _masked_ncc(big, tmpl, mask):
+    """Masked normalised cross-correlation; returns (best score, (x, y) location).
+    Score -2 marks an invalid geometry (template not smaller than the image)."""
+    mv = tmpl[mask > 0]
+    if mv.size == 0:
+        return -2.0, (0, 0)
+    t = (tmpl - mv.mean()) * mask
+    b = big - big.mean()
+    if t.shape[0] >= b.shape[0] or t.shape[1] >= b.shape[1]:
+        return -2.0, (0, 0)
+    res = np.nan_to_num(cv2.matchTemplate(b, t, cv2.TM_CCORR_NORMED, mask=mask), nan=-1)
+    _, mx, _, loc = cv2.minMaxLoc(res)
+    return float(mx), loc
+
+
+def decompose_fov_affine(affine):
+    """Extract (flip, theta_deg, scale) from a 2x3 EVK4->ORCA affine.
+
+    ``theta`` follows the cv2.getRotationMatrix2D convention used by the
+    registration search (the 2026-07-10 calibration reads theta = 317 deg,
+    scale = 0.745). A negative determinant marks an x-flip.
+    """
+    A2 = np.asarray(affine, dtype=np.float64)[:, :2]
+    flip = bool(np.linalg.det(A2) < 0)
+    M = A2 @ np.array([[-1.0, 0], [0, 1.0]]) if flip else A2
+    scale = float(np.hypot(M[0, 0], M[1, 0]))
+    theta = float((-np.degrees(np.arctan2(M[1, 0], M[0, 0]))) % 360.0)
+    return flip, theta, scale
+
+
+def register_evk4_to_orca(orca_img, evk4_img, seed_affine=None, status=None):
+    """Register a live EVK4 image onto a live ORCA image; return the new affine.
+
+    The measurement counterpart of the offline 2026-07-10 ``step2_register.py``:
+    both images are reduced to smoothed blob maps and matched by masked NCC over
+    flip / rotation / scale / translation, coarse-to-fine. ``orca_img`` must be a
+    full-sensor ORCA frame (e.g. an average of a few frames) and ``evk4_img`` a
+    full-sensor accumulated event image of the *same* (structured) sample.
+
+    When ``seed_affine`` is given (the current calibration), the search is
+    bounded around its rotation/scale — fast, and robust for a bumped/drifted
+    setup. If the seeded search matches poorly (NCC < 0.35), it automatically
+    widens to a full-circle search (slower) to handle a remounted/rotated
+    camera. ``status`` is an optional ``str -> None`` progress callback.
+
+    Returns ``(affine, score, params)``: the 2x3 EVK4->ORCA map (list of lists),
+    its NCC score in [0, 1] (values ≳ 0.5 were reliable in the analysis), and
+    ``{"flip", "theta", "scale"}``.
+    """
+    def say(msg):
+        if status is not None:
+            status(msg)
+
+    cov_o = _blobmap(orca_img, 4.0)
+    cov_e = _blobmap(evk4_img, 3.0)
+    o4 = cv2.resize(cov_o, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    e4 = cv2.resize(cov_e, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    o2 = cv2.resize(cov_o, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    e2 = cv2.resize(cov_e, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+
+    def coarse(flips, thetas, scales):
+        best = None
+        for flip in flips:
+            for theta in thetas:
+                canv, mask, _ = _rotate_full(e4, flip, theta)
+                for scale in scales:
+                    tr, mr = _scaled(canv, mask, scale)
+                    s, _ = _masked_ncc(o4, tr, mr)
+                    if best is None or s > best[0]:
+                        best = (s, flip, theta, scale)
+        return best
+
+    full_flips = (False, True)
+    full_thetas = np.arange(0.0, 360.0, 2.0)
+    full_scales = np.arange(0.55, 0.96, 0.03)
+    if seed_affine is not None:
+        flip0, th0, sc0 = decompose_fov_affine(seed_affine)
+        say(f"Coarse search around the current calibration (θ ≈ {th0:.0f}°)...")
+        best = coarse([flip0],
+                      np.arange(th0 - 15.0, th0 + 15.01, 1.5),
+                      np.arange(max(0.1, sc0 - 0.06), sc0 + 0.0601, 0.015))
+        if best[0] < 0.35:
+            say("Weak match near the calibration — widening to a full search "
+                "(the camera may have been remounted; this takes longer)...")
+            best = coarse(full_flips, full_thetas, full_scales)
+    else:
+        say("Full coarse registration search (no calibration seed)...")
+        best = coarse(full_flips, full_thetas, full_scales)
+    s_c, flip, theta_c, scale_c = best
+
+    say(f"Refining registration (coarse NCC {s_c:.2f}, θ = {theta_c:.1f}°, "
+        f"scale = {scale_c:.3f})...")
+    best2 = None
+    for theta in np.arange(theta_c - 3.0, theta_c + 3.01, 0.25):
+        canv, mask, _ = _rotate_full(e2, flip, theta)
+        for scale in np.arange(scale_c - 0.03, scale_c + 0.0301, 0.005):
+            tr, mr = _scaled(canv, mask, scale)
+            s, _ = _masked_ncc(o2, tr, mr)
+            if best2 is None or s > best2[0]:
+                best2 = (s, theta, scale)
+    _, theta_r, scale_r = best2
+
+    # Translation at half res, then a cheap local full-resolution polish: the
+    # full-res template is only matched inside a small window around the
+    # upscaled half-res location, instead of over the whole sensor.
+    canv2, mask2, _ = _rotate_full(e2, flip, theta_r)
+    tr2, mr2 = _scaled(canv2, mask2, scale_r)
+    s2, (x2, y2) = _masked_ncc(o2, tr2, mr2)
+
+    canvas, mask, A_rot = _rotate_full(cov_e, flip, theta_r)
+    tr, mr = _scaled(canvas, mask, scale_r)
+    x0g, y0g = 2 * x2, 2 * y2
+    pad = 12
+    x0w, y0w = max(0, x0g - pad), max(0, y0g - pad)
+    x1w = min(cov_o.shape[1], x0g + tr.shape[1] + pad)
+    y1w = min(cov_o.shape[0], y0g + tr.shape[0] + pad)
+    s, (dx, dy) = _masked_ncc(cov_o[y0w:y1w, x0w:x1w], tr, mr)
+    if s <= -2.0:  # window degenerate near the sensor edge — keep half-res result
+        s, (x0, y0) = s2, (x0g, y0g)
+    else:
+        x0, y0 = x0w + dx, y0w + dy
+
+    S3 = np.array([[scale_r, 0, 0], [0, scale_r, 0], [0, 0, 1.0]])
+    T3 = np.array([[1.0, 0, x0], [0, 1, y0], [0, 0, 1.0]])
+    A3 = T3 @ S3 @ np.vstack([A_rot, [0, 0, 1.0]])
+    say(f"Registration done: NCC = {s:.2f}, θ = {theta_r:.2f}°, scale = {scale_r:.4f}.")
+    return A3[:2].tolist(), float(s), {
+        "flip": bool(flip), "theta": float(theta_r), "scale": float(scale_r),
+    }
+
+
+def compose_registration_overlay(orca_img, evk4_img, affine):
+    """Green-ORCA / magenta-EVK4 overlay of the registered pair (HxWx3 uint8).
+
+    The EVK4 blob map is warped into the ORCA frame through ``affine`` — where
+    the two cameras see the same beads, green + magenta ≈ white. Used as the
+    preview-dialog background so the user validates the *measured* registration,
+    not just the resulting rectangle.
+    """
+    g = _blobmap(orca_img, 4.0)
+    m = _blobmap(evk4_img, 3.0)
+    h, w = g.shape
+    A = np.asarray(affine, dtype=np.float64)
+    warp = cv2.warpAffine(m, A, (w, h))
+    rgb = np.zeros((h, w, 3), np.uint8)
+    rgb[..., 1] = (np.clip(g, 0, 1) * 255).astype(np.uint8)
+    mag = (np.clip(warp, 0, 1) * 255).astype(np.uint8)
+    rgb[..., 0] = mag
+    rgb[..., 2] = mag
+    return rgb
