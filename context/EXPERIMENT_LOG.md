@@ -26,6 +26,54 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-16 — bias_fo × bias_hpf 2-D sweep at **500 Hz** (completes the 07-15 pair)
+
+**Conditions**
+- Sample: **fluorescent marker (highlighter pen) on a glass substrate** — not a biological sample. **Same sample and same stage position as 2026-07-15**, never moved between the three frequency runs, so 500 / 1500 / 2500 Hz differ *only* in AWG frequency. (Neither day's `Context.txt` recorded the sample; noted here.)
+- Light power at sample: **0.30 mW** (same as both 07-15 runs).
+- Illumination (AWG): CH1 square, **500 Hz**, 18 Vpp. CH2 OFF (2000 Hz, 18 Vpp, not output).
+- Camera settings: EVK4 bias_on = bias_off = 40, **2 s/plane**, full sensor (1280×720). PI stage: target focus 200 µm, **35 planes, 0.5 µm step** (z = 191.2 → 208.3 µm). ORCA connected (200 ms × 200) but this analysis uses the event channel only.
+- Grid: `bias_fo` ∈ [-35, -10, 15, 35, 55] × `bias_hpf` ∈ [0, 25, 50, 75, 100, 120] = **30 cells, all 30 physically acquired** (unlike 1500 Hz).
+- Anything that failed: nothing. A stray `teste/` folder in the sweep directory is not part of the grid and is skipped by the script.
+
+**Data treatment**
+- Same pipeline as 2026-07-15: per-acquisition `*_axial_profile_event.csv` → FWHM from the Gaussian-fit comment, total events = `sum(mean_intensity) × 1280×720`.
+- **Correction to the 07-15 script (matters here, not there):** it hardcoded "`bias_hpf = 120` has no events" and forced that one column to zero. At 500 Hz the signal dies a step earlier — **`bias_hpf = 100` is also exactly zero** (`sum(mean_intensity)` literally `0.0` in all 5 cells). The rule was made **data-driven** (any cell measuring zero events is zeroed), which is the rule the 07-15 script's own docstring already justified; the old `hpf = 120` forcing is kept for cells that were never acquired. **Verified backward-compatible: re-running it on the 07-15 data reproduces `results_1500hz.csv` and `results_2500hz.csv` identically.**
+- Why it mattered: on an all-zero profile the fit returns **`amp = -0.000000`** (zero-amplitude Gaussian — no peak) with `mu` pinned to 191.24, the first plane of the scan, versus ≈200 µm (the focus) for cells with signal. Its reported `fwhm_um ≈ 10 µm` is meaningless; unguarded it would have been plotted as a real 10 µm slice and would have crushed the colour scale (true range 1.54–1.88 µm). Note 10 µm *does* fit inside the 17.0 µm z-range — the fit is meaningless because there is no peak, not because the number is impossible.
+- **Result 1 — 500 Hz yield collapses, confirming 1500 Hz directly:** peak **3.0 M** events (hpf = 0) vs **126 M** at 1500 Hz and **92 M** at 2500 Hz → **≈ 42× below 1500 Hz**. Because sample/position/power were held fixed, this is a controlled comparison, and it independently reproduces the 2026-07-07 decorrelation result (~40×) from a separate measurement.
+- **Result 2 — `bias_hpf` is NOT independent of AWG frequency (new):** as a fraction of each frequency's own peak, `hpf = 75` keeps ~40 % at 1500 Hz, ~31 % at 2500 Hz, but only **~6 % at 500 Hz**; `hpf = 100` is alive at 1500 (~1.2 M) and 2500 Hz (~0.17 M) but **exactly zero** at 500 Hz. Physically sensible: slower speckle → fluctuations at lower temporal frequencies → the same high-pass removes more of them. **`bias_hpf ≲ 60` is a 1500 Hz statement, not a universal one.** At 500 Hz the usable window is `hpf ≤ 50`. Re-tune `hpf` whenever the AWG frequency changes.
+- **Result 3 — the thin FWHM at 500 Hz is starvation, not resolution:** cells with signal read **1.54–1.88 µm**, thinner than 1500 Hz (2.5–3.4) and 2500 Hz (2.3–3.3), but on ~40× fewer events; within the sweep FWHM falls 1.88 → 1.54 µm exactly as events fall 3.0 M → 0.19 M. Also, at 0.5 µm z-step a 1.54 µm FWHM spans only ~3 planes — near the sampling limit, so the differences between thin cells are not meaningful. **Do not read 500 Hz as the sharpest setting.**
+- **Result 4 — `bias_fo` stays a weak knob:** ≤ ~20 % effect on event count, `bias_fo = -35` consistently poorest (2.42 M vs ~3.03 M at hpf = 0) — same ranking as 1500 Hz. `hpf` dominates.
+- **Caveat:** the FWHM here is measured on a marker layer, not on a point-like object, so it is a relative sectioning metric across settings rather than an absolute PSF width. That is fine for this purpose — every cell is compared on the same sample.
+
+**Main files generated** (in `D:\2026-07-16\bias_fo_hpf_500hz_analysis\`, copied to `07b_2026-07-16_biasfo_hpf_500hz`)
+- `analyze_bias_fo_hpf_sweep.py` (now takes frequency **and** base folder: `python analyze_bias_fo_hpf_sweep.py 1500 D:/2026-07-15` reproduces 07-15), `README.md`
+- `combined_heatmap_500hz.png` (primary), `fwhm_heatmap_500hz.png`, `event_count_heatmap_500hz.png`, `combined_3d_500hz.png`
+- `results_500hz.csv` — full grid, `source` column marks each cell `measured` (20) / `no_events` (10)
+
+---
+
+## 2026-07-15 — bias_fo × bias_hpf 2-D sweep at 1500 and 2500 Hz
+
+**Conditions**
+- Sample: **fluorescent marker (highlighter pen) on a glass substrate**. Same sample and stage position as the 07-16 500 Hz run — the stage was not moved across any of the three frequencies.
+- Light power at sample: **0.30 mW** at 1500 Hz and **0.30 mW** at 2500 Hz (`Power.txt`).
+- Illumination (AWG): CH1 square, **1500 Hz** and **2500 Hz**, 18 Vpp.
+- Camera settings: EVK4 bias_on = bias_off = 40, 2 s/plane, full sensor. PI stage: target focus 200 µm, **35 planes, 0.5 µm step**.
+- Grid: `bias_fo` ∈ [-35, -10, 15, 35, 55] × `bias_hpf` ∈ [0, 25, 50, 75, 100, 120].
+- Anything that failed: at **1500 Hz only `bias_fo = -35` was acquired at `hpf = 120`** (26 of 30 cells); the rest of that column is filled by the forced-zero rule. 2500 Hz has all 30.
+
+**Data treatment**
+- Per-acquisition `*_axial_profile_event.csv` → FWHM (Gaussian-fit comment) + total events (`sum(mean_intensity) × NPIX`, `NPIX = 1280×720`). The event proxy was validated against a true raw EVT3 decode to ~0.4 % in the 2026-07-01 study, so no raw decoding.
+- `bias_hpf = 120` yields zero events at both frequencies → that column zeroed (FWHM undefined there). See the 07-16 entry for the generalisation of this rule.
+- **Result — `hpf` dominates, `fo` barely matters.** Events highest at hpf = 0–25 (~100–126 M at 1500 Hz; ~68–92 M at 2500 Hz), falling to ~50 M / ~28 M at hpf = 75 and ~1.2 M / ~0.17 M at hpf = 100. The heat maps are essentially horizontally striped. `bias_fo = -35` is consistently the poorest.
+- **Result — FWHM narrows as hpf rises** (≈3.0–3.4 → 1.5–1.7 µm at 1500 Hz) but tracks the collapse in events → signal-starvation artefact, not better sectioning. Usable window: low-to-mid hpf (0–50), FWHM ≈2.5–3 µm on a healthy event count.
+
+**Main files generated** (in `D:\2026-07-15\`, copied to `07a_2026-07-15_biasfo_hpf_2Dsweep`)
+- `bias_fo_hpf_1500hz_analysis/` and `bias_fo_hpf_2500hz_analysis/`, each with `analyze_bias_fo_hpf_sweep.py`, `README.md`, `results_<freq>hz.csv`, `combined_heatmap_<freq>hz.png`, `fwhm_heatmap_<freq>hz.png`, `event_count_heatmap_<freq>hz.png`, `combined_3d_<freq>hz.png`
+
+---
+
 ## 2026-07-10 — Is the EVK4 linear in **log(intensity)**? (sparse different-size beads, two ports)
 
 **Conditions**
