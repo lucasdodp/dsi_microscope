@@ -781,6 +781,7 @@ class MainWindow(QMainWindow):
         return {
             "version": 1,
             "evk4": self.evk4_params.get_preset(),
+            "evk4_queue": self.evk4_queue.get_preset(),
             "orca": self.orca_params.get_preset(),
             "awg": self.awg_widget.get_preset(),
             "zstack": {
@@ -809,6 +810,11 @@ class MainWindow(QMainWindow):
             self.orca_params.set_preset(preset.get("orca_zstack") or preset.get("orca"))
         if "evk4" in preset or "evk4_zstack" in preset:
             self.evk4_params.set_preset(preset.get("evk4_zstack") or preset.get("evk4"))
+
+        # Never disturb a queue that is mid-run (an autosave/preset load during a
+        # batch would otherwise rewrite the rows being sequenced under it).
+        if "evk4_queue" in preset and not self._queue_active:
+            self.evk4_queue.set_preset(preset["evk4_queue"])
 
         if "awg" in preset:
             self.awg_widget.set_preset(preset["awg"])

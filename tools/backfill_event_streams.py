@@ -1,11 +1,14 @@
-"""Backfill decoded event-stream files for already-acquired EVK4 ``.raw`` data.
+"""Generate decoded event-stream files for acquired EVK4 ``.raw`` data.
 
-The acquisition pipeline now saves an explicit per-event list ``<name>_xytp.mat``
-(x, y, p, t) next to every Prophesee ``.raw`` log. This standalone tool creates
-that same file for data acquired *before* the feature existed, by walking one or
-more root folders, decoding each ``.raw`` with the Metavision SDK and writing the
-compressed ``.mat`` via the shared ``core.save_event_stream`` (so the on-disk
-result is byte-for-byte the format a fresh acquisition produces).
+This is the **standard way** the explicit per-event list ``<name>_xytp.mat``
+(x, y, p, t) is produced. Acquisition deliberately does not write it inline: the
+decode-plus-gzip cost scales with the event count and dominated the per-plane
+time at high rates, so acquisition saves only the authoritative ``.raw`` and the
+stream is generated here afterwards, off the critical path.
+
+It walks one or more root folders, decodes each ``.raw`` with the Metavision SDK
+and writes the compressed ``.mat`` via the shared ``core.save_event_stream``, so
+the on-disk result is identical to what an inline save would have produced.
 
 It is **resumable and idempotent**: a ``.raw`` whose ``_xytp.mat`` already exists
 is skipped, so the run can be interrupted and restarted, and re-running it is a

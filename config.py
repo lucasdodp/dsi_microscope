@@ -191,7 +191,12 @@ EVK4_SENSOR_HEIGHT = 720
 # mid-stack, the orchestrator releases the device, waits, and retries the same
 # plane up to this many times before giving up — so a brief comms glitch no longer
 # loses a multi-hour run. Tunable via env vars.
-EVK4_MAX_RECONNECT_ATTEMPTS = int(os.environ.get("DSI_EVK4_RECONNECT_ATTEMPTS", "3"))
+#
+# The budget (attempts x delay) must exceed how long the host takes to re-enumerate
+# a dropped EVK4: on Windows that is commonly 10-30 s, so the original 3 x 5 s = 15 s
+# gave up just as the device was coming back and paused the run for a manual Resume
+# — which defeats an unattended batch. 24 x 5 s = 2 min of patience covers it.
+EVK4_MAX_RECONNECT_ATTEMPTS = int(os.environ.get("DSI_EVK4_RECONNECT_ATTEMPTS", "24"))
 EVK4_RECONNECT_DELAY_S = float(os.environ.get("DSI_EVK4_RECONNECT_DELAY_S", "5"))
 
 # ---------------------------------------------------------------------------

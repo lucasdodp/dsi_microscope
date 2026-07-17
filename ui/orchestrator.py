@@ -32,7 +32,7 @@ from config import (
 from core import (
     accumulate_event_frame, apply_smoothing, compute_dsi_images, crop_to_roi,
     filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
-    save_axial_sectioning_plot, save_event_stream, save_parameter_log,
+    save_axial_sectioning_plot, save_parameter_log,
     save_raw_stack_tiff, save_volume_tiff,
 )
 from hardware.event_camera import (
@@ -525,13 +525,12 @@ class AutomatedZStackWorker(QThread):
                 reader = EventsIterator(input_path=raw_path, delta_t=1000000)
                 event_img = accumulate_event_frame(reader, width, height)
 
-                # Also save this plane's decoded event stream (x, y, p, t) next to
-                # its .raw, mirroring the single-Z acquire — an explicit per-event
-                # list for downstream analysis.
-                save_event_stream(
-                    EventsIterator(input_path=raw_path, delta_t=1000000),
-                    raw_dir, f"{filename}_events_z{step:03d}",
-                )
+                # The decoded (x, y, p, t) list is deliberately NOT written here.
+                # It cost a second full decode pass plus a gzip of ~13 bytes/event,
+                # which at high event rates dominated the per-plane time (tens of
+                # seconds against a 2 s recording). The .raw is the authoritative
+                # record and loses nothing, so the stream is generated offline
+                # afterwards instead:  python tools/backfill_event_streams.py
             else:  # unsaved run force-stopped before any accumulation
                 event_img = np.zeros((height, width), dtype=np.float32)
 

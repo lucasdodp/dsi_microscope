@@ -26,6 +26,47 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-17 — bias_on × bias_off sweep: **USB2 corrupted the data**, and what the biases actually do
+
+**Conditions**
+- Sample: _(fill in)_
+- Light power at sample: _(fill in)_
+- Illumination (AWG): CH1 square, **1500 Hz**, 18 Vpp. CH2 OFF (2000 Hz, 18 Vpp, not output).
+- Camera settings: EVK4 `bias_fo = 40`, `bias_hpf = 0`, **0.5 s/plane**, full sensor (1280×720). PI stage: target focus 200 µm, 0.5 µm step, 21 planes (25 for `test6`).
+- Exploratory runs in `C:\DSI Microscope Data\2026-07-17\bias_on_off_sweep\`: `test1`–`test4` (`on=0, off=0`, four repeats), `test5` (`on=40, off=40`), `test6` (`on=-50, off=0`).
+- Notes: the first `0_bias_hpf_set1` batch attempt ran with the **laser shutter closed** (discovered after ~20 planes) — those numbers are a dark measurement, not signal. The event camera was **running on USB2 all day** (`[HAL][WARNING] Your EVK camera isn't connected in USB3`), and also dropped off the bus twice mid-batch.
+- Anything that failed: see Result 1 — most of the day's data is compromised by the USB link, not by the settings.
+
+**Data treatment**
+- Per-plane `.raw` decoded with the Metavision SDK; events counted directly and split by polarity (`p`). Crucially, event rate was recomputed against **live recording time** (span between first and last timestamp, minus dead air) rather than nominal `acqu_time` — this is what separated a link artefact from a physical result.
+- Dead air per plane measured by histogramming event timestamps in 5 ms bins and summing empty bins.
+
+**Results**
+- **Result 1 — the "double-peaked Gaussian" is USB2, not the sample.** `test1`–`test4` all show a single Gaussian split by a dip *at focus*. The dip planes are the only ones with **stalls**: `test1` z011/z012/z013 have **85 / 330 / 255 ms of complete dead air** (zero events — impossible for a real sensor at these biases); all other 18 planes have exactly 0 ms. z012 recorded for only 170 of its 500 ms. **Dividing by live time collapses the double peak into one clean Gaussian peaking at z = 200.74 µm — exactly where the dip was.** The apparent peaks wandered ~2 µm between test1–test4 because stall onset is a chaotic buffer-overflow threshold, not a physical position. The `Evt3 InvalidVectBase` warnings are the same root cause.
+- **Result 2 — the rule is the byte rate, not the warning.** USB2 practical ceiling ≈ 38–45 MB/s. `test1` peaks at 21.8 MB / 0.5 s = **43.6 MB/s → stalls**. `test5` peaks at 27 MB/s → no stalls. The 2 s/plane batch rows ran ~18 MB/s and were unaffected. **Under ~30 MB/s is safe; near 38+ MB/s loses planes silently.** The manual (§3.1) states USB 3.0 SuperSpeed is *required* for the necessary bandwidth and power.
+- **Result 3 — `bias_on` and `bias_off` should be set EQUAL.** The EVK4 manual (p.13, `metavision_platform_info`) shows **every default bias = 0** — they are relative offsets from a factory-balanced calibration, *not* absolute values with differing zero points. Measured ON:OFF ratio **at the peak plane** confirms it: `0/0` → **1.04**, `40/40` → **0.98** (both balanced), but `-50/0` → **7.29** (badly imbalanced, only ON moved off its default). The spin-box limits (`bias_on -85..140`, `bias_off -35..190`) span 225 each and are offset by 50, which *looks* like it implies a 50 offset between them — **it does not**; that arithmetic coincidence is a trap.
+- **Result 4 — higher equal biases dramatically improve sectioning.** peak/floor contrast: `0/0` → **2.0×**, `-50/0` → **1.2×**, `40/40` → **93.5×** (peak 6.58 Me/s vs floor 0.07 Me/s). High biases suppress the out-of-focus background while the in-focus signal survives — and they cut the data rate below the USB2 ceiling as a side effect. This retrospectively supports the `bias_on = bias_off = 40` used on 07-15/07-16.
+- **Result 5 — ON:OFF ratio is a signal-vs-noise diagnostic.** At `0/0` the *off-focus* plane reads ON:OFF = 0.09 (noise is OFF-dominated) while the *in-focus* plane reads 1.04 (speckle is symmetric). **ON:OFF ≈ 1 means you are looking at speckle; far from 1 means you are looking at noise.** Measuring the wrong plane inverts the conclusion — beware.
+- **Result 6 — direction of the knobs (measured):** lower = more sensitive, for both. `bias_on` 0 → -50 raised ON events 4.4×; 0 → +40 cut them 19×. The two are **coupled**: `test1` and `test6` both have `off=0`, yet OFF fell 8.13 → 0.43 Me/s when `bias_on` changed — a sensitive ON fires first and resets the pixel, starving OFF.
+- **Caveat:** the ERC cap is 20 Me/s (`config.py`), and the live-time-corrected true peak at `0/0` is **21.6 Me/s** — i.e. at low biases the peak is clipped by the ERC *before* USB2 touches it. Low-bias rows are doubly unreliable.
+
+**Software changes made the same day** (see git log)
+- `_xytp.mat` no longer written during acquisition (2 full decode passes + gzip of ~13 B/event dominated per-plane time); generate offline with `tools/backfill_event_streams.py`.
+- Batch queue now persists in the session/preset (`evk4_queue`) — a 30-row sweep survives a restart.
+- EVK4 reconnect budget 3×5 s → **24×5 s = 2 min**, so a USB re-enumeration (10–30 s on Windows) recovers unattended instead of pausing for a manual Resume.
+- Bias application isolated per-bias and made non-fatal: a value the SDK rejects no longer tears down the live feed and orphans the USB handle (which presented as "Live View won't connect").
+
+**Main files generated**
+- `C:\DSI Microscope Data\2026-07-17\bias_on_off_sweep\test1..test6\` (raw + axial profiles; **test1–test4 profiles are stall-corrupted — recompute against live time before use**)
+- `presets/bias_hpf_sweep_6sets.json` — 30-row queue, `bias_on = bias_off ∈ {10,35,60,90,115,140}` × `bias_hpf ∈ {0,25,50,75,100}`, highest-bias set first.
+
+**Open / next**
+- **Move the EVK4 to a native USB3 port before any further sweep** — every quantitative result above is bandwidth-limited otherwise.
+- Consider a stall check in `orchestrator._capture_plane_event`: compare each plane's live time to `acqu_time` and raise on significant dead air, so the existing retry loop rejects corrupted planes automatically instead of silently keeping them.
+- A dark noise floor is **Z-independent**, so it needs no Z-stack: `num_steps = 1`, shutter closed, run the same 30-row queue ≈ 5 min → per-bias noise floor for SNR.
+
+---
+
 ## 2026-07-16 — bias_fo × bias_hpf 2-D sweep at **500 Hz** (completes the 07-15 pair)
 
 **Conditions**

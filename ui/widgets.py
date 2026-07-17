@@ -359,6 +359,38 @@ class Evk4QueueWidget(QGroupBox):
     def rows(self):
         return [self._row_values(r) for r in range(self.table.rowCount())]
 
+    # ---------------------------------------------------------- persistence
+    def get_preset(self):
+        """The whole queue as a JSON-serialisable dict, so a long batch survives
+        a restart (configuring 30 acquisitions by hand is expensive)."""
+        return {"auto_name": self.combo_name.currentText(), "rows": self.rows()}
+
+    def set_preset(self, data):
+        """Restore a queue saved by ``get_preset``. Ignores anything malformed —
+        a bad file leaves the current queue untouched rather than clearing it."""
+        if not isinstance(data, dict):
+            return
+        rows = data.get("rows")
+        if isinstance(rows, list):
+            self.table.blockSignals(True)   # one `changed` at the end, not per cell
+            try:
+                self.table.setRowCount(0)
+                for v in rows:
+                    if not isinstance(v, dict):
+                        continue
+                    self.add_row([
+                        v.get("filename", ""), v.get("bias_fo", self.DEFAULTS[0]),
+                        v.get("bias_hpf", self.DEFAULTS[1]), v.get("bias_on", self.DEFAULTS[2]),
+                        v.get("bias_off", self.DEFAULTS[3]), v.get("acqu_time", self.DEFAULTS[4]),
+                        v.get("repeats", self.DEFAULTS[5]),
+                    ])
+            finally:
+                self.table.blockSignals(False)
+        name = data.get("auto_name")
+        if name and self.combo_name.findText(name) >= 0:
+            self.combo_name.setCurrentText(name)
+        self.changed.emit()                 # refresh the time estimate
+
     # ---------------------------------------------------------- auto-naming
     @staticmethod
     def _fmt_dur(v):

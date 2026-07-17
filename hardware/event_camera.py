@@ -5,6 +5,7 @@
 core.image_processing. Raw-data logging is always stopped in a finally block.
 """
 
+import gc
 import os
 import time
 
@@ -14,7 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import EVK4_ERC_RATE, EVK4_FPS
 from core import (
     accumulate_event_frame, apply_smoothing, crop_to_roi, filter_crazy_pixels,
-    save_event_stream, save_mat_tif, save_parameter_log,
+    save_mat_tif, save_parameter_log,
 )
 
 try:
@@ -85,6 +86,34 @@ class CameraWorker(QThread):
         """Queue a bias update; applied on the next event batch (live mode only)."""
         self._pending_biases = params
 
+    def _set_biases(self, device, params):
+        """Push the four biases to the device, one at a time, never raising.
+
+        Each bias is set independently and its failure isolated: the SDK rejects a
+        value for reasons the spin-box ranges don't capture (per-device limits, and
+        ordering constraints between bias_diff_on/off), and a rejected *parameter*
+        must not be able to kill the stream. Previously any failure here escaped
+        into ``run()``'s handler, which reported it as an "EVK4 Hardware Error",
+        tore the live feed down and orphaned the USB handle — so a single bad value
+        left the camera unopenable until the app restarted.
+
+        Returns a list of human-readable failures (empty when all four applied).
+        """
+        biases = device.get_i_ll_biases()
+        if not biases:
+            return ["this device exposes no low-level bias interface"]
+        failures = []
+        for name, key in (("bias_fo", "bias_fo"), ("bias_hpf", "bias_hpf"),
+                          ("bias_diff_on", "bias_on"), ("bias_diff_off", "bias_off")):
+            value = params[key]
+            try:
+                biases.set(name, value)
+            except Exception as e:
+                # Report the UI's name for the bias, not the SDK's, so the message
+                # points at the field the user actually typed into.
+                failures.append(f"{key}={value} rejected ({e})")
+        return failures
+
     def apply_roi(self, roi):
         """Update the live crop window (live mode). Takes effect on the next frame.
 
@@ -100,16 +129,18 @@ class CameraWorker(QThread):
             self.error_signal.emit("Metavision SDK not found.")
             return
 
+        device = None
+        mv_iterator = None
         try:
             self.status_update.emit("Initializing EVK4 device...")
             device = initiate_device("")
 
             # Low-level bias tuning (pixel cut-off frequencies & contrast thresholds).
-            if device.get_i_ll_biases():
-                device.get_i_ll_biases().set("bias_fo", self.params["bias_fo"])
-                device.get_i_ll_biases().set("bias_hpf", self.params["bias_hpf"])
-                device.get_i_ll_biases().set("bias_diff_on", self.params["bias_on"])
-                device.get_i_ll_biases().set("bias_diff_off", self.params["bias_off"])
+            # A rejected value is reported but does not abort the run: the camera
+            # simply keeps that bias at its previous setting.
+            failures = self._set_biases(device, self.params)
+            if failures:
+                self.status_update.emit("EVK4 bias warning: " + "; ".join(failures))
 
             erc = device.get_i_erc_module()
             if erc:
@@ -157,11 +188,13 @@ class CameraWorker(QThread):
                     if self._pending_biases is not None:
                         biases = self._pending_biases
                         self._pending_biases = None
-                        if device.get_i_ll_biases():
-                            device.get_i_ll_biases().set("bias_fo", biases["bias_fo"])
-                            device.get_i_ll_biases().set("bias_hpf", biases["bias_hpf"])
-                            device.get_i_ll_biases().set("bias_diff_on", biases["bias_on"])
-                            device.get_i_ll_biases().set("bias_diff_off", biases["bias_off"])
+                        failures = self._set_biases(device, biases)
+                        if failures:
+                            # Live tuning: a value the device won't take is user
+                            # error, not a fault. Say so and keep streaming.
+                            self.status_update.emit(
+                                "EVK4 bias not applied: " + "; ".join(failures))
+                        else:
                             self.status_update.emit("EVK4 biases updated.")
                     event_frame_gen.process_events(evs)
 
@@ -184,10 +217,22 @@ class CameraWorker(QThread):
                 # from, which downstream analysis re-uses.
 
             self.status_update.emit("Camera stopped.")
-            self.finished_signal.emit()
 
         except Exception as e:
             self.error_signal.emit(f"EVK4 Hardware Error: {str(e)}")
+        finally:
+            # Drop every reference so the USB link is released (mirrors
+            # fov_registration._grab_event_frame). Without this an error path left
+            # the device handle claimed and the *next* Live View could not open the
+            # camera — the failure looked like broken hardware but was this leak.
+            del mv_iterator
+            del device
+            gc.collect()
+            # Always emit, including on the error path: MainWindow resets the live
+            # UI (Apply-biases button, Start/Stop state) in this handler, so a run
+            # that ended by exception must still hand control back or the window is
+            # left believing a dead feed is running.
+            self.finished_signal.emit()
 
     def process_final_image(self, raw_path, width, height):
         """Reconstruct, post-process and save the 2D event image from a raw log.
@@ -201,15 +246,11 @@ class CameraWorker(QThread):
         # framing the user selected (the raw log keeps every event for re-use).
         final_image = crop_to_roi(final_image, self._roi)
 
-        # Also save the decoded event stream (x, y, p, t) alongside the .raw log,
-        # as the explicit per-event list requested for downstream analysis. A
-        # second pass over the raw file (decode is cheap) keeps this independent
-        # of the accumulation above; it is always saved, even if the image below
-        # turns out blank.
-        save_event_stream(
-            EventsIterator(input_path=raw_path, delta_t=1000000),
-            self.params["output_dir"], self.params["filename"],
-        )
+        # The decoded (x, y, p, t) list is deliberately NOT written here — decode
+        # is *not* cheap at high event rates, and the gzip of the per-event list
+        # dominated acquisition time. The .raw log above is the authoritative
+        # record, so the stream is generated offline afterwards instead:
+        #     python tools/backfill_event_streams.py
 
         # Always log the acquisition parameters, even if no events were recorded.
         metadata = self.params.get("metadata")
