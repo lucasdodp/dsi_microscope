@@ -38,7 +38,7 @@ from core import (
 from hardware.event_camera import (
     apply_event_roi, EventsIterator, METAVISION_AVAILABLE, initiate_device,
 )
-from hardware.orca_camera import DCAM_AVAILABLE, Dcam, Dcamapi
+from hardware.orca_camera import _ORCA_BUSY_HINT, DCAM_AVAILABLE, Dcam, Dcamapi
 from hardware.stage_control import pitools
 
 
@@ -114,7 +114,13 @@ class AutomatedZStackWorker(QThread):
         focus = self.motor_params["focus"]
         step_size = self.motor_params["step_size"]
         steps = self.motor_params["steps"]
-        init_pos = focus - (step_size * steps / 2)
+        # Anchoring: "start" makes ``focus`` the bottom plane and scans upward
+        # (for a 3D sample scanned from the bottom of the volume up); "center"
+        # (default) makes ``focus`` the middle plane, the original behaviour.
+        if self.motor_params.get("start_mode") == "start":
+            init_pos = focus
+        else:
+            init_pos = focus - (step_size * steps / 2)
 
         # Per-plane sectioned images, accumulated into depth volumes.
         std_volume, avg_volume, event_volume, z_positions = [], [], [], []
@@ -194,10 +200,12 @@ class AutomatedZStackWorker(QThread):
     def _open_orca(self):
         self.status_update.emit("Initializing ORCA DCAM API for Z-Stack...")
         if not Dcamapi.init():
-            raise RuntimeError(f"Dcamapi.init() failed with error {Dcamapi.lasterr()}")
+            raise RuntimeError(
+                f"Dcamapi.init() failed with error {Dcamapi.lasterr()}. {_ORCA_BUSY_HINT}")
         dcam = Dcam(0)
         if not dcam.dev_open():
-            raise RuntimeError(f"dev_open() failed with error {dcam.lasterr()}")
+            raise RuntimeError(
+                f"dev_open() failed with error {dcam.lasterr()}. {_ORCA_BUSY_HINT}")
         dcam.prop_setvalue(DCAM_EXPOSURE_PROP, self.orca_params["orca_exposure"] / 1000.0)
         return dcam
 

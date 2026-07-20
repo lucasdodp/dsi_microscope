@@ -447,6 +447,19 @@ class OrcaParamsWidget(QWidget):
         self.spin_frames = QSpinBox(); self.spin_frames.setRange(2, 1000); self.spin_frames.setValue(100)
         setup_form.addRow("Exposure Time (texp):", self.spin_exp)
         setup_form.addRow("Frames per Stack (N):", self.spin_frames)
+        # Display-only auto-contrast: percentile-stretch each preview frame so
+        # faint signal is visible (like HCImage Live's automatic contrast). It
+        # never affects the saved raw stack or the DSI statistics. Default on so
+        # the live feed looks like the vendor software out of the box.
+        self.chk_auto_contrast = QCheckBox("Auto-contrast (display only)")
+        self.chk_auto_contrast.setChecked(True)
+        self.chk_auto_contrast.setToolTip(
+            "Stretch the live preview between the 0.5th and 99.5th intensity "
+            "percentiles so dim signal is visible, matching HCImage Live's "
+            "automatic contrast. Display only — the raw data and DSI results are "
+            "unchanged."
+        )
+        setup_form.addRow("", self.chk_auto_contrast)
         setup_group.setLayout(setup_form)
         layout.addWidget(setup_group)
 
@@ -646,6 +659,7 @@ class OrcaParamsWidget(QWidget):
             "trigger_source": self.combo_trigsrc.currentData(),
             "trigger_mode": self.combo_trigmode.currentData(),
             "defect_correct": self.combo_defect.currentData(),
+            "auto_contrast": self.chk_auto_contrast.isChecked(),
         }
 
     def mode_labels(self):
@@ -672,10 +686,13 @@ class OrcaParamsWidget(QWidget):
             "trigger_source": self.combo_trigsrc.currentData(),
             "trigger_mode": self.combo_trigmode.currentData(),
             "defect_correct": self.combo_defect.currentData(),
+            "auto_contrast": self.chk_auto_contrast.isChecked(),
         }
 
     def set_preset(self, data):
         """Restore widget values from a preset dict. Unknown keys are ignored."""
+        if "auto_contrast" in data:
+            self.chk_auto_contrast.setChecked(bool(data["auto_contrast"]))
         if "exposure_ms" in data:
             self.spin_exp.setValue(float(data["exposure_ms"]))
         if "frames" in data:
@@ -1061,6 +1078,22 @@ class PIStageWidget(QWidget):
         self.spin_steps.setRange(1, 1000)
         self.spin_steps.setValue(60)
 
+        # How the scan is anchored to the "Target Focus Position" field:
+        #  * "Centred on focus" (default, original behaviour): focus is the middle
+        #    plane; the scan runs from focus − step·steps/2 up to focus + half.
+        #  * "Start at this position": focus is the bottom plane; the scan runs
+        #    upward from it (focus → focus + step·(steps−1)), which is what you
+        #    want for a 3D sample scanned from the bottom of the volume up.
+        self.combo_zmode = QComboBox()
+        self.combo_zmode.addItems(["Centred on focus", "Start at this position (scan up)"])
+        self.lbl_zrange = QLabel("")
+        self.lbl_zrange.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
+        self.lbl_zrange.setWordWrap(True)
+        for sig in (self.spin_focus.valueChanged, self.spin_step_size.valueChanged,
+                    self.spin_steps.valueChanged):
+            sig.connect(self._update_zrange)
+        self.combo_zmode.currentIndexChanged.connect(self._update_zrange)
+
         self.btn_connect = QPushButton("Connect PI Stage")
         self.btn_connect.clicked.connect(self.connect_stage)
 
@@ -1095,11 +1128,14 @@ class PIStageWidget(QWidget):
         z_form.addRow("", self.btn_move_focus)
         z_form.addRow("Step Size:", self.spin_step_size)
         z_form.addRow("Number of Steps:", self.spin_steps)
+        z_form.addRow("Z-Stack anchoring:", self.combo_zmode)
+        z_form.addRow("", self.lbl_zrange)
         z_form.addRow("", self.btn_move_init)
         z_form.addRow("Manual Step:", step_layout)
 
         z_group.setLayout(z_form)
         layout.addWidget(z_group)
+        self._update_zrange()
 
     def connect_stage(self):
         if not PI_AVAILABLE:
@@ -1171,6 +1207,7 @@ class PIStageWidget(QWidget):
         tmin, tmax = self.controller.travel_min, self.controller.travel_max
         if tmin is not None and tmax is not None and tmax > tmin:
             self.spin_focus.setRange(tmin, tmax)
+        self._update_zrange()
 
     def pause_position_updates(self):
         """Suspend idle polling while another thread owns the device (e.g. Z-stack)."""
@@ -1182,12 +1219,35 @@ class PIStageWidget(QWidget):
     def move_to_focus(self):
         self.execute_movement(self.spin_focus.value())
 
-    def move_to_initial_pos(self):
+    def start_mode(self):
+        """The Z-stack anchoring mode: ``"start"`` (focus is the bottom plane,
+        scan upward) or ``"center"`` (focus is the middle plane)."""
+        return "start" if self.combo_zmode.currentIndex() == 1 else "center"
+
+    def _initial_position(self):
+        """Absolute position of the first (bottom) plane, per the anchoring mode."""
         focus = self.spin_focus.value()
         step_size = self.spin_step_size.value()
         steps = self.spin_steps.value()
-        init_pos = focus - (step_size * steps / 2)
-        self.execute_movement(init_pos)
+        if self.start_mode() == "start":
+            return focus
+        return focus - (step_size * steps / 2)
+
+    def _update_zrange(self):
+        """Show the absolute first→last plane positions for the current settings,
+        so the scanned volume is explicit before starting."""
+        step_size = self.spin_step_size.value()
+        steps = self.spin_steps.value()
+        unit = self.controller.unit
+        bottom = self._initial_position()
+        top = bottom + step_size * (steps - 1)
+        self.lbl_zrange.setText(
+            f"Scan: {bottom:.3f} → {top:.3f} {unit}  ({steps} planes, "
+            f"{step_size:g} {unit} step)"
+        )
+
+    def move_to_initial_pos(self):
+        self.execute_movement(self._initial_position())
 
     def step_manual(self, direction):
         if self.controller.is_connected and not self._device_busy:

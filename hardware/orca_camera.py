@@ -14,15 +14,16 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import (
     DCAM_BINNING_PROP, DCAM_DEFECTCORRECT_PROP, DCAM_EXPOSURE_PROP,
     DCAM_READOUTSPEED_PROP, DCAM_TRIGGER_MODE_PROP, DCAM_TRIGGERSOURCE_PROP,
+    DCAM_TRIGGERSOURCE_INTERNAL,
     DCAM_SUBARRAY_HPOS_PROP, DCAM_SUBARRAY_HSIZE_PROP,
     DCAM_SUBARRAY_VPOS_PROP, DCAM_SUBARRAY_VSIZE_PROP,
     DCAM_SUBARRAY_MODE_PROP, DCAM_SUBARRAY_MODE_OFF, DCAM_SUBARRAY_MODE_ON,
-    ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT,
+    ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT, PREVIEW_MAX_FPS,
     HAMAMATSU_SDK_PATH,
 )
 from core import (
-    compute_dsi_images, normalize_to_8bit, save_dsi_results, save_parameter_log,
-    save_raw_stack_tiff, scale_16bit_image,
+    autocontrast_8bit, compute_dsi_images, normalize_to_8bit, save_dsi_results,
+    save_parameter_log, save_raw_stack_tiff, scale_16bit_image,
 )
 
 # Extend the path to the Hamamatsu SDK sample wrapper before importing it.
@@ -36,6 +37,18 @@ except ImportError:
     Dcam = None
     Dcamapi = None
     DCAM_AVAILABLE = False
+
+
+# The ORCA (DCAM) allows only ONE process to hold the camera at a time. The most
+# common reason a connect that works in HCImage Live fails here is that HCImage
+# Live — or a previous, still-running instance of this app — is holding the
+# device open. This hint is appended to the init/open error so the cause is
+# actionable rather than a bare error code.
+_ORCA_BUSY_HINT = (
+    "The ORCA can be opened by only one program at a time — close HCImage Live "
+    "(and any other instance of this app) completely, then try again. If it "
+    "stays locked after a crash, unplug/replug the camera USB or power-cycle it."
+)
 
 
 class OrcaWorker(QThread):
@@ -53,10 +66,26 @@ class OrcaWorker(QThread):
         self._is_running = True
         self._pending_params = None  # set by apply_params(), consumed in _run_live
         self._hw_roi_active = False  # True when DCAM subarray mode is ON
+        # Display-only auto-contrast (HCImage-style percentile stretch). Toggled
+        # live via set_auto_contrast() without a capture restart, since it only
+        # changes how frames are mapped to 8-bit for the preview.
+        self._auto_contrast = bool(params.get("auto_contrast", True))
 
     def apply_params(self, params):
         """Queue a parameter update; applied on the next live frame (live mode only)."""
         self._pending_params = params
+
+    def set_auto_contrast(self, on):
+        """Toggle display auto-contrast on the running live feed (no restart)."""
+        self._auto_contrast = bool(on)
+
+    def _scale_for_display(self, data):
+        """Map a raw 16-bit frame to 8-bit for the preview, honouring the
+        auto-contrast toggle. Never touches the data used for the saved stack /
+        DSI statistics — this is display only."""
+        if self._auto_contrast:
+            return autocontrast_8bit(data)
+        return scale_16bit_image(data)
 
     def run(self):
         if not DCAM_AVAILABLE:
@@ -70,12 +99,16 @@ class OrcaWorker(QThread):
         try:
             self.status_update.emit("Initializing ORCA DCAM API...")
             if not Dcamapi.init():
-                raise RuntimeError(f"Dcamapi.init() failed with error {Dcamapi.lasterr()}")
+                raise RuntimeError(
+                    f"Dcamapi.init() failed with error {Dcamapi.lasterr()}. "
+                    f"{_ORCA_BUSY_HINT}")
             _initialized = True
 
             dcam = Dcam(0)
             if not dcam.dev_open():
-                raise RuntimeError(f"dev_open() failed with error {dcam.lasterr()}")
+                raise RuntimeError(
+                    f"dev_open() failed with error {dcam.lasterr()}. "
+                    f"{_ORCA_BUSY_HINT}")
             _opened = True
 
             dcam.prop_setvalue(DCAM_EXPOSURE_PROP, exposure_time)
@@ -113,10 +146,19 @@ class OrcaWorker(QThread):
         Accepts an explicit params dict for live updates; falls back to self.params.
         """
         p = params if params is not None else self.params
+        # A live focus preview must free-run. The app never fires a software (or
+        # external) trigger, so if the selected trigger source is anything other
+        # than Internal the camera opens and cap_start() succeeds but every
+        # wait_capevent_frameready() times out — no frame is ever delivered and
+        # the feed stays on "ORCA Feed Offline". Force Internal for the live feed
+        # regardless of the acquisition trigger source the user picked.
+        trigger_source = p.get("trigger_source")
+        if self.mode == "live":
+            trigger_source = DCAM_TRIGGERSOURCE_INTERNAL
         settings = [
             ("Readout speed", DCAM_READOUTSPEED_PROP, p.get("readout_speed")),
             ("Binning", DCAM_BINNING_PROP, p.get("binning")),
-            ("Trigger source", DCAM_TRIGGERSOURCE_PROP, p.get("trigger_source")),
+            ("Trigger source", DCAM_TRIGGERSOURCE_PROP, trigger_source),
             ("Trigger mode", DCAM_TRIGGER_MODE_PROP, p.get("trigger_mode")),
             ("Defect correction", DCAM_DEFECTCORRECT_PROP, p.get("defect_correct")),
         ]
@@ -177,8 +219,12 @@ class OrcaWorker(QThread):
             if dcam.cap_start():
                 # Measured display framerate, reported ~twice a second so the
                 # real rate can be compared against the ROI prediction. This is
-                # the *display* rate; the live preview emit limits it, so the
-                # true camera throughput is what the acquisition reports below.
+                # the *display* rate; the true camera throughput is what the
+                # acquisition reports below. The preview is capped at the monitor
+                # refresh (PREVIEW_MAX_FPS) — drawing faster is wasted work — so at
+                # or below that cap it now tracks the real camera rate.
+                min_interval = 1.0 / PREVIEW_MAX_FPS if PREVIEW_MAX_FPS > 0 else 0.0
+                last_emit = 0.0
                 fps_count = 0
                 fps_t0 = time.perf_counter()
                 while self._is_running:
@@ -186,6 +232,7 @@ class OrcaWorker(QThread):
                         pending = self._pending_params
                         self._pending_params = None
                         self.params = pending  # keep ROI and other display settings current
+                        self._auto_contrast = bool(pending.get("auto_contrast", self._auto_contrast))
                         dcam.cap_stop()
                         dcam.buf_release()
                         buf_allocated = False
@@ -201,9 +248,19 @@ class OrcaWorker(QThread):
                         fps_t0 = time.perf_counter()
                         continue
                     if dcam.wait_capevent_frameready(100):
+                        # Cap the preview at the monitor refresh. When a frame is
+                        # ready but the last emit was under one interval ago, skip
+                        # it (the camera still captures it) without the heavy
+                        # read/scale/emit, sleeping briefly so the loop doesn't spin
+                        # a core waiting out the interval.
+                        now = time.perf_counter()
+                        if min_interval and now - last_emit < min_interval:
+                            time.sleep(0.002)
+                            continue
                         data = dcam.buf_getlastframedata()
                         if data is not False:
-                            img = scale_16bit_image(data)
+                            last_emit = now
+                            img = self._scale_for_display(data)
                             # Hardware subarray already delivers the cropped frame;
                             # only apply software crop when the camera rejected it.
                             if not self._hw_roi_active:
@@ -277,7 +334,7 @@ class OrcaWorker(QThread):
                         count += 1
                         if i % preview_every == 0:
                             self.status_update.emit(f"Acquiring speckle frame {i + 1}/{num_frames}...")
-                            self.image_ready.emit(scale_16bit_image(data))  # live preview
+                            self.image_ready.emit(self._scale_for_display(data))  # live preview
                     else:
                         raise RuntimeError(f"Frame timeout: {dcam.lasterr()}")
                 if capture_start is not None:

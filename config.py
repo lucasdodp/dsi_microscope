@@ -107,6 +107,26 @@ DCAM_TRIGGERSOURCE_OPTIONS = {
     "Software": 3.0,
     "Master Pulse": 4.0,
 }
+# Free-running trigger source. The app never fires software/external triggers, so
+# the live focus preview must use this or no frames are ever produced.
+DCAM_TRIGGERSOURCE_INTERNAL = 1.0
+
+# ---------------------------------------------------------------------------
+# Live preview performance (display only — never affects acquired data)
+# ---------------------------------------------------------------------------
+# The live focus preview is decoupled from acquisition: it shows the latest frame
+# and drops the rest, so these only tune how smooth the on-screen feed is.
+#   * PREVIEW_MAX_DISPLAY_EDGE — the preview frame is downscaled so its longer
+#     side is at most this many pixels before it is turned into a pixmap. A full
+#     2304-px ORCA frame repainted every tick caps the feed far below the camera
+#     rate; the display area is only ~1–1.5k px, so this looks identical but
+#     repaints much faster. Frames already at/below this (EVK4, small ROIs) are
+#     untouched.
+#   * PREVIEW_MAX_FPS — the live loop emits at most this many preview frames per
+#     second (there is no point drawing faster than the monitor refresh). The
+#     camera still captures, and the DSI acquisition still reads, at full rate.
+PREVIEW_MAX_DISPLAY_EDGE = int(os.environ.get("DSI_PREVIEW_MAX_EDGE", "1440"))
+PREVIEW_MAX_FPS = float(os.environ.get("DSI_PREVIEW_MAX_FPS", "60"))
 DCAM_TRIGGER_MODE_OPTIONS = {
     "Normal": 1.0,
     "Start": 6.0,

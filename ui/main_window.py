@@ -27,9 +27,9 @@ from config import (
     ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
     EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE, FOV_MATCH_PATH,
     ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
-    SESSION_STATE_PATH,
+    PREVIEW_MAX_DISPLAY_EDGE, SESSION_STATE_PATH,
 )
-from core import compose_registration_overlay, map_evk4_window_to_orca
+from core import compose_registration_overlay, downscale_for_display, map_evk4_window_to_orca
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
 from ui.fov_registration import FovRegistrationWorker
@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
         self._acq_start = None      # time.time() when the acquisition started
         self._acq_label = None      # QLabel to update with the elapsed time
         self._acq_restore = None    # callable that restores the estimate text
+        self._acq_total_lo = 0.0    # typical calibrated total for the running acq (remaining calc)
+        self._acq_total_hi = 0.0    # slow calibrated total for the running acq (remaining calc)
 
         # Whole-batch elapsed readout: while the queue runs, its status line also
         # ticks total elapsed + rough remaining time for the entire batch (the
@@ -626,18 +628,30 @@ class MainWindow(QMainWindow):
     # ----- live elapsed timer (ground truth during an acquisition) -----
     def _start_elapsed(self, label, restore):
         """Begin ticking 'Elapsed: mm:ss' in ``label``; ``restore`` is called on
-        stop to put the estimate back."""
+        stop to put the estimate back. The calibrated (typical, slow) total of the
+        acquisition just recorded in ``_begin_acq_record`` is captured here so the
+        readout can also show the rough time remaining."""
         self._acq_label = label
         self._acq_restore = restore
         self._acq_start = time.time()
+        rec = self._acq_record
+        if rec is not None and rec.get("predicted_s", 0) > 0:
+            self._acq_total_lo, self._acq_total_hi, _ = self._calibrate_range(
+                rec["predicted_s"], rec["type"])
+        else:
+            self._acq_total_lo = self._acq_total_hi = 0.0
         self._acq_timer.start()
         self._tick_elapsed()
 
     def _tick_elapsed(self):
         if self._acq_start is None or self._acq_label is None:
             return
-        m, s = divmod(int(time.time() - self._acq_start), 60)
-        self._acq_label.setText(f"Elapsed: {m:02d}:{s:02d}")
+        elapsed = time.time() - self._acq_start
+        m, s = divmod(int(elapsed), 60)
+        text = f"Elapsed: {m:02d}:{s:02d}"
+        text += self._fmt_remaining(self._acq_total_lo - elapsed,
+                                    self._acq_total_hi - elapsed)
+        self._acq_label.setText(text)
 
     def _stop_elapsed(self):
         """Stop the elapsed timer, record/save the real elapsed time, and restore
@@ -1014,6 +1028,7 @@ class MainWindow(QMainWindow):
             "focus": self.pi_stage_widget.spin_focus.value(),
             "step_size": self.pi_stage_widget.spin_step_size.value(),
             "steps": self.pi_stage_widget.spin_steps.value(),
+            "start_mode": self.pi_stage_widget.start_mode(),
         }
 
     # ==========================
@@ -1086,6 +1101,9 @@ class MainWindow(QMainWindow):
         self.orca_params.btn_apply_live.setEnabled(True)
         self.orca_params.btn_apply_live.clicked.connect(self._apply_orca_params_live)
         self.orca_params.roi_changed.connect(self._apply_orca_roi_live)
+        # Auto-contrast is display-only, so it applies to the running feed
+        # instantly (no capture restart, unlike the other settings).
+        self.orca_params.chk_auto_contrast.toggled.connect(self._apply_orca_autocontrast_live)
 
         self._refresh_buttons()
         self._sync_both_live_button()
@@ -1119,6 +1137,15 @@ class MainWindow(QMainWindow):
             self.orca_params.roi_changed.disconnect(self._apply_orca_roi_live)
         except (RuntimeError, TypeError):
             pass
+        try:
+            self.orca_params.chk_auto_contrast.toggled.disconnect(self._apply_orca_autocontrast_live)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _apply_orca_autocontrast_live(self, on):
+        """Toggle display auto-contrast on the running ORCA live feed in real time."""
+        if self.orca_worker is not None and self.orca_worker.isRunning():
+            self.orca_worker.set_auto_contrast(on)
 
     def _apply_orca_params_live(self):
         """Apply ALL ORCA settings to the live feed — triggered by the Apply button."""
@@ -1852,9 +1879,17 @@ class MainWindow(QMainWindow):
 
     def _render_to_label(self, label, cv_img):
         """Render a NumPy frame into a feed label, scaled with KeepAspectRatio."""
+        # The full-resolution frame's real dimensions drive the crop overlay's
+        # widget<->sensor pixel mapping, so capture them BEFORE any display
+        # downscale (the drawn ROI must stay in full-sensor pixels).
+        src_h, src_w = cv_img.shape[:2]
+        # Downscale big frames for display only: repainting a full 2304² pixmap on
+        # the GUI thread is what caps the preview below the camera rate. The stored
+        # frame (self._orca_frame / crop / FOV matching) stays full-resolution; only
+        # this on-screen pixmap shrinks, and it shows the identical field of view.
         # PyQt6 requires bytes, not memoryview; ascontiguousarray packs the
-        # ROI-cropped slice before tobytes() serialises it row-by-row.
-        img = np.ascontiguousarray(cv_img)
+        # (possibly resized / ROI-cropped slice) before tobytes() serialises it.
+        img = np.ascontiguousarray(downscale_for_display(cv_img, PREVIEW_MAX_DISPLAY_EDGE))
         # Keep the pixel buffer in a *named* local: a QImage built on a buffer does
         # not own it, and QPixmap.fromImage copies only on the next line. If the
         # buffer were an unnamed temporary (``QImage(img.tobytes(), …)``) it could
@@ -1869,11 +1904,11 @@ class MainWindow(QMainWindow):
             qt_img = QImage(buf, w, h, w, QImage.Format.Format_Grayscale8)
 
         pixmap = QPixmap.fromImage(qt_img)  # copies now, while ``buf`` is still alive
-        # Let the crop overlay map widget <-> image pixels for this frame size.
-        label.set_source_size(w, h)
-        # Hand the full-resolution pixmap to the label, which scales it to fit and
-        # re-scales on resize — so switching tabs / Display mode never leaves a
-        # stale, wrongly-sized frame.
+        # Report the FULL-resolution source size so the crop overlay still maps the
+        # drawn rectangle to sensor pixels regardless of the display downscale.
+        label.set_source_size(src_w, src_h)
+        # Hand the pixmap to the label, which scales it to fit and re-scales on
+        # resize — so switching tabs / Display mode never leaves a stale frame.
         label.set_frame_pixmap(pixmap)
 
     @pyqtSlot(np.ndarray)

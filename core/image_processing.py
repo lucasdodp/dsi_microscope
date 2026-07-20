@@ -787,6 +787,60 @@ def scale_16bit_image(data):
     return (data / 256).astype(np.uint8)
 
 
+def downscale_for_display(image, max_edge):
+    """Shrink a display image so its longer side is at most ``max_edge`` px.
+
+    Returns the image unchanged when it already fits (so the EVK4's 1280-px frame
+    and any cropped ROI are untouched). Repainting a full 2304×2304 ORCA frame as
+    a pixmap on the GUI thread is what caps the live preview well below the camera
+    rate; the on-screen display area is only ~1–1.5k px wide, so a frame shrunk to
+    ``max_edge`` looks identical but builds and repaints several times faster.
+
+    Display-only: never call this on data destined for saving or DSI analysis —
+    it is purely for the live preview. ``INTER_AREA`` is the right filter for
+    downscaling (clean, no aliasing). Works for grayscale (H, W) and colour
+    (H, W, C) frames alike, so it serves both the ORCA and EVK4 previews.
+    """
+    h, w = image.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_edge:
+        return image
+    scale = max_edge / float(long_edge)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def autocontrast_8bit(data, low_pct=0.5, high_pct=99.5):
+    """Percentile contrast-stretch a camera frame to 8-bit for display.
+
+    This is the *display-only* equivalent of the "correct contrast automatically"
+    button in HCImage Live: the pixel range between the ``low_pct`` and ``high_pct``
+    intensity percentiles is stretched across the full 0–255 range, so faint
+    signal on a dim sensor becomes visible instead of collapsing into the bottom
+    few codes of a fixed 16→8-bit down-shift (:func:`scale_16bit_image`). Clipping
+    a small fraction at each end (rather than min–max normalising) keeps a single
+    hot pixel or dead pixel from flattening the whole image.
+
+    It is used for the live preview / acquisition preview only — the raw stack and
+    all DSI statistics still run on the untouched camera data, so nothing about the
+    saved science changes.
+
+    The percentiles are computed on a strided subsample of the frame (every 4th
+    pixel in each axis) so this stays cheap enough to run on every live frame at
+    full sensor without capping the display rate.
+    """
+    arr = np.asarray(data)
+    sample = arr[::4, ::4].astype(np.float32, copy=False)
+    lo, hi = np.percentile(sample, [low_pct, high_pct])
+    if hi <= lo:  # flat / degenerate frame — fall back to the true min/max
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi <= lo:
+            return np.zeros(arr.shape, dtype=np.uint8)
+    scaled = (arr.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Prophesee EVK4 — event accumulation & 2D image post-processing
 # ---------------------------------------------------------------------------
