@@ -5,7 +5,9 @@
       "Bash(QT_QPA_PLATFORM=offscreen python -c ' *)",
       "PowerShell(pip show h5py 2>&1)",
       "PowerShell(pip install h5py 2>&1)",
-      "Read(//d/2026-07-08/linearity_analysis/**)"
+      "Read(//d/2026-07-08/linearity_analysis/**)",
+      "Bash(python -)",
+      "Bash(PYTHONIOENCODING=utf-8 python test_axial_gui.py)"
     ]
   }
 }

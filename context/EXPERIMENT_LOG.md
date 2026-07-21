@@ -26,6 +26,29 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-20 — Biases in physical units (Hz): temporal spectrum of the event stream (re-analysis of 07-15/16)
+
+**Conditions**
+- No new acquisition. Re-analysis of the 07-15 (1500/2500 Hz) and 07-16 (500 Hz) `bias_fo × bias_hpf` sweeps, using the per-plane decoded event lists (`raw_files/*_events_zNNN_xytp.mat`, fields `x/y/p/t`) that the earlier scalar-proxy analysis ignored. 07-17 is raw-only (no `_xytp.mat`) and the Metavision SDK is not installed here, so it is out of scope.
+
+**Data treatment**
+- For each cell's **focal plane** (max `mean_intensity` in the axial CSV), binned the whole-sensor event rate at 25 µs (40 kHz) and computed its temporal PSD (Welch) and the autocorrelation envelope of the 2f-bandpassed rate. Sampled the "cross" of the grid: `fo=15` column across all `hpf` + `hpf=0` row across all `fo`, per frequency.
+- Metrics per cell: peak frequency, coherent-line/broadband-floor ratio, and a coherent-fraction (envelope plateau over lag 2–5 ms). A single-exponential `τ_c` was deliberately **not** reported — the envelope plateaus, so a fit reads the band-pass transient, not decorrelation.
+
+**Results**
+- **Result 1 (headline) — event rate is periodic at exactly 2·f_AWG.** Sharp PSD line at 1001 / 2998 / 5000 Hz for 500 / 1500 / 2500 Hz drive (slope 2.00, every cell with a detectable line). The square wave reconfigures the speckle **twice per cycle**, so the sensor sees 2·f_AWG. This maps the AWG dial to a real temporal frequency, from the event timing alone.
+- **Result 2 — `bias_hpf` is a high-pass whose corner rises with the bias value.** Across frequencies, the 1000 Hz line (500 Hz drive) is extinguished at a *lower* `bias_hpf` than the 3000 Hz line (1500 Hz drive) — signature of a corner sweeping upward; between `bias_hpf ≈ 75` and `≈ 120` it crosses ~1–3 kHz. This is the physical-units explanation of the 07-16 result (why `hpf=100` kills 500 Hz but not 1500/2500 Hz). **Caveat:** raising `hpf` also starves the event count, so "line gone" vs "all events gone" can't be fully separated → reported as a bracket, not a calibration curve. 2500 Hz is starvation-confounded (weak intrinsic line) and flagged, not used, as a corner point; the 500-vs-1500 pair is the clean comparison.
+- **Result 3 — speckle temporal coherence falls off above ~1500 Hz.** Coherent fraction (2f-bandpassed autocorrelation plateau) ≈ 0.61 / 0.46 / 0.04 for 500 / 1500 / 2500 Hz; at 2500 Hz the envelope collapses within ~1 ms. The LC can't follow a 2500 Hz square drive cleanly — a direct-in-time decorrelation measurement (closes the 07-07 "measure it directly" note) and a plausible mechanism for the 07-07 yield drop above 1500 Hz. Note coherence ≠ yield.
+- **Result 4 (secondary) — `bias_fo` is a weak low-pass:** higher `fo` raises the high-frequency broadband floor; `fo=-35` lowest. Small effect, as on every prior day.
+- **Artefact:** a 90–110 Hz double peak in every spectrum, independent of the drive — most likely 100 Hz full-wave mains ripple (50 Hz line) on the laser/LC driver, or slow LC drift. Confirm with a shutter-closed dark run.
+
+**Main files generated** (in `D:\2026-07-20\temporal_spectrum_analysis\`)
+- `analyze_temporal_spectrum.py`, `README.md`
+- `fig1_event_rate_is_2x_awg.png` (primary), `fig2_hpf_highpass_corner.png`, `fig3_speckle_coherence.png`, `fig4_bias_fo_lowpass.png`
+- `temporal_spectrum_results.csv` (per-cell peak_hz / line_floor / coh_frac / n_events)
+
+---
+
 ## 2026-07-17 — bias_on × bias_off sweep: **USB2 corrupted the data**, and what the biases actually do
 
 **Conditions**
