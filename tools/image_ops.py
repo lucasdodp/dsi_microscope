@@ -55,6 +55,11 @@ views stop smearing), and projections through z — MIP, mean, std, extended
 depth of field, and depth-colour-coding (hue = z, intensity = signal), which
 turns a whole volume into one figure that shows off the optical sectioning.
 
+*3-D rendering:* an isotropic-voxel working volume (``build_view_volume``) and a
+shear-warp projector (``render_volume``) that turns a z-stack into a rotatable
+volume with no GPU and no extra dependency — see the section comment above
+``plan_view_volume`` for why it is factored that way.
+
 --------------------------------------------------------------------------
 The ImageJ auto-B&C algorithm (stage 8, "Auto")
 --------------------------------------------------------------------------
@@ -580,6 +585,348 @@ def orthogonal_views(slices, z_step_um=None, um_per_px=None):
             yz = cv2.resize(yz, (max(1, int(round(nz * factor))), h),
                             interpolation=cv2.INTER_LINEAR)
     return xz, yz
+
+
+# --- 3-D volume rendering ---------------------------------------------------
+# A DSI z-stack is already a 3-D image: the sectioning is what makes the volume
+# meaningful, so nothing has to be *reconstructed* — only resampled onto an
+# isotropic grid and projected from an arbitrary angle.
+#
+# The renderer is a **shear-warp** maximum-intensity projector, chosen so that
+# rotating stays interactive with no GPU and no new dependency. Resampling the
+# whole volume into camera space for every frame (``ndimage.affine_transform``)
+# costs one 3-D interpolation per rendered pixel; shear-warp instead factors the
+# view into
+#
+#     (a) a per-slice **translation** — because rays advance by a constant
+#         in-plane step per slice once the volume is permuted so the axis most
+#         parallel to the view direction comes first, and
+#     (b) one final 2-D **affine warp** of the accumulated image.
+#
+# So the per-frame cost is N 2-D ``cv2.warpAffine`` calls (SIMD, milliseconds)
+# instead of a 3-D resampling. The factorization is exact for MIP and for
+# front-to-back alpha compositing alike, because both are evaluated along the
+# rays, and MIP additionally does not care about the foreshortening the warp
+# corrects (``max`` is scale-free, unlike a sum).
+#
+# Depth is carried alongside the intensity and coloured with the *same* hue ramp
+# as :func:`depth_colour_code`, so ``depth_colour_legend`` is a valid legend for
+# a 3-D view too, and a bead's colour means the same thing in both. Hue is keyed
+# to the bead's position in the **sample**, not its distance from the camera, so
+# the colours do not change as the volume is rotated.
+def plan_view_volume(n_planes, plane_shape, z_step_um, um_per_px, max_dim=256):
+    """Geometry of the isotropic working volume: ``(voxel_um, (nz, ny, nx))``.
+
+    Rendering needs cubic voxels, but the acquired ones are wildly anisotropic
+    (0.1625 um laterally against a 0.2-1 um z step, and an axial *resolution* of
+    2-4 um). The grid is therefore sized by physical extent, at whatever voxel
+    size keeps the longest axis within ``max_dim`` — which bounds the volume at
+    ``max_dim**3`` voxels regardless of how big the stack is.
+
+    Over a full 2304-px field that voxel lands near 1.5 um, which throws away
+    lateral detail but is still finer than the axial resolution: the *axial*
+    sampling, the one that costs sectioning, survives. Crop the field first when
+    lateral detail matters.
+    """
+    h, w = int(plane_shape[0]), int(plane_shape[1])
+    um_per_px = float(um_per_px) if um_per_px and um_per_px > 0 else 1.0
+    z_step_um = float(z_step_um) if z_step_um and z_step_um > 0 else um_per_px
+    n_planes = max(1, int(n_planes))
+    # World order here is (x, y, z); the array stays (z, y, x).
+    extent = (n_planes * z_step_um, h * um_per_px, w * um_per_px)
+    voxel = max(max(extent) / float(max(8, int(max_dim))), 1e-9)
+    shape = tuple(max(2, int(round(e / voxel))) for e in extent)
+    return voxel, shape
+
+
+def _resample_axis0(stack, nz):
+    """Resample a (Z, H, W) stack to ``nz`` planes.
+
+    Downsampling takes the **maximum** over each output plane's source range,
+    not the mean: beads are sparse, and averaging a bead in with the empty
+    planes around it dims exactly the structure the view exists to show. (The
+    projection downstream is a max anyway, so this is consistent.) Upsampling is
+    linear.
+    """
+    n = int(stack.shape[0])
+    nz = max(1, int(nz))
+    if nz == n:
+        return stack
+    if nz < n:
+        edges = np.linspace(0, n, nz + 1)
+        out = np.empty((nz,) + stack.shape[1:], np.float32)
+        for k in range(nz):
+            lo = int(np.floor(edges[k]))
+            hi = max(lo + 1, int(np.ceil(edges[k + 1])))
+            out[k] = stack[lo:hi].max(axis=0)
+        return out
+    pos = np.linspace(0, n - 1, nz)
+    lo = np.floor(pos).astype(np.intp)
+    hi = np.minimum(lo + 1, n - 1)
+    frac = (pos - lo).astype(np.float32)[:, None, None]
+    return (stack[lo] * (1.0 - frac) + stack[hi] * frac).astype(np.float32)
+
+
+def build_view_volume(get_slice, n_planes, z_step_um, um_per_px,
+                      max_dim=256, status=None):
+    """Build the isotropic render volume. Returns ``(vol, voxel_um)``.
+
+    ``get_slice(i)`` returns processed plane ``i`` as a 2-D array. Each plane is
+    shrunk to the working grid **as it arrives** and then dropped, so peak
+    memory is the working volume plus one full-size plane — never the whole
+    processed stack (which is gigabytes at full sensor).
+    """
+    first = np.asarray(get_slice(0), dtype=np.float32)
+    voxel, (nz, ny, nx) = plan_view_volume(n_planes, first.shape,
+                                           z_step_um, um_per_px, max_dim)
+    stack = np.empty((n_planes, ny, nx), np.float32)
+    shrinking = nx < first.shape[1] or ny < first.shape[0]
+    interp = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+    for i in range(n_planes):
+        plane = first if i == 0 else np.asarray(get_slice(i), dtype=np.float32)
+        stack[i] = cv2.resize(plane, (nx, ny), interpolation=interp)
+        if status is not None and (i % 4 == 0 or i == n_planes - 1):
+            status(f"Building 3-D volume… plane {i + 1}/{n_planes}")
+    return _resample_axis0(stack, nz), voxel
+
+
+def volume_display_range(vol, low_pct=1.0, high_pct=99.9):
+    """Auto black/white points for a render volume, from a subsample."""
+    step = max(1, vol.shape[0] // 64)
+    lo, hi = np.percentile(vol[::step, ::4, ::4], [low_pct, high_pct])
+    if hi <= lo:
+        hi = lo + 1.0
+    return float(lo), float(hi)
+
+
+def view_rotation(azimuth_deg, elevation_deg):
+    """World->camera rotation for the volume view (world order x, y, z).
+
+    Camera axes are (u right, v down, w into the screen), matching image
+    convention, so azimuth 0 / elevation 0 looks straight down z and reproduces
+    the familiar top-down MIP.
+    """
+    az, el = np.radians(float(azimuth_deg)), np.radians(float(elevation_deg))
+    ca, sa = np.cos(az), np.sin(az)
+    ce, se = np.cos(el), np.sin(el)
+    r_y = np.array([[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]])
+    r_x = np.array([[1.0, 0.0, 0.0], [0.0, ce, -se], [0.0, se, ce]])
+    return r_x @ r_y
+
+
+def project_volume_points(points_xyz, rotation, vol_shape, zoom, out_shape):
+    """Project world points (x, y, z voxel indices) to (col, row) pixels.
+
+    The projection is orthographic and isotropic, so this is the exact inverse
+    of what :func:`render_volume` draws — overlays land on the structure.
+    """
+    nz, ny, nx = vol_shape
+    centre = (np.array([nx, ny, nz], dtype=np.float64) - 1.0) / 2.0
+    uv = (np.asarray(points_xyz, dtype=np.float64) - centre) @ np.asarray(rotation)[:2].T
+    uv *= float(zoom)
+    uv[:, 0] += out_shape[1] / 2.0
+    uv[:, 1] += out_shape[0] / 2.0
+    return uv
+
+
+_BOX_EDGES = ((0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4),
+              (0, 4), (1, 5), (2, 6), (3, 7))
+
+
+def _box_corners(x0, x1, y0, y1, z0, z1):
+    return np.array([[x, y, z] for x in (x0, x1) for y in (y0, y1)
+                     for z in (z0, z1)], dtype=np.float64)
+
+
+def draw_volume_box(view, rotation, vol_shape, zoom, z_range=None,
+                    labels=True):
+    """Draw the volume's wireframe (and the active slab) onto a BGR view.
+
+    A projected box is the cheapest strong depth cue there is: without it an
+    orthographic MIP of sparse beads gives the eye nothing to read the rotation
+    against, and the structure looks flat no matter how far it is turned.
+    """
+    nz, ny, nx = vol_shape
+    out = view
+
+    def draw(corners, colour, thickness):
+        pts = project_volume_points(corners, rotation, vol_shape, zoom, out.shape)
+        for i, j in _BOX_EDGES:
+            p0 = (int(round(pts[i, 0])), int(round(pts[i, 1])))
+            p1 = (int(round(pts[j, 0])), int(round(pts[j, 1])))
+            cv2.line(out, p0, p1, colour, thickness, cv2.LINE_AA)
+        return pts
+
+    corners = draw(_box_corners(0, nx - 1, 0, ny - 1, 0, nz - 1), (70, 70, 70), 1)
+    if z_range is not None:
+        z0, z1 = int(z_range[0]), int(z_range[1]) - 1
+        if not (z0 <= 0 and z1 >= nz - 1):
+            draw(_box_corners(0, nx - 1, 0, ny - 1, z0, z1), (0, 190, 190), 1)
+    if labels:
+        # Axis names at the far end of the three edges leaving corner (0,0,0).
+        ends = project_volume_points(
+            np.array([[nx - 1, 0, 0], [0, ny - 1, 0], [0, 0, nz - 1]], float),
+            rotation, vol_shape, zoom, out.shape)
+        for (name, pt) in zip(("x", "y", "z"), ends):
+            cv2.putText(out, name, (int(pt[0]) + 4, int(pt[1]) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1,
+                        cv2.LINE_AA)
+    return out
+
+
+def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
+                  display_range=(0.0, 1.0), threshold=0.0, opacity=0.5,
+                  colour_by_depth=True, zoom=1.0, margin=1.08):
+    """Project an isotropic volume from an arbitrary angle. Returns BGR uint8.
+
+    ``mode``
+        ``mip``   — maximum intensity along each ray. The honest choice for
+                    sparse beads: nothing occludes anything, so no bead can be
+                    hidden by one in front of it.
+        ``solid`` — front-to-back alpha compositing. Beads *do* occlude each
+                    other, which is the strongest depth cue available, at the
+                    cost of hiding faint structure behind bright structure.
+    ``z_range``
+        ``(z0, z1)`` slab in volume planes — the "scroll through the stack"
+        control. The slab is cropped from the volume but is still projected
+        about the **whole** volume's centre, so it stays at its true position in
+        the frame instead of re-centring as it is scrolled.
+    ``stride``
+        Render from every n-th voxel and scale the result back up. The output
+        is the same size and geometry either way, which is what lets a fast
+        draft be swapped for a full-quality frame without the view jumping.
+    """
+    vol = np.asarray(vol, dtype=np.float32)
+    nz, ny, nx = vol.shape
+    stride = max(1, int(stride))
+    rotation = np.asarray(rotation, dtype=np.float64)
+
+    z0, z1 = (0, nz) if z_range is None else (int(z_range[0]), int(z_range[1]))
+    z0 = int(np.clip(z0, 0, nz - 1))
+    z1 = int(np.clip(z1, z0 + 1, nz))
+
+    # Strided grid: indices 0, stride, 2*stride, ... of the original volume.
+    zs = np.arange(0, nz, stride)
+    k0 = int(np.searchsorted(zs, z0, "left"))
+    k1 = max(int(np.searchsorted(zs, z1, "left")), k0 + 1)
+    sub = vol[zs[k0]:zs[k1 - 1] + 1:stride, ::stride, ::stride]
+
+    # World sizes / origin / centre, all in strided voxels, world order (x,y,z).
+    # The centre is the *original* volume's centre expressed in strided units,
+    # not the strided array's own middle: the two differ by up to half a stride,
+    # which would shift the draft frame against the full-quality one.
+    extent = (np.array([nx, ny, nz], dtype=np.float64) - 1.0) / stride
+    centre = extent / 2.0
+    origin = np.array([0.0, 0.0, float(k0)])
+    off = origin - centre
+
+    # --- shear: permute so the axis most parallel to the view comes first ---
+    view_dir = rotation[2]
+    c = int(np.argmax(np.abs(view_dir)))
+    a, b = [i for i in (0, 1, 2) if i != c]
+    perm = np.transpose(sub, (2 - c, 2 - a, 2 - b))   # array axis of world i is 2-i
+    n_c, n_a, n_b = perm.shape
+
+    ks = np.arange(n_c, dtype=np.float64)
+    t_a = off[a] - (off[c] + ks) * (view_dir[a] / view_dir[c])
+    t_b = off[b] - (off[c] + ks) * (view_dir[b] / view_dir[c])
+    p0, q0 = -t_a.min(), -t_b.min()
+    h_i = int(np.ceil(t_a.max() - t_a.min())) + n_a + 2
+    w_i = int(np.ceil(t_b.max() - t_b.min())) + n_b + 2
+
+    lo, hi = float(display_range[0]), float(display_range[1])
+    span = max(hi - lo, EPS)
+    thr = float(np.clip(threshold, 0.0, 0.999))
+    cut = lo + thr * span
+    solid = (mode == "solid")
+
+    acc = np.zeros((h_i, w_i), np.float32)
+    dep = np.zeros((h_i, w_i), np.float32) if colour_by_depth else None
+    alpha = np.zeros((h_i, w_i), np.float32) if solid else None
+    rows = np.arange(h_i, dtype=np.float32)[:, None]
+    cols = np.arange(w_i, dtype=np.float32)[None, :]
+
+    # Front-to-back: w increases with k when the view direction and the
+    # principal axis point the same way. Only alpha compositing cares, but the
+    # order is free, so both modes use it.
+    order = range(n_c) if view_dir[c] > 0 else range(n_c - 1, -1, -1)
+    # Sparse volumes are mostly empty: skipping planes with nothing above the
+    # black point is what keeps a big slab interactive.
+    plane_max = perm.max(axis=(1, 2))
+
+    for k in order:
+        if plane_max[k] <= cut:
+            continue
+        shift = np.array([[1.0, 0.0, t_b[k] + q0], [0.0, 1.0, t_a[k] + p0]],
+                         dtype=np.float32)
+        warped = cv2.warpAffine(perm[k], shift, (w_i, h_i),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        if dep is not None:
+            # The source z of every pixel is analytic — the slice was only
+            # translated, so a z ramp stays a ramp and needs no second warp.
+            if c == 2:
+                z_src = np.float32(k0 + k)
+            elif a == 2:
+                z_src = rows - np.float32(t_a[k] + p0 - k0)
+            else:
+                z_src = cols - np.float32(t_b[k] + q0 - k0)
+        if solid:
+            val = np.clip((warped - cut) / (span * (1.0 - thr)), 0.0, 1.0)
+            contrib = (1.0 - alpha) * val * float(opacity)
+            acc += contrib * val
+            alpha += contrib
+            if dep is not None:
+                dep += contrib * z_src
+        else:
+            upd = warped > acc
+            if upd.any():
+                acc[upd] = warped[upd]
+                if dep is not None:
+                    dep[upd] = np.broadcast_to(z_src, acc.shape)[upd]
+
+    if solid:
+        intensity = np.clip(acc / max(float(acc.max()), EPS), 0.0, 1.0)
+        if dep is not None:
+            dep = dep / np.maximum(alpha, EPS)
+    else:
+        intensity = np.clip((acc - cut) / (span * (1.0 - thr)), 0.0, 1.0)
+
+    # --- warp: one 2-D affine takes the sheared image to the screen ---------
+    mat2 = float(zoom) * np.array([[rotation[0, a], rotation[0, b]],
+                                   [rotation[1, a], rotation[1, b]]])
+    # Frame the *whole* volume (not the slab) so scrolling the slab does not
+    # make the picture jump. Sized in final pixels first, then divided down by
+    # the stride, so every stride yields the identical output size.
+    box = (_box_corners(0, extent[0], 0, extent[1], 0, extent[2])
+           - centre) @ rotation[:2].T * float(zoom) * stride
+    w_out = int(np.ceil((box[:, 0].max() - box[:, 0].min()) * margin)) + 8
+    h_out = int(np.ceil((box[:, 1].max() - box[:, 1].min()) * margin)) + 8
+    w_o, h_o = -(-w_out // stride), -(-h_out // stride)
+    cx = w_o / 2.0 - (mat2[0, 0] * p0 + mat2[0, 1] * q0)
+    cy = h_o / 2.0 - (mat2[1, 0] * p0 + mat2[1, 1] * q0)
+    # warpAffine reads (x=col=q, y=row=p), hence the swapped columns.
+    warp = np.array([[mat2[0, 1], mat2[0, 0], cx],
+                     [mat2[1, 1], mat2[1, 0], cy]], dtype=np.float32)
+    intensity = cv2.warpAffine(intensity, warp, (w_o, h_o),
+                               flags=cv2.INTER_LINEAR)
+    if dep is not None:
+        dep = cv2.warpAffine(dep, warp, (w_o, h_o), flags=cv2.INTER_NEAREST)
+
+    if dep is not None:
+        # Same hue ramp as depth_colour_code, so depth_colour_legend applies.
+        hue = np.clip(dep * stride * (179.0 / max(1, nz - 1)), 0, 179)
+        hsv = np.zeros((h_o, w_o, 3), np.uint8)
+        hsv[..., 0] = hue.astype(np.uint8)
+        hsv[..., 1] = 255
+        hsv[..., 2] = (intensity * 255).astype(np.uint8)
+        out = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    else:
+        out = cv2.cvtColor((intensity * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+    if (w_o, h_o) != (w_out, h_out):
+        out = cv2.resize(out, (w_out, h_out), interpolation=cv2.INTER_LINEAR)
+    return out
 
 
 # --- axial (Z) matching between two cameras --------------------------------

@@ -41,13 +41,37 @@ dataset from an unchanged optical setup can be cropped and overlaid immediately.
 *Save / Load match to file* writes the same record next to the data, so a match
 travels with the dataset. Re-measure only when the cameras have actually moved.
 
-For the per-stage description of the processing pipeline itself, see
-``tools/image_ops.py``.
+--------------------------------------------------------------------------
+The 3-D volume view
+--------------------------------------------------------------------------
+*Stack tools -> Open 3-D volume view* turns the active channel's z-stack into
+an interactive volume: **drag to rotate**, wheel to zoom, **Shift+wheel to
+scroll a slab** through the depth. Nothing is *reconstructed* — a DSI stack is
+already a 3-D image, because the optical sectioning is what makes each plane
+belong to one depth. The view only resamples it onto **cubic voxels** (using
+the channel's Z step and pixel size, so the shape is geometrically true rather
+than stretched by the z step) and projects it from the chosen angle.
+
+Beads read as three-dimensional through three cues: parallax while rotating,
+**hue keyed to depth in the sample** — the same ramp as the 2-D depth-coded
+projection, and rotation-invariant, so a bead keeps its colour as the volume
+turns — and the projected **wireframe box**, without which an orthographic
+projection of sparse beads gives the eye nothing to judge the rotation against.
+*Solid* mode swaps the max-intensity projection for front-to-back compositing,
+so nearer beads occlude further ones.
+
+Be aware of what the optics allow: the axial resolution is the DSI sectioning
+FWHM (2-4 um) against a ~0.16 um lateral pixel, so every bead is genuinely
+elongated in z. That is physics, not a rendering artifact.
+
+For the per-stage description of the processing pipeline itself — and for how
+the renderer works — see ``tools/image_ops.py``.
 """
 
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,12 +79,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 import tifffile
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -81,14 +106,17 @@ from PyQt6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.image_ops import (  # noqa: E402 — needs the sys.path line above
+    EPS,
     LUT_NAMES,
     Frame,
     apply_display_range,
     axial_profile,
     axial_profile_peakedness,
+    build_view_volume,
     depth_colour_code,
     depth_colour_legend,
     draw_scale_bar,
+    draw_volume_box,
     find_axial_offset,
     find_axial_offset_by_images,
     hot_pixel_mask_from_dark,
@@ -103,9 +131,12 @@ from tools.image_ops import (  # noqa: E402 — needs the sys.path line above
     read_axial_profile_csv,
     register_stack,
     render_display,
+    render_volume,
     resample_stack_z,
     save_axial_comparison,
     scan_paths,
+    view_rotation,
+    volume_display_range,
 )
 
 # The measured EVK4->ORCA registration lives in the main application. Import it
@@ -444,6 +475,414 @@ def _group(title, rows):
     return box
 
 
+# ===========================================================================
+# 3-D volume view
+# ===========================================================================
+class _Cancelled(Exception):
+    """Raised out of a per-plane callback when the user cancels a long build."""
+
+
+class VolumeCanvas(QLabel):
+    """The 3-D view's drawing surface: drag to rotate, wheel to zoom.
+
+    Reports gestures as deltas and holds no state, so the dialog stays the
+    single owner of the camera.
+    """
+
+    rotated = pyqtSignal(float, float)
+    zoomed = pyqtSignal(int)
+    slabbed = pyqtSignal(int)
+    drag_finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(520, 480)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background:#101010;")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._last = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._last = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._last is None:
+            return
+        pos = event.position()
+        self.rotated.emit(pos.x() - self._last.x(), pos.y() - self._last.y())
+        self._last = pos
+
+    def mouseReleaseEvent(self, event):
+        if self._last is not None:
+            self._last = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.drag_finished.emit()
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120.0
+        # Shift+wheel scrolls the slab through the stack — the 3-D equivalent of
+        # scrolling the slice slider in the 2-D view.
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.slabbed.emit(int(np.sign(steps)))
+        else:
+            self.zoomed.emit(int(np.sign(steps)))
+
+
+class VolumeView(QDialog):
+    """Interactive 3-D view of one channel's z-stack.
+
+    The stack is already a 3-D image — DSI's optical sectioning is what makes
+    each plane belong to one depth — so this only resamples it onto an isotropic
+    grid once and then projects it from whatever angle the user drags to.
+
+    Two things make sparse beads read as *3-D* rather than as a flat smear:
+    hue keyed to depth in the sample (rotation-invariant, so a bead keeps its
+    colour as the volume turns) and the projected wireframe box, which gives the
+    eye a reference to judge the rotation against. The slab controls scroll a
+    sub-range of the stack while it stays at its true position in the frame.
+
+    Rendering is progressive: a half-resolution draft follows the mouse during a
+    drag and a full-quality frame replaces it once the drag stops, so rotation
+    stays smooth on volumes where a full frame takes a fraction of a second.
+    """
+
+    DETAIL = (("Fast (128)", 128), ("Balanced (256)", 256), ("Fine (384)", 384))
+
+    def __init__(self, parent, channel, builder, max_dim=256):
+        super().__init__(parent)
+        self.setWindowTitle(f"3-D volume — channel {channel.name}")
+        self.resize(1180, 820)
+        self.setWindowFlag(Qt.WindowType.Window, True)   # modeless, own taskbar entry
+
+        self.channel = channel
+        self._builder = builder
+        self.vol = None
+        self.voxel_um = 1.0
+        self.range = (0.0, 1.0)
+        self.azimuth, self.elevation = 32.0, 24.0
+        self.zoom = 1.0
+        self._buf = None
+        self._dragging = False
+
+        self.canvas = VolumeCanvas()
+        self.canvas.rotated.connect(self._on_rotate)
+        self.canvas.zoomed.connect(self._on_zoom)
+        self.canvas.slabbed.connect(self._on_slab_wheel)
+        self.canvas.drag_finished.connect(self._on_drag_finished)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:#9c9;")
+        self.status.setWordWrap(True)
+
+        # Full-quality re-render after a gesture settles.
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(120)
+        self._settle.timeout.connect(lambda: self._render(draft=False))
+
+        panel = QVBoxLayout()
+        panel.addWidget(self._build_view_group())
+        panel.addWidget(self._build_slab_group())
+        panel.addWidget(self._build_look_group())
+        panel.addStretch(1)
+        panel.addWidget(self.status)
+
+        side = QWidget()
+        side.setLayout(panel)
+        side.setFixedWidth(330)
+        root = QHBoxLayout(self)
+        root.addWidget(self.canvas, 1)
+        root.addWidget(side)
+
+        self._detail_index = next((i for i, (_, d) in enumerate(self.DETAIL)
+                                   if d == max_dim), 1)
+        self.detail.setCurrentIndex(self._detail_index)
+        self.rebuild()
+
+    # -- controls ------------------------------------------------------
+    def _build_view_group(self):
+        row = QHBoxLayout()
+        for text, (az, el) in (("Top", (0, 0)), ("Front", (0, 90)),
+                               ("Side", (90, 0)), ("Iso", (32, 24))):
+            b = QPushButton(text)
+            b.setToolTip(f"azimuth {az}°, elevation {el}°")
+            b.clicked.connect(lambda _, a=az, e=el: self._set_view(a, e))
+            row.addWidget(b)
+
+        self.az_slider = QSlider(Qt.Orientation.Horizontal)
+        self.az_slider.setRange(-180, 180)
+        self.az_slider.setValue(int(self.azimuth))
+        self.az_slider.valueChanged.connect(self._on_angle_slider)
+        self.el_slider = QSlider(Qt.Orientation.Horizontal)
+        self.el_slider.setRange(-90, 90)
+        self.el_slider.setValue(int(self.elevation))
+        self.el_slider.valueChanged.connect(self._on_angle_slider)
+
+        self.detail = QComboBox()
+        self.detail.addItems([name for name, _ in self.DETAIL])
+        self.detail.setToolTip(
+            "Voxels along the longest axis. Higher is sharper but slower to "
+            "build and to rotate; the volume is rebuilt from the current "
+            "processing settings.")
+        self.detail.currentIndexChanged.connect(self._on_detail)
+
+        hint = QLabel("Drag to rotate · wheel to zoom · Shift+wheel to scroll "
+                      "the slab · arrow keys nudge")
+        hint.setStyleSheet("color:#888;")
+        hint.setWordWrap(True)
+        return _group("View", [
+            (None, row), ("Azimuth", self.az_slider),
+            ("Elevation", self.el_slider), ("Detail", self.detail), (None, hint),
+        ])
+
+    def _build_slab_group(self):
+        self.slab_centre = QSlider(Qt.Orientation.Horizontal)
+        self.slab_centre.valueChanged.connect(self._on_slab)
+        self.slab_depth = QSlider(Qt.Orientation.Horizontal)
+        self.slab_depth.valueChanged.connect(self._on_slab)
+        b_all = QPushButton("Whole volume")
+        b_all.clicked.connect(self._slab_all)
+        self.slab_label = QLabel("")
+        self.slab_label.setStyleSheet("color:#888;")
+        return _group("Slab (scroll through the stack)", [
+            ("Centre", self.slab_centre), ("Thickness", self.slab_depth),
+            (None, b_all), (None, self.slab_label),
+        ])
+
+    def _build_look_group(self):
+        self.mode = QComboBox()
+        self.mode.addItems(["Max intensity (MIP)", "Solid (depth occlusion)"])
+        self.mode.setToolTip(
+            "MIP hides nothing — no bead can be occluded by one in front of "
+            "it. Solid composites front-to-back, so nearer beads cover further "
+            "ones: a stronger depth cue, but faint structure can disappear.")
+        self.mode.currentIndexChanged.connect(self._queue)
+
+        self.colour = QCheckBox("Colour by depth (hue = z in the sample)")
+        self.colour.setChecked(True)
+        self.colour.setToolTip(
+            "Same hue ramp as the 2-D depth-coded projection, keyed to the "
+            "bead's depth in the sample rather than its distance from the "
+            "camera — so colours stay meaningful while you rotate.")
+        self.colour.toggled.connect(self._queue)
+
+        self.threshold = QSlider(Qt.Orientation.Horizontal)
+        self.threshold.setRange(0, 95)
+        self.threshold.setValue(12)
+        self.threshold.setToolTip("Black point, as a % of the display range. "
+                                  "Raise it until the haze between beads clears.")
+        self.threshold.valueChanged.connect(self._queue)
+
+        self.brightness = QSlider(Qt.Orientation.Horizontal)
+        self.brightness.setRange(20, 400)
+        self.brightness.setValue(100)
+        self.brightness.valueChanged.connect(self._queue)
+
+        self.opacity = QSlider(Qt.Orientation.Horizontal)
+        self.opacity.setRange(2, 100)
+        self.opacity.setValue(35)
+        self.opacity.setToolTip("Solid mode only: how much each voxel absorbs.")
+        self.opacity.valueChanged.connect(self._queue)
+
+        self.show_box = QCheckBox("Bounding box + axes")
+        self.show_box.setChecked(True)
+        self.show_box.toggled.connect(self._queue)
+        self.show_bar = QCheckBox("Scale bar")
+        self.show_bar.setChecked(True)
+        self.show_bar.toggled.connect(self._queue)
+
+        b_png = QPushButton("Save view (PNG)")
+        b_png.clicked.connect(self.save_png)
+        return _group("Appearance", [
+            ("Mode", self.mode), (None, self.colour),
+            ("Threshold", self.threshold), ("Brightness", self.brightness),
+            ("Opacity", self.opacity), (None, self.show_box),
+            (None, self.show_bar), (None, b_png),
+        ])
+
+    # -- volume --------------------------------------------------------
+    def rebuild(self):
+        """(Re)build the working volume from the channel's current processing."""
+        max_dim = self.DETAIL[self.detail.currentIndex()][1]
+        built = self._builder(self.channel, max_dim)
+        if built is None:
+            if self.vol is None:
+                QTimer.singleShot(0, self.reject)   # cancelled before first build
+            return False
+        self.vol, self.voxel_um = built
+        self.range = volume_display_range(self.vol)
+
+        nz = self.vol.shape[0]
+        for slider, value in ((self.slab_centre, nz // 2), (self.slab_depth, nz)):
+            slider.blockSignals(True)
+            slider.setRange(0, nz)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        self._render(draft=False)
+        return True
+
+    def _slab(self):
+        """Current slab as ``(z0, z1)`` volume planes."""
+        nz = self.vol.shape[0]
+        depth = max(1, self.slab_depth.value())
+        if depth >= nz:
+            return 0, nz
+        centre = self.slab_centre.value()
+        z0 = int(np.clip(centre - depth // 2, 0, nz - 1))
+        return z0, int(min(nz, z0 + depth))
+
+    # -- rendering -----------------------------------------------------
+    def _queue(self, *_):
+        self._render(draft=True)
+        self._settle.start()
+
+    def _render(self, draft=False):
+        if self.vol is None:
+            return
+        started = time.perf_counter()
+        lo, hi = self.range
+        # Brightness pulls the white point in (>100%) or pushes it out (<100%).
+        gain = self.brightness.value() / 100.0
+        rng = (lo, lo + max(hi - lo, EPS) / gain)
+        z0, z1 = self._slab()
+        rotation = view_rotation(self.azimuth, self.elevation)
+        view = render_volume(
+            self.vol, rotation, z_range=(z0, z1),
+            mode="solid" if self.mode.currentIndex() == 1 else "mip",
+            stride=2 if draft else 1, display_range=rng,
+            threshold=self.threshold.value() / 100.0,
+            opacity=self.opacity.value() / 100.0,
+            colour_by_depth=self.colour.isChecked(), zoom=self.zoom)
+        if self.show_box.isChecked():
+            draw_volume_box(view, rotation, self.vol.shape, self.zoom,
+                            z_range=(z0, z1))
+        if self.show_bar.isChecked():
+            view = draw_scale_bar(view, self.voxel_um / max(self.zoom, EPS),
+                                  self.channel.params["bar_um"])
+        self._show(view)
+        if not draft:
+            self._update_status(time.perf_counter() - started)
+
+    def _show(self, view):
+        self._buf = np.ascontiguousarray(view)
+        h, w, _ = self._buf.shape
+        qimg = QImage(self._buf.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+        self.canvas.setPixmap(QPixmap.fromImage(qimg).scaled(
+            self.canvas.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    def _update_status(self, seconds):
+        nz, ny, nx = self.vol.shape
+        z0, z1 = self._slab()
+        z_step = self.channel.params["z_step"]
+        self.slab_label.setText(
+            f"planes {z0}-{z1 - 1} of {nz}   "
+            f"({z0 * self.voxel_um:.1f}–{z1 * self.voxel_um:.1f} µm deep, "
+            f"{(z1 - z0) * self.voxel_um:.1f} µm thick)")
+        note = ""
+        if self.voxel_um > 1.5 * z_step:
+            note = ("   ⚠ voxel is coarser than the z step — crop the field or "
+                    "raise Detail for finer structure")
+        self.status.setText(
+            f"{nx}×{ny}×{nz} voxels at {self.voxel_um:.3f} µm   ·   "
+            f"az {self.azimuth:.0f}° el {self.elevation:.0f}° zoom {self.zoom:.2f}×"
+            f"   ·   {seconds * 1000:.0f} ms{note}")
+
+    # -- gestures ------------------------------------------------------
+    def _on_rotate(self, dx, dy):
+        self.azimuth = (self.azimuth + dx * 0.4 + 180.0) % 360.0 - 180.0
+        self.elevation = float(np.clip(self.elevation - dy * 0.4, -90.0, 90.0))
+        self._sync_angle_sliders()
+        self._dragging = True
+        self._render(draft=True)
+
+    def _on_drag_finished(self):
+        self._dragging = False
+        self._render(draft=False)
+
+    def _on_angle_slider(self, _value):
+        if self._dragging:
+            return
+        self.azimuth = float(self.az_slider.value())
+        self.elevation = float(self.el_slider.value())
+        self._queue()
+
+    def _sync_angle_sliders(self):
+        for slider, value in ((self.az_slider, self.azimuth),
+                              (self.el_slider, self.elevation)):
+            slider.blockSignals(True)
+            slider.setValue(int(round(value)))
+            slider.blockSignals(False)
+
+    def _set_view(self, azimuth, elevation):
+        self.azimuth, self.elevation = float(azimuth), float(elevation)
+        self._sync_angle_sliders()
+        self._render(draft=False)
+
+    def _on_zoom(self, steps):
+        self.zoom = float(np.clip(self.zoom * (1.15 ** steps), 0.4, 3.0))
+        self._queue()
+
+    def _on_slab_wheel(self, steps):
+        self.slab_centre.setValue(self.slab_centre.value() + steps)
+
+    def _on_slab(self, _value):
+        self._queue()
+
+    def _slab_all(self):
+        self.slab_depth.setValue(self.slab_depth.maximum())
+
+    def _on_detail(self, index):
+        if index == self._detail_index:
+            return
+        previous, self._detail_index = self._detail_index, index
+        if not self.rebuild():        # cancelled — keep showing the old volume
+            self._detail_index = previous
+            self.detail.blockSignals(True)
+            self.detail.setCurrentIndex(previous)
+            self.detail.blockSignals(False)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        step = 5.0
+        if key == Qt.Key.Key_Left:
+            self._set_view(self.azimuth - step, self.elevation)
+        elif key == Qt.Key.Key_Right:
+            self._set_view(self.azimuth + step, self.elevation)
+        elif key == Qt.Key.Key_Up:
+            self._set_view(self.azimuth, min(90.0, self.elevation + step))
+        elif key == Qt.Key.Key_Down:
+            self._set_view(self.azimuth, max(-90.0, self.elevation - step))
+        elif key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            delta = 1 if key == Qt.Key.Key_PageUp else -1
+            self.slab_centre.setValue(self.slab_centre.value() + delta)
+        else:
+            super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._buf is not None:
+            self._show(self._buf)
+
+    def save_png(self):
+        if self._buf is None:
+            return
+        parent = self.parent()
+        base = parent._out_base(stack_wide=True)
+        path = parent._out_dir() / (
+            f"{base}_volume_az{self.azimuth:+.0f}_el{self.elevation:+.0f}.png")
+        cv2.imwrite(str(path), self._buf)
+        msg = f"Saved {path}"
+        if self.colour.isChecked():
+            legend = parent._out_dir() / f"{base}_volume_depth_legend.png"
+            cv2.imwrite(str(legend), depth_colour_legend(self.vol.shape[0]))
+            msg += f"  (+ {legend.name})"
+        self.status.setText(msg)
+        parent._final_status(msg)
+
+
 class ImageLab(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -454,6 +893,7 @@ class ImageLab(QMainWindow):
         self.active = "A"
         self._loading_params = False   # guard against feedback while repopulating
         self._qbuf = None
+        self._volume_views = []        # open (modeless) 3-D windows
 
         # Field matching: the B -> A affine, plus the manual nudge on top of it.
         self.base_affine = IDENTITY_AFFINE.copy()
@@ -859,10 +1299,16 @@ class ImageLab(QMainWindow):
         self._connect(self.z_step)
         b_ortho = QPushButton("Save orthogonal views (XZ / YZ)")
         b_ortho.clicked.connect(self.save_orthogonal)
+        b_3d = QPushButton("Open 3-D volume view…")
+        b_3d.setToolTip("Rotate the stack in 3-D, scroll a slab through it, and "
+                        "colour beads by depth. Uses the Z step and pixel size "
+                        "to build cubic voxels, so the shape is geometrically "
+                        "true rather than stretched.")
+        b_3d.clicked.connect(self.open_volume_view)
         return _group("Stack tools (active channel)", [
             (None, b_reg), (None, b_unreg),
             ("Projection", self.proj_mode), (None, b_proj), (None, b_back),
-            ("Z step", self.z_step), (None, b_ortho),
+            ("Z step", self.z_step), (None, b_ortho), (None, b_3d),
         ])
 
     def _build_export_group(self):
@@ -1770,6 +2216,58 @@ class ImageLab(QMainWindow):
         self._sync_slider()
         self.refresh()
 
+    def open_volume_view(self):
+        """Open the interactive 3-D view of the active channel's stack."""
+        c = self.ch()
+        if c.n_slices < 3:
+            self._status("The 3-D view needs a stack (at least 3 planes).")
+            return
+        if c.params["z_step"] <= 0:
+            self._status("Set the Z step before opening the 3-D view — without "
+                         "it the volume cannot be scaled to true proportions.")
+            return
+        view = VolumeView(self, c, self._build_volume)
+        if view.vol is None:
+            return
+        # Modeless, so the pipeline can be tuned with the volume still open;
+        # keep a reference or Python would collect the window immediately.
+        self._volume_views.append(view)
+        view.finished.connect(lambda _r, v=view: self._volume_views.remove(v)
+                              if v in self._volume_views else None)
+        view.show()
+
+    def _build_volume(self, c, max_dim):
+        """Build a render volume from ``c``'s processed planes (cancellable).
+
+        Planes are processed and shrunk one at a time inside
+        ``build_view_volume``, so this never holds the whole processed stack —
+        which at full sensor would be gigabytes.
+        """
+        prog = QProgressDialog(f"Building 3-D volume (channel {c.name})…",
+                               "Cancel", 0, c.n_slices, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        cancelled = False
+
+        def get_slice(i):
+            nonlocal cancelled
+            prog.setValue(i)
+            QApplication.processEvents()
+            if prog.wasCanceled():
+                cancelled = True
+                raise _Cancelled()
+            return c.process_index(i)
+
+        try:
+            return build_view_volume(get_slice, c.n_slices, c.params["z_step"],
+                                     c.params["um_per_px"], max_dim=max_dim)
+        except _Cancelled:
+            return None
+        finally:
+            prog.close()
+            if not cancelled:
+                self._status(f"3-D volume built from {c.n_slices} planes "
+                             f"(channel {c.name}).")
+
     def _on_stack_toggled(self, checked):
         if self._loading_params:
             return
@@ -1894,6 +2392,8 @@ class ImageLab(QMainWindow):
     def closeEvent(self, event):
         # Catches nudges, which are not worth a write on every spinbox tick.
         self._save_match_state()
+        for view in list(self._volume_views):
+            view.close()
         super().closeEvent(event)
 
     def resizeEvent(self, event):

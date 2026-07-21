@@ -63,6 +63,7 @@ The codebase is organized into four layers with a **one-directional dependency r
 - `core/` imports **no PyQt6 and no hardware SDK** — pure, side-effect-free math (apart from explicit `save_*` helpers). This is the optical-sectioning physics, unit-testable in isolation.
 - `hardware/` wraps vendor SDKs and owns the threading. It depends on `core` (to do the math) and `config`, never on `ui`.
 - `ui/` is the only layer that instantiates workers and wires Qt signals. The Z-stack **orchestrator** lives here (not in `hardware/`) deliberately, because it composes *two* instruments plus `core`, and putting it in `hardware/` would create a `hardware → core → hardware` tangle.
+- `tools/` sits **outside** the acquisition app: offline utilities that run after a run, on archived files. They depend on `core`/`config` (never on `ui/` or an instrument), which is exactly why an offline rebuild produces byte-identical output to the live path. The Image Lab inside `tools/` repeats the same split one level down — `image_ops.py` is its `core/`, `image_lab.py` its `ui/`.
 
 ### Threading model
 
@@ -106,8 +107,16 @@ Dependency-light constants:
 - `save_axial_average_plot(z_positions, intensities, dir, name)` — **companion profile of the *average* (widefield) image** vs axial position. Unlike the sectioned image, the average collects out-of-focus light at every plane, so its intensity is essentially **flat** across z — it has *no* optical sectioning. It is therefore fitted with a **straight line** (`np.polyfit`, no SciPy needed) rather than a Gaussian; the near-zero slope quantifies the absence of sectioning. Same CSV-always / PNG-if-matplotlib contract: writes `<name>_axial_average.csv` + `.png`. Returns `(slope, csv_path, png_path)`. Helpers `_fit_axial_line`, `_save_average_figure`. **ORCA-only** (the event camera produces no average image).
 - `_write_multipage_tiff` / `_prepare_raw_frames` — shared internals (ROI crop + native-depth coercion).
 
+*Offline rebuild from the archived per-plane raws:*
+Because every plane's raw data is archived (ORCA `_raw_stack_zNNN.tif`, EVK4 `_events_zNNN.raw`), a run's **summary products are always reconstructible without hardware** — this is what makes an interrupted or resumed acquisition salvageable rather than lost.
+- `raw_stack_plane_path` / `event_raw_plane_path(raw_dir, name, plane)` — the canonical per-plane filename for each detector (one place that knows the naming, so tools and orchestrator cannot drift).
+- `find_complete_planes(raw_dir, name, steps, expected_frames=None)` / `find_complete_event_planes(...)` — which planes are present **and complete**. A plane TIFF with fewer pages than `expected_frames` is reported as truncated and skipped, so a half-written plane silently shrinks nothing.
+- `rebuild_zstack_from_raw(raw_dir, out_dir, name, z_positions, ...)` — re-runs `compute_dsi_images` over the found planes and writes the same depth volumes, axial profiles and parameter log a completed run would. Driven by `tools/rebuild_orca_zstack.py`.
+- `read_multipage_tiff` / `_tiff_num_frames` — shared readers.
+
 *Logging:*
 - `save_parameter_log(dir, name, sections)` — human-readable `<name>_parameters.txt` from an ordered `{section: {key: value}}` dict.
+- `save_event_stream(chunks, dir, name)` — the decoded per-event list `<name>_xytp.mat` (x, y, p, t), gzip-compressed. **Not** called during acquisition (its cost scales with event count and dominated per-plane wall-clock); `tools/backfill_event_streams.py` calls it offline so the on-disk result is byte-identical to an inline save.
 
 *EVK4:*
 - `accumulate_event_frame(chunks, w, h)` — sum events per pixel via `np.add.at` (SDK-agnostic; iterator injected by hardware).
@@ -151,6 +160,21 @@ Dependency-light constants:
     - **Recording watchdog (anti-freeze + no-events)** — a plane must record for ~`acqu_time` of wall-clock then stop. The normal exit is the elapsed check inside `events_for_duration`, but that only fires *after* the SDK yields a chunk. If the camera delivers **nothing** — a `bias_hpf` at its ceiling suppresses all events, or the EVK4 falls back off USB3 — `for evs in mv_iterator` blocks in native code with nothing to yield and never stops (which, with the old large ceiling, hung every plane and froze the UI). A **wall-clock watchdog thread** (`ceiling = acqu_time + 5 s`, the 5 s a grace for stream start-up / first-chunk latency) force-stops the event stream (`get_i_events_stream().stop()`, then `get_i_device_control().stop()`, both guarded) once the ceiling passes **or** the user Stops; that unblocks the iterator, so an empty (or delivery-stalled) plane still finishes in ~`acqu_time` instead of hanging, and **Stop stays responsive**. The plane is reconstructed from whatever raw was captured and the stack continues; a plane whose image is all-zero emits an explicit "0 events recorded — check the USB3 connection and lower bias_hpf" status so the cause is visible rather than just a slow blank stack. Raw logging is stopped exactly once via a lock-guarded flag shared by the watchdog and the `finally` (a double `stop_log_raw_data` can crash the native lib).
   - At the end, per-plane sectioned images are stacked into depth volumes and saved via `save_volume_tiff`, the **axial-sectioning profile** (Fig. 3a) is fitted and saved via `save_axial_sectioning_plot` (FWHM reported in the status bar), and — for ORCA — a **companion axial-average profile** of the widefield image is saved via `save_axial_average_plot` (straight-line fit, showing the average has no sectioning), plus a parameter log that records the z-positions. Each ORCA plane's raw file is written as that plane completes, so partial/aborted stacks keep the raw files of every plane that finished and still save whatever sectioned planes completed.
 
+### `tools/` — offline utilities (no hardware, run from the command line)
+
+Everything in `tools/` runs **after** an acquisition, on archived files. None of it imports `ui/`, none of it touches an instrument, and each script inserts the repo root on `sys.path` so it can be run directly (`python tools/<name>.py`). They fall into two groups.
+
+**Rebuild / regenerate — reuse `core`, so offline output is identical to live output:**
+- **`rebuild_orca_zstack.py`** — rebuilds an ORCA Z-stack's `_zstack_dsi.tif` / `_zstack_average.tif`, both axial profiles and the parameter log from the per-plane `_raw_stack_zNNN.tif` files (via `core.find_complete_planes` + `core.rebuild_zstack_from_raw`). For salvaging a run whose summary save was interrupted, or regenerating after a resume filled in missing tail planes. Axial positions are reconstructed from the scan geometry — pass the same `--focus / --step / --steps` the run used (the closed-loop PI stage reproduces nominal positions to sub-nm, so this is exact). `--frames` marks short plane files as truncated instead of silently shrinking the volume. Never modifies anything under `raw_files`.
+- **`rebuild_evk4_zstack.py`** — the event counterpart, from the per-plane `_events_zNNN.raw`. Same contract and the same `--focus/--step/--steps` reconstruction, plus `--roi-*` to re-apply the run's crop and `--no-filter`/`--no-smooth` to override the acquisition-default cleanup. Unlike the ORCA rebuild this one **does** need the Metavision SDK, because the `.raw` must be decoded.
+- **`backfill_event_streams.py`** — the standard way `<name>_xytp.mat` is produced. Walks the lab data drives, decodes every `.raw` and writes the stream via `core.save_event_stream`. **Resumable and idempotent**: a `.raw` whose `_xytp.mat` exists is skipped, so it can be interrupted and restarted freely; `--dry-run`, `--limit`, `--workers` (process pool), `--overwrite`.
+
+**Image Lab — a standalone two-channel post-processing workbench** (`python tools/image_lab.py`, independent of `main.py`). It mirrors the main app's layering one level down: **`image_ops.py` is to `image_lab.py` what `core/` is to `ui/`** — pure array math, no PyQt6, no SDK, so the image-quality algorithms are testable and scriptable without opening the GUI.
+- **`image_ops.py`** — the 12-stage pipeline in a deliberate order: *quantitative* stages first (hot-pixel removal → noise-floor subtraction **in the variance domain**, since a DSI std image is `sqrt(Var_speckle + Var_noise)` → `std/mean` normalization, the Ventalon–Mertz speckle-contrast metric → background subtraction → denoising → Richardson–Lucy deconvolution → unsharp mask), then *display-only* stages (ImageJ-equivalent auto-B&C → gamma → CLAHE → LUT → scale bar). Deconvolution runs **after** denoising because RL amplifies exactly the noise the earlier stages remove, and is documented as contrast enhancement, **not** quantitative restoration (the std image is not a linear convolution of the object). Also holds the stack-level tools: phase-correlation drift registration, projections (MIP / mean / std / EDF / depth-colour-coded), orthogonal XZ-YZ views, the axial-offset machinery that matches the two cameras' focal planes, and the 3-D renderer (below).
+- **`image_lab.py`** — the PyQt6 front end. Two independent channels **A** and **B** (intended as the ORCA and EVK4 views of the same sample, which the detection beamsplitter allows simultaneously), each with its own files, slice index, references and full parameter set; view modes *A only / B only / Side by side / Overlay* (green-A / magenta-B, so a well-matched bead reads white). **Field matching** reuses the acquisition GUI's own `core.register_evk4_to_orca` to measure the B→A affine from image content — which works regardless of how each file was cropped, unlike the stored calibration alone — and the match is **persisted and never re-measured unless asked** (`MATCH_STATE_PATH`, env-override `DSI_IMAGE_LAB_MATCH`), so an unchanged optical setup can crop and overlay a fresh dataset immediately. **Axial matching** measures the z offset between the two ports and resamples B onto A's z grid.
+  - **3-D volume view** (*Stack tools → Open 3-D volume view…*) — drag to rotate, wheel to zoom, **Shift+wheel to scroll a slab** through the depth. Nothing is *reconstructed*: a DSI stack is already a 3-D image, because the sectioning is what makes each plane belong to one depth. The view resamples it onto **cubic voxels** from the channel's Z step and pixel size (so proportions are true, not stretched by the z step) and projects it. Rendering is a **shear-warp** MIP (`image_ops.render_volume`): permuting the volume so the axis most parallel to the view comes first makes the rays advance by a constant in-plane step per slice, so the whole projection factors into N 2-D `cv2.warpAffine` translations plus one final affine warp — no 3-D resampling, no GPU, no new dependency. Measured worst case on a dense 256³ volume: **~64 ms** for the half-resolution draft that follows the mouse, ~290 ms for the full frame that replaces it when the drag stops; both render to identical geometry so the swap doesn't shift the view, and empty planes are skipped, which makes sparse bead data far faster. Depth is carried alongside intensity and coloured with the **same hue ramp as `depth_colour_code`** (so `depth_colour_legend` is a valid legend for a 3-D view too), keyed to depth **in the sample** rather than distance from the camera — so a bead keeps its colour while the volume turns. A projected wireframe box supplies the reference the eye needs to read an orthographic rotation. *Solid* mode swaps MIP for front-to-back alpha compositing (nearer beads occlude further ones — stronger depth cue, but faint structure can hide). Memory is bounded: `build_view_volume` shrinks each plane as it is processed and drops it, so a full-sensor stack never materializes as a processed volume, and the working grid is capped at `max_dim³` (Detail 128/256/384).
+  - **Physical caveat the view surfaces rather than hides** — the axial resolution is the DSI sectioning FWHM (2–4 µm) against a ~0.16 µm lateral pixel, so beads are *genuinely* elongated in z; that is the optics, not a rendering artifact. And over a full 2304-px field the isotropic voxel lands near 1.5 µm, which sacrifices lateral detail (still finer than the axial resolution, so sectioning survives) — the status line warns when the voxel is coarser than the z step, and the fix is to crop the field.
+
 ---
 
 ## 4. Typical data flows
@@ -179,6 +203,22 @@ MainWindow.start_zstack(camera)  (pauses PIStageWidget polling; hands stage to o
        save_parameter_log
 ```
 
+**Offline, after the run** (`tools/`, no hardware — see the `tools/` guide above):
+```
+salvage / regenerate a stack     rebuild_orca_zstack.py  --focus --step --steps [--frames]
+                                 rebuild_evk4_zstack.py  --focus --step --steps [--roi-*]
+                                   → core.find_complete_planes → core.rebuild_zstack_from_raw
+                                   → the same _zstack_*.tif + axial CSV/PNG + parameter log
+
+decode event streams             backfill_event_streams.py  [--dry-run|--limit|--workers]
+                                   → core.save_event_stream → <name>_xytp.mat (resumable, idempotent)
+
+publication images / 3-D         image_lab.py
+                                   load stack -> image_ops pipeline (12 stages)
+                                   -> projections / orthogonal views / field + axial match
+                                   -> build_view_volume -> render_volume (rotatable 3-D)
+```
+
 ---
 
 ## 5. Recent work / gotchas worth remembering
@@ -199,3 +239,4 @@ MainWindow.start_zstack(camera)  (pauses PIStageWidget polling; hands stage to o
 - **Graceful degradation** — guarded SDK imports mean the GUI is fully buildable on any machine; missing hardware surfaces as a dialog, not a crash.
 - **Responsiveness** — every blocking operation is on a worker thread; the UI thread only paints and routes signals.
 - **Swappability** — adding a detector or moving math around touches one layer, because dependencies only ever point downward (`ui → hardware → core → config`).
+- **Nothing is lost to an interrupted run** — every plane's raw data is archived as it completes, and `tools/` can rebuild every summary product from it with no hardware. This is why the acquisition path is free to skip expensive work (the `_xytp.mat` decode) and leave it to an offline pass.
