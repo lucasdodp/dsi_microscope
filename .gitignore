@@ -15,6 +15,12 @@ env/
 *.raw
 *.mat
 
+# Per-dataset analysis output (figures, decoded counts, write-ups). These
+# belong in the data folder they were computed from, next to the acquisition
+# they describe -- not in the code repo, where they go stale and bloat clones.
+# The reusable parts live in tools/; EXPERIMENT_LOG.md records what was found.
+EVK4_parameter_analysis/
+
 # IDE / OS
 .vscode/
 .idea/
