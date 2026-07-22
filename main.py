@@ -15,7 +15,9 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
-    window.show()
+    # Maximized rather than true full screen: the window keeps its title bar,
+    # so it can still be moved and closed.
+    window.showMaximized()
     sys.exit(app.exec())
 
 

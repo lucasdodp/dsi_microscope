@@ -8,47 +8,32 @@ scripted without opening the GUI.
 --------------------------------------------------------------------------
 The pipeline
 --------------------------------------------------------------------------
-Stages run in this order; the ordering is deliberate, not incidental.
+Deliberately kept short: every stage here should be explainable in one plain
+sentence, with no sensor-physics (gain/offset/read-noise) or optics (PSF, NA,
+wavelength) parameters to reason about. Stages run in this order.
 
-*Quantitative* (physics-correct — safe under a measurement):
+*Quantitative* (changes the pixel values; safe under a measurement):
 
   1. **Hot-pixel removal** — sensor artifacts must go first, before any
      statistic is computed from neighbourhoods. Outliers are detected against a
      *local* median (> median + k·MAD in a window) and replaced by that median,
      not zeroed: zeroing punches holes into genuinely bright structure.
-  2. **Noise-floor subtraction** — a DSI std image is
-     ``sqrt(Var_speckle + Var_noise)``. Removing ``Var_noise`` in the variance
-     domain flattens the background to true zero, which is what lets faint
-     in-focus structure survive the contrast stretch. Either from a measured
-     reference (a frozen-speckle std image, AWG off) or analytically from the
-     companion average image via ``Var_shot = k·(mean − offset)``.
-  3. **Normalization / flat-fielding** — ``std/mean`` is the classic
-     Ventalon–Mertz speckle-contrast metric: it divides out the illumination
-     envelope and the fluorophore-density weighting. ``std/sqrt(mean)`` keeps the
-     result shot-noise-weighted. Self flat-field (divide by a heavily blurred
-     copy) removes the beam profile without a companion image.
-  4. **Background subtraction** — rolling-ball-equivalent (grayscale opening)
-     for residual out-of-focus haze.
-  5. **Denoising** — edge-preserving options (bilateral, NLM) instead of a
-     Gaussian that rounds beads off. The Anscombe variant applies a
-     variance-stabilizing transform first, which is the correct order for the
-     Poisson-ish statistics of event counts.
-  6. **Deconvolution** — Richardson–Lucy with a Gaussian PSF derived from
-     NA / λ / pixel size. Runs *after* denoising because RL amplifies exactly
-     the noise the previous stages remove. NOTE: the std image is not strictly a
-     linear convolution of the object, so treat this as contrast enhancement,
-     not quantitative restoration.
-  7. **Unsharp mask** — the cheapest perceived-sharpness gain.
+  2. **Background subtraction** — rolling-ball-equivalent (grayscale opening)
+     for residual out-of-focus haze or uneven glow. Matters more on tissue
+     (real autofluorescence background) than on clean beads.
+  3. **Denoising** — plain Gaussian or median blur. Median holds small round
+     structure (beads, cell nuclei) together slightly better than Gaussian.
+  4. **Unsharp mask** — the cheapest perceived-sharpness gain: subtract a
+     blurred copy, scaled, from the image.
 
 *Display-only* (cosmetic — never quantitative):
 
-  8. **Contrast stretch** — ImageJ's "Auto" B&C (reproducing
+  5. **Contrast stretch** — ImageJ's "Auto" B&C (reproducing
      ``ContrastAdjuster.autoAdjust()``), a percentile clip, or manual limits.
-  9. **Gamma** — reveals faint structure without clipping the bright end.
- 10. **CLAHE** — local histogram equalization; dramatic on uneven fluorescence.
- 11. **LUT** — a perceptually-uniform colormap resolves low-contrast detail that
+  6. **Gamma** — reveals faint structure without clipping the bright end.
+  7. **LUT** — a perceptually-uniform colormap resolves low-contrast detail that
      grayscale hides.
- 12. **Scale bar** — burnt into the exported image.
+  8. **Scale bar** — burnt into the exported image.
 
 *Stack-level tools:* lateral drift correction (phase correlation, so orthogonal
 views stop smearing), and projections through z — MIP, mean, std, extended
@@ -61,7 +46,7 @@ volume with no GPU and no extra dependency — see the section comment above
 ``plan_view_volume`` for why it is factored that way.
 
 --------------------------------------------------------------------------
-The ImageJ auto-B&C algorithm (stage 8, "Auto")
+The ImageJ auto-B&C algorithm (stage 5, "Auto")
 --------------------------------------------------------------------------
   1. Build a 256-bin histogram over the slice's [min, max] data range.
   2. Zero out bins that hold more than 10% of the pixels (the dominant
@@ -77,7 +62,6 @@ import cv2
 import numpy as np
 import scipy.io
 import tifffile
-from scipy.signal import fftconvolve
 
 # ImageJ's default auto-threshold divisor (first press of "Auto").
 AUTO_THRESHOLD = 5000
@@ -194,78 +178,7 @@ def hot_pixel_mask_from_dark(dark_img, k=6.0):
     return arr > (med + k * max(mad, EPS))
 
 
-# --- 2. noise floor --------------------------------------------------------
-def subtract_noise_reference(std_img, noise_std_img, strength=1.0):
-    """Remove a measured noise floor from a std image, in the variance domain.
-
-    ``noise_std_img`` is the per-pixel standard deviation of a *frozen-speckle*
-    stack (AWG output off, everything else identical): with the speckle static,
-    that variance **is** the shot + read noise floor — measured per pixel, with
-    no need to know the camera's conversion gain.
-
-        std_corrected = sqrt(max(std^2 - strength * noise^2, 0))
-    """
-    s2 = np.asarray(std_img, dtype=np.float32) ** 2
-    n2 = np.asarray(noise_std_img, dtype=np.float32) ** 2
-    return np.sqrt(np.clip(s2 - float(strength) * n2, 0.0, None))
-
-
-def subtract_noise_analytic(std_img, avg_img, gain_adu_per_e=0.23, offset=100.0,
-                            read_noise_adu=4.0, strength=1.0):
-    """Remove the shot + read noise floor using the camera noise model.
-
-    For a signal of S electrons digitised at k ADU/e-, the shot-noise variance in
-    ADU is ``k * (mean_ADU - offset)``; read noise adds a constant. So::
-
-        var_corrected = var_measured - k*(mean - offset) - sigma_read^2
-
-    Use this when no frozen-speckle reference was acquired. The measured
-    reference (:func:`subtract_noise_reference`) is strictly better — it is
-    per-pixel and free of any assumption about k.
-    """
-    var = np.asarray(std_img, dtype=np.float32) ** 2
-    mean = np.asarray(avg_img, dtype=np.float32) - float(offset)
-    noise_var = float(gain_adu_per_e) * np.clip(mean, 0, None) + float(read_noise_adu) ** 2
-    return np.sqrt(np.clip(var - float(strength) * noise_var, 0.0, None))
-
-
-# --- 3. normalization / flat field ----------------------------------------
-def normalize_by_average(std_img, avg_img, offset=0.0, mode="ratio", floor_pct=5.0):
-    """Divide out the illumination envelope using the companion average image.
-
-    ``mode="ratio"`` gives ``std/mean`` — the speckle contrast, the classic
-    Ventalon–Mertz sectioning metric, which removes both the Gaussian beam
-    profile and the fluorophore-density weighting. ``mode="sqrt"`` gives
-    ``std/sqrt(mean)``, which keeps the result shot-noise-weighted (a
-    shot-noise-limited region then reads flat, so departures from flat are real
-    signal).
-
-    The denominator is floored at its ``floor_pct`` percentile so dark corners
-    can't explode into a bright rim.
-    """
-    num = np.asarray(std_img, dtype=np.float32)
-    den = np.asarray(avg_img, dtype=np.float32) - float(offset)
-    floor = max(float(np.percentile(den, floor_pct)), EPS)
-    den = np.clip(den, floor, None)
-    if mode == "sqrt":
-        den = np.sqrt(den)
-    return num / den
-
-
-def self_flat_field(img, sigma=60.0):
-    """Divide by a heavily blurred copy of the image itself.
-
-    Removes the low-spatial-frequency illumination envelope when no companion
-    average image is available. ``sigma`` must be much larger than the structures
-    of interest, or it eats the signal along with the background.
-    """
-    arr = np.asarray(img, dtype=np.float32)
-    bg = cv2.GaussianBlur(arr, (0, 0), float(sigma))
-    floor = max(float(np.percentile(bg, 5.0)), EPS)
-    return arr / np.clip(bg, floor, None)
-
-
-# --- 4. background ---------------------------------------------------------
+# --- 2. background ---------------------------------------------------------
 def rolling_ball_background(img, radius=50):
     """Subtract a rolling-ball-equivalent background (grayscale opening).
 
@@ -280,27 +193,13 @@ def rolling_ball_background(img, radius=50):
     return arr - bg
 
 
-# --- 5. denoising ----------------------------------------------------------
-def _to_uint8_scaled(img):
-    """Scale a float image to uint8 for the 8-bit-only OpenCV denoisers."""
-    arr = np.asarray(img, dtype=np.float32)
-    lo, hi = float(arr.min()), float(arr.max())
-    if hi <= lo:
-        return np.zeros(arr.shape, np.uint8), lo, 1.0
-    scale = 255.0 / (hi - lo)
-    return np.clip((arr - lo) * scale, 0, 255).astype(np.uint8), lo, scale
-
-
+# --- 3. denoising ----------------------------------------------------------
 def denoise(img, method="none", strength=1.0):
     """Apply the selected denoiser.
 
-    ``gaussian``  — fast, but rounds off point-like structure (beads).
-    ``median``    — good against residual salt-and-pepper.
-    ``bilateral`` — edge-preserving; the safe default for beads.
-    ``nlm``       — non-local means; best detail retention, slowest.
-    ``anscombe``  — Anscombe variance-stabilizing transform -> NLM -> inverse.
-                    The correct order for Poisson-ish data such as EVK4 event
-                    counts, where the noise level scales with the signal.
+    ``gaussian`` — fast, standard blur; rounds off point-like structure (beads).
+    ``median``   — good against residual salt-and-pepper / stray bright specks,
+                   with less rounding of small round structure than Gaussian.
     """
     arr = np.asarray(img, dtype=np.float32)
     s = float(strength)
@@ -310,74 +209,10 @@ def denoise(img, method="none", strength=1.0):
         return cv2.GaussianBlur(arr, (0, 0), s)
     if method == "median":
         return _median_filter(arr, int(max(3, round(s) * 2 + 1)))
-    if method == "bilateral":
-        rng = float(arr.max() - arr.min()) or 1.0
-        return cv2.bilateralFilter(arr, -1, sigmaColor=0.05 * rng * s, sigmaSpace=3.0 * s)
-    if method == "nlm":
-        u8, lo, scale = _to_uint8_scaled(arr)
-        out = cv2.fastNlMeansDenoising(u8, None, h=float(3.0 * s),
-                                       templateWindowSize=7, searchWindowSize=21)
-        return out.astype(np.float32) / scale + lo
-    if method == "anscombe":
-        # z = 2*sqrt(x + 3/8) turns Poisson noise into ~unit-variance Gaussian
-        # noise, which is what NLM assumes; invert exactly afterwards.
-        shift = float(min(0.0, arr.min()))
-        z = 2.0 * np.sqrt(np.clip(arr - shift, 0, None) + 0.375)
-        u8, lo, scale = _to_uint8_scaled(z)
-        d = cv2.fastNlMeansDenoising(u8, None, h=float(3.0 * s),
-                                     templateWindowSize=7, searchWindowSize=21)
-        zd = d.astype(np.float32) / scale + lo
-        inv = (zd / 2.0) ** 2 - 0.125
-        return np.clip(inv, 0, None) + shift
     return arr
 
 
-# --- 6. deconvolution ------------------------------------------------------
-def psf_sigma_px(wavelength_nm=580.0, na=0.65, pixel_um=0.1625):
-    """Gaussian-PSF sigma in pixels from the optics.
-
-    Uses the lateral resolution ``FWHM = 0.51*lambda/NA`` converted to pixels,
-    then ``sigma = FWHM / 2.355``. ``pixel_um`` is the *sample-side* pixel size
-    (camera pitch / magnification) — e.g. 6.5 µm / 40x = 0.1625 µm.
-    """
-    fwhm_um = 0.51 * (float(wavelength_nm) * 1e-3) / max(float(na), EPS)
-    return float(fwhm_um / max(float(pixel_um), EPS) / 2.3548)
-
-
-def gaussian_psf(sigma):
-    """Normalised 2-D Gaussian PSF kernel sized to ~3 sigma each side."""
-    r = max(1, int(round(3.0 * float(sigma))))
-    ax = np.arange(-r, r + 1, dtype=np.float64)
-    g = np.exp(-(ax ** 2) / (2.0 * float(sigma) ** 2))
-    psf = np.outer(g, g)
-    return psf / psf.sum()
-
-
-def richardson_lucy(img, psf, iterations=10):
-    """Richardson–Lucy deconvolution (float, non-negativity preserved).
-
-    RL assumes a non-negative image formed by a linear convolution, with Poisson
-    noise. A DSI std image does not strictly satisfy the linearity assumption, so
-    the result is a *contrast enhancement*, not a quantitative restoration —
-    say so in any caption. Keep the iteration count low (5–15); RL amplifies
-    noise without bound as it converges.
-    """
-    arr = np.asarray(img, dtype=np.float64)
-    shift = float(min(0.0, arr.min()))
-    arr = arr - shift  # RL requires non-negative input
-    psf = np.asarray(psf, dtype=np.float64)
-    psf_mirror = psf[::-1, ::-1]
-
-    est = np.full(arr.shape, max(float(arr.mean()), EPS), dtype=np.float64)
-    for _ in range(int(iterations)):
-        conv = fftconvolve(est, psf, mode="same")
-        relative = arr / np.clip(conv, EPS, None)
-        est = est * fftconvolve(relative, psf_mirror, mode="same")
-        np.clip(est, 0, None, out=est)
-    return (est + shift).astype(np.float32)
-
-
-# --- 7. sharpening ---------------------------------------------------------
+# --- 4. sharpening ---------------------------------------------------------
 def unsharp_mask(img, amount=0.6, radius=2.0):
     """``img + amount * (img - blur(img))`` — classic unsharp mask."""
     arr = np.asarray(img, dtype=np.float32)
@@ -387,7 +222,7 @@ def unsharp_mask(img, amount=0.6, radius=2.0):
     return arr + float(amount) * (arr - blur)
 
 
-# --- 8-12. display-only ----------------------------------------------------
+# --- 5-8. display-only ------------------------------------------------------
 def apply_gamma(view8, gamma=1.0):
     """Gamma-correct an 8-bit view. gamma < 1 lifts faint structure."""
     g = float(gamma)
@@ -395,17 +230,6 @@ def apply_gamma(view8, gamma=1.0):
         return view8
     lut = np.clip(((np.arange(256) / 255.0) ** g) * 255.0, 0, 255).astype(np.uint8)
     return cv2.LUT(view8, lut)
-
-
-def apply_clahe(view8, clip_limit=2.0, tiles=8):
-    """Contrast-limited adaptive histogram equalization.
-
-    Display only: it is a spatially varying, non-monotonic remap, so intensities
-    in the result are no longer comparable between regions.
-    """
-    clahe = cv2.createCLAHE(clipLimit=float(clip_limit),
-                            tileGridSize=(int(tiles), int(tiles)))
-    return clahe.apply(view8)
 
 
 # cv2's viridis/magma/inferno are perceptually uniform; the single-hue
@@ -668,25 +492,47 @@ def _resample_axis0(stack, nz):
 
 
 def build_view_volume(get_slice, n_planes, z_step_um, um_per_px,
-                      max_dim=256, status=None):
+                      max_dim=256, status=None, roi=None, planes=None):
     """Build the isotropic render volume. Returns ``(vol, voxel_um)``.
 
     ``get_slice(i)`` returns processed plane ``i`` as a 2-D array. Each plane is
     shrunk to the working grid **as it arrives** and then dropped, so peak
     memory is the working volume plus one full-size plane — never the whole
     processed stack (which is gigabytes at full sensor).
+
+    ``roi`` (``(x0, x1, y0, y1)`` in source pixels) and ``planes``
+    (``(p0, p1)``) restrict the build to part of the stack. Since the voxel size
+    is set by the *extent* covered, building from a sub-region spends the same
+    ``max_dim`` on less sample — which is the only way to actually resolve more
+    detail, as opposed to magnifying the voxels you already have.
     """
-    first = np.asarray(get_slice(0), dtype=np.float32)
-    voxel, (nz, ny, nx) = plan_view_volume(n_planes, first.shape,
+    p0, p1 = (0, n_planes) if planes is None else planes
+    p0 = int(np.clip(p0, 0, max(0, n_planes - 1)))
+    p1 = int(np.clip(p1, p0 + 1, n_planes))
+    n_used = p1 - p0
+
+    def read(i):
+        plane = np.asarray(get_slice(i), dtype=np.float32)
+        if roi is None:
+            return plane
+        x0, x1, y0, y1 = (int(v) for v in roi)
+        x0 = int(np.clip(x0, 0, plane.shape[1] - 1))
+        y0 = int(np.clip(y0, 0, plane.shape[0] - 1))
+        x1 = int(np.clip(x1, x0 + 1, plane.shape[1]))
+        y1 = int(np.clip(y1, y0 + 1, plane.shape[0]))
+        return plane[y0:y1, x0:x1]
+
+    first = read(p0)
+    voxel, (nz, ny, nx) = plan_view_volume(n_used, first.shape,
                                            z_step_um, um_per_px, max_dim)
-    stack = np.empty((n_planes, ny, nx), np.float32)
+    stack = np.empty((n_used, ny, nx), np.float32)
     shrinking = nx < first.shape[1] or ny < first.shape[0]
     interp = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
-    for i in range(n_planes):
-        plane = first if i == 0 else np.asarray(get_slice(i), dtype=np.float32)
+    for i in range(n_used):
+        plane = first if i == 0 else read(p0 + i)
         stack[i] = cv2.resize(plane, (nx, ny), interpolation=interp)
-        if status is not None and (i % 4 == 0 or i == n_planes - 1):
-            status(f"Building 3-D volume… plane {i + 1}/{n_planes}")
+        if status is not None and (i % 4 == 0 or i == n_used - 1):
+            status(f"Building 3-D volume… plane {i + 1}/{n_used}")
     return _resample_axis0(stack, nz), voxel
 
 
@@ -697,6 +543,23 @@ def volume_display_range(vol, low_pct=1.0, high_pct=99.9):
     if hi <= lo:
         hi = lo + 1.0
     return float(lo), float(hi)
+
+
+def fit_zoom(vol_shape, out_size, margin=1.08):
+    """Zoom that makes the volume fill ``out_size`` (w, h) pixels at any angle.
+
+    Sized from the volume's **diagonal**, not from the current rotation's
+    projected extent: a per-angle fit would rescale the picture as it turns,
+    which reads as the volume breathing rather than rotating. A constant scale
+    also means the rendered frame is never larger than the widget, so the view
+    can be shown pixel-for-pixel instead of being resampled a second time on the
+    way to the screen — that second resample is what makes a small render look
+    blurred.
+    """
+    nz, ny, nx = vol_shape
+    diagonal = float(np.linalg.norm(np.array([nx, ny, nz], dtype=np.float64) - 1.0))
+    span = max(diagonal * float(margin) + 8.0, EPS)
+    return float(min(out_size[0], out_size[1]) / span)
 
 
 def view_rotation(azimuth_deg, elevation_deg):
@@ -714,18 +577,20 @@ def view_rotation(azimuth_deg, elevation_deg):
     return r_x @ r_y
 
 
-def project_volume_points(points_xyz, rotation, vol_shape, zoom, out_shape):
+def project_volume_points(points_xyz, rotation, vol_shape, zoom, out_shape,
+                          pan=(0.0, 0.0)):
     """Project world points (x, y, z voxel indices) to (col, row) pixels.
 
     The projection is orthographic and isotropic, so this is the exact inverse
-    of what :func:`render_volume` draws — overlays land on the structure.
+    of what :func:`render_volume` draws — overlays land on the structure, at
+    whatever zoom and pan the view is currently using.
     """
     nz, ny, nx = vol_shape
     centre = (np.array([nx, ny, nz], dtype=np.float64) - 1.0) / 2.0
     uv = (np.asarray(points_xyz, dtype=np.float64) - centre) @ np.asarray(rotation)[:2].T
     uv *= float(zoom)
-    uv[:, 0] += out_shape[1] / 2.0
-    uv[:, 1] += out_shape[0] / 2.0
+    uv[:, 0] += out_shape[1] / 2.0 + float(pan[0])
+    uv[:, 1] += out_shape[0] / 2.0 + float(pan[1])
     return uv
 
 
@@ -738,35 +603,43 @@ def _box_corners(x0, x1, y0, y1, z0, z1):
                      for z in (z0, z1)], dtype=np.float64)
 
 
-def draw_volume_box(view, rotation, vol_shape, zoom, z_range=None,
-                    labels=True):
-    """Draw the volume's wireframe (and the active slab) onto a BGR view.
+def draw_volume_box(view, rotation, vol_shape, zoom, crop=None,
+                    labels=True, pan=(0.0, 0.0)):
+    """Draw the volume's wireframe (and the active crop) onto a BGR view.
 
     A projected box is the cheapest strong depth cue there is: without it an
     orthographic MIP of sparse beads gives the eye nothing to read the rotation
     against, and the structure looks flat no matter how far it is turned.
+
+    ``crop`` is ``(x_range, y_range, z_range)`` in voxels; when any of it
+    differs from the full volume the kept box is outlined inside the grey
+    wireframe, so it is always clear how much of the sample is on show.
     """
     nz, ny, nx = vol_shape
     out = view
 
     def draw(corners, colour, thickness):
-        pts = project_volume_points(corners, rotation, vol_shape, zoom, out.shape)
+        pts = project_volume_points(corners, rotation, vol_shape, zoom,
+                                    out.shape, pan)
         for i, j in _BOX_EDGES:
             p0 = (int(round(pts[i, 0])), int(round(pts[i, 1])))
             p1 = (int(round(pts[j, 0])), int(round(pts[j, 1])))
             cv2.line(out, p0, p1, colour, thickness, cv2.LINE_AA)
         return pts
 
-    corners = draw(_box_corners(0, nx - 1, 0, ny - 1, 0, nz - 1), (70, 70, 70), 1)
-    if z_range is not None:
-        z0, z1 = int(z_range[0]), int(z_range[1]) - 1
-        if not (z0 <= 0 and z1 >= nz - 1):
-            draw(_box_corners(0, nx - 1, 0, ny - 1, z0, z1), (0, 190, 190), 1)
+    draw(_box_corners(0, nx - 1, 0, ny - 1, 0, nz - 1), (70, 70, 70), 1)
+    if crop is not None:
+        full = ((0, nx), (0, ny), (0, nz))
+        spans = [tuple(int(v) for v in (r if r is not None else f))
+                 for r, f in zip(crop, full)]
+        if spans != [tuple(f) for f in full]:
+            (x0, x1), (y0, y1), (z0, z1) = spans
+            draw(_box_corners(x0, x1 - 1, y0, y1 - 1, z0, z1 - 1), (0, 190, 190), 1)
     if labels:
         # Axis names at the far end of the three edges leaving corner (0,0,0).
         ends = project_volume_points(
             np.array([[nx - 1, 0, 0], [0, ny - 1, 0], [0, 0, nz - 1]], float),
-            rotation, vol_shape, zoom, out.shape)
+            rotation, vol_shape, zoom, out.shape, pan)
         for (name, pt) in zip(("x", "y", "z"), ends):
             cv2.putText(out, name, (int(pt[0]) + 4, int(pt[1]) - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1,
@@ -774,9 +647,28 @@ def draw_volume_box(view, rotation, vol_shape, zoom, z_range=None,
     return out
 
 
-def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
+def _strided_span(n, rng, stride):
+    """``(slice, first_index)`` for a cropped axis on the strided grid.
+
+    The slice is taken from the same 0, stride, 2*stride, ... grid whatever the
+    crop, and the index returned is the position of its first sample *in strided
+    units* — so a draft frame and a full-quality one place the crop identically
+    and the view does not shift when one replaces the other.
+    """
+    a0, a1 = (0, n) if rng is None else (int(rng[0]), int(rng[1]))
+    a0 = int(np.clip(a0, 0, n - 1))
+    a1 = int(np.clip(a1, a0 + 1, n))
+    grid = np.arange(0, n, stride)
+    k0 = int(np.searchsorted(grid, a0, "left"))
+    k1 = max(int(np.searchsorted(grid, a1, "left")), k0 + 1)
+    return slice(int(grid[k0]), int(grid[k1 - 1]) + 1, stride), k0
+
+
+def render_volume(vol, rotation, z_range=None, y_range=None, x_range=None,
+                  mode="mip", stride=1,
                   display_range=(0.0, 1.0), threshold=0.0, opacity=0.5,
-                  colour_by_depth=True, zoom=1.0, margin=1.08):
+                  colour_by_depth=True, zoom=1.0, margin=1.08,
+                  out_size=None, pan=(0.0, 0.0)):
     """Project an isotropic volume from an arbitrary angle. Returns BGR uint8.
 
     ``mode``
@@ -786,30 +678,35 @@ def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
         ``solid`` — front-to-back alpha compositing. Beads *do* occlude each
                     other, which is the strongest depth cue available, at the
                     cost of hiding faint structure behind bright structure.
-    ``z_range``
-        ``(z0, z1)`` slab in volume planes — the "scroll through the stack"
-        control. The slab is cropped from the volume but is still projected
-        about the **whole** volume's centre, so it stays at its true position in
-        the frame instead of re-centring as it is scrolled.
+    ``z_range`` / ``y_range`` / ``x_range``
+        Half-open crops in voxels along each axis — the "scroll a slab through
+        the stack" control on z, and on x/y the way to cut a bead out of the
+        picture without touching the data. The crop is taken out of the volume
+        but is still projected about the **whole** volume's centre, so what
+        remains stays at its true position in the frame instead of re-centring
+        as the crop is scrolled.
     ``stride``
         Render from every n-th voxel and scale the result back up. The output
         is the same size and geometry either way, which is what lets a fast
         draft be swapped for a full-quality frame without the view jumping.
+    ``out_size`` / ``pan``
+        Render into a fixed ``(w, h)`` viewport, with the volume's centre
+        displaced by ``pan`` pixels. This is what makes zooming *in* mean
+        magnification rather than a bigger picture of the same thing: whatever
+        falls outside the viewport is never drawn, so the cost of a frame does
+        not grow with the zoom. Without ``out_size`` the output is sized to hold
+        the whole projected volume, as before.
     """
     vol = np.asarray(vol, dtype=np.float32)
     nz, ny, nx = vol.shape
     stride = max(1, int(stride))
     rotation = np.asarray(rotation, dtype=np.float64)
 
-    z0, z1 = (0, nz) if z_range is None else (int(z_range[0]), int(z_range[1]))
-    z0 = int(np.clip(z0, 0, nz - 1))
-    z1 = int(np.clip(z1, z0 + 1, nz))
-
-    # Strided grid: indices 0, stride, 2*stride, ... of the original volume.
-    zs = np.arange(0, nz, stride)
-    k0 = int(np.searchsorted(zs, z0, "left"))
-    k1 = max(int(np.searchsorted(zs, z1, "left")), k0 + 1)
-    sub = vol[zs[k0]:zs[k1 - 1] + 1:stride, ::stride, ::stride]
+    # Crop, on the strided grid (indices 0, stride, 2*stride, ... of the volume).
+    sl_z, kz0 = _strided_span(nz, z_range, stride)
+    sl_y, ky0 = _strided_span(ny, y_range, stride)
+    sl_x, kx0 = _strided_span(nx, x_range, stride)
+    sub = vol[sl_z, sl_y, sl_x]
 
     # World sizes / origin / centre, all in strided voxels, world order (x,y,z).
     # The centre is the *original* volume's centre expressed in strided units,
@@ -817,7 +714,7 @@ def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
     # which would shift the draft frame against the full-quality one.
     extent = (np.array([nx, ny, nz], dtype=np.float64) - 1.0) / stride
     centre = extent / 2.0
-    origin = np.array([0.0, 0.0, float(k0)])
+    origin = np.array([float(kx0), float(ky0), float(kz0)])
     off = origin - centre
 
     # --- shear: permute so the axis most parallel to the view comes first ---
@@ -866,11 +763,11 @@ def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
             # The source z of every pixel is analytic — the slice was only
             # translated, so a z ramp stays a ramp and needs no second warp.
             if c == 2:
-                z_src = np.float32(k0 + k)
+                z_src = np.float32(kz0 + k)
             elif a == 2:
-                z_src = rows - np.float32(t_a[k] + p0 - k0)
+                z_src = rows - np.float32(t_a[k] + p0 - kz0)
             else:
-                z_src = cols - np.float32(t_b[k] + q0 - k0)
+                z_src = cols - np.float32(t_b[k] + q0 - kz0)
         if solid:
             val = np.clip((warped - cut) / (span * (1.0 - thr)), 0.0, 1.0)
             contrib = (1.0 - alpha) * val * float(opacity)
@@ -898,18 +795,29 @@ def render_volume(vol, rotation, z_range=None, mode="mip", stride=1,
     # Frame the *whole* volume (not the slab) so scrolling the slab does not
     # make the picture jump. Sized in final pixels first, then divided down by
     # the stride, so every stride yields the identical output size.
-    box = (_box_corners(0, extent[0], 0, extent[1], 0, extent[2])
-           - centre) @ rotation[:2].T * float(zoom) * stride
-    w_out = int(np.ceil((box[:, 0].max() - box[:, 0].min()) * margin)) + 8
-    h_out = int(np.ceil((box[:, 1].max() - box[:, 1].min()) * margin)) + 8
+    if out_size is None:
+        box = (_box_corners(0, extent[0], 0, extent[1], 0, extent[2])
+               - centre) @ rotation[:2].T * float(zoom) * stride
+        w_out = int(np.ceil((box[:, 0].max() - box[:, 0].min()) * margin)) + 8
+        h_out = int(np.ceil((box[:, 1].max() - box[:, 1].min()) * margin)) + 8
+    else:
+        w_out, h_out = max(8, int(out_size[0])), max(8, int(out_size[1]))
     w_o, h_o = -(-w_out // stride), -(-h_out // stride)
-    cx = w_o / 2.0 - (mat2[0, 0] * p0 + mat2[0, 1] * q0)
-    cy = h_o / 2.0 - (mat2[1, 0] * p0 + mat2[1, 1] * q0)
+    # The pan is given in final pixels, so it divides down with everything else.
+    cx = w_o / 2.0 - (mat2[0, 0] * p0 + mat2[0, 1] * q0) + float(pan[0]) / stride
+    cy = h_o / 2.0 - (mat2[1, 0] * p0 + mat2[1, 1] * q0) + float(pan[1]) / stride
     # warpAffine reads (x=col=q, y=row=p), hence the swapped columns.
     warp = np.array([[mat2[0, 1], mat2[0, 0], cx],
                      [mat2[1, 1], mat2[1, 0], cy]], dtype=np.float32)
-    intensity = cv2.warpAffine(intensity, warp, (w_o, h_o),
-                               flags=cv2.INTER_LINEAR)
+    # Cubic on the quality pass: this warp is usually a magnification (the view
+    # is rendered at the widget's own resolution so nothing has to resample it
+    # again on the way to the screen), and bilinear magnification is exactly
+    # what turns a bead into a soft blob. Cubic overshoots, hence the clip —
+    # without it a negative undershoot wraps around when cast to uint8.
+    intensity = cv2.warpAffine(
+        intensity, warp, (w_o, h_o),
+        flags=cv2.INTER_CUBIC if stride == 1 else cv2.INTER_LINEAR)
+    np.clip(intensity, 0.0, 1.0, out=intensity)
     if dep is not None:
         dep = cv2.warpAffine(dep, warp, (w_o, h_o), flags=cv2.INTER_NEAREST)
 
@@ -1222,12 +1130,12 @@ def save_axial_comparison(z_a, prof_a, z_b, prof_b, dz, out_dir, filename):
 
 # --- the pipeline ----------------------------------------------------------
 def process_slice(img, p, refs=None):
-    """Run the quantitative pipeline (stages 1-7) on one slice.
+    """Run the quantitative pipeline (stages 1-4) on one slice.
 
     ``p`` is the parameter dict from the UI; ``refs`` carries the reference
-    images (``avg``, ``noise``, ``hot_mask``) already matched to this slice.
-    Returns float32 — the display stages are applied separately so the
-    quantitative result can be exported at full precision.
+    image (``hot_mask``) already matched to this slice. Returns float32 — the
+    display stages are applied separately so the quantitative result can be
+    exported at full precision.
     """
     refs = refs or {}
     out = np.asarray(img, dtype=np.float32)
@@ -1237,33 +1145,15 @@ def process_slice(img, p, refs=None):
         out = remove_hot_pixels(out, k=p["hot_k"], window=p["hot_win"],
                                 mask=refs.get("hot_mask"))
 
-    # 2. noise floor (variance domain)
-    if p["noise_mode"] == "reference" and refs.get("noise") is not None:
-        out = subtract_noise_reference(out, refs["noise"], strength=p["noise_strength"])
-    elif p["noise_mode"] == "analytic" and refs.get("avg") is not None:
-        out = subtract_noise_analytic(out, refs["avg"], gain_adu_per_e=p["gain"],
-                                      offset=p["offset"], read_noise_adu=p["read_noise"],
-                                      strength=p["noise_strength"])
-
-    # 3. normalization / flat field
-    if p["norm_mode"] in ("ratio", "sqrt") and refs.get("avg") is not None:
-        out = normalize_by_average(out, refs["avg"], offset=p["offset"], mode=p["norm_mode"])
-    elif p["norm_mode"] == "self":
-        out = self_flat_field(out, sigma=p["flat_sigma"])
-
-    # 4. background
+    # 2. background
     if p["bg_radius"] > 0:
         out = rolling_ball_background(out, radius=p["bg_radius"])
 
-    # 5. denoise
+    # 3. denoise
     if p["denoise_method"] != "none":
         out = denoise(out, method=p["denoise_method"], strength=p["denoise_strength"])
 
-    # 6. deconvolution
-    if p["decon_on"] and p["decon_iters"] > 0:
-        out = richardson_lucy(out, gaussian_psf(p["decon_sigma"]), p["decon_iters"])
-
-    # 7. sharpen
+    # 4. sharpen
     if p["unsharp_amount"] > 0:
         out = unsharp_mask(out, amount=p["unsharp_amount"], radius=p["unsharp_radius"])
 
@@ -1271,20 +1161,16 @@ def process_slice(img, p, refs=None):
 
 
 def render_display(processed, p, disp_range=None):
-    """Run the display stages (8-12). Returns ``(view, (disp_min, disp_max))``."""
+    """Run the display stages (5-8). Returns ``(view, (disp_min, disp_max))``."""
     if disp_range is not None:
         lo, hi = disp_range
     elif p["contrast_mode"] == "auto":
         lo, hi = imagej_auto_minmax(processed)
-    elif p["contrast_mode"] == "percentile":
-        lo, hi = percentile_minmax(processed, p["pct_low"], p["pct_high"])
     else:
         lo, hi = p["manual_min"], p["manual_max"]
 
     view = apply_display_range(processed, lo, hi)
     view = apply_gamma(view, p["gamma"])
-    if p["clahe_on"]:
-        view = apply_clahe(view, p["clahe_clip"], p["clahe_tiles"])
     view = apply_lut(view, p["lut"])
     if p["scalebar_on"]:
         view = draw_scale_bar(view, p["um_per_px"], p["bar_um"])
@@ -1326,6 +1212,25 @@ def load_image_file(path):
     return arr.astype(np.float32)
 
 
+def load_image_plane(path, page):
+    """Load exactly one plane of a stack file, without decoding the rest.
+
+    A multi-page TIFF backing a 100+ plane z-stack must not be fully
+    re-decoded from disk on every single slice change while scrubbing —
+    ``tifffile`` can seek and decode one IFD directly via ``key=``.
+    ``.mat`` has no such partial-read path (acquisitions normally write one
+    ``.mat`` per plane, so this only costs a whole-file load on the rarer
+    genuinely multi-plane ``.mat``).
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".mat":
+        return np.ascontiguousarray(load_image_file(path)[page], dtype=np.float32)
+    arr = np.squeeze(np.asarray(tifffile.imread(str(path), key=page)))
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        arr = arr[..., 0]  # collapse an RGB(A) page to one channel
+    return arr.astype(np.float32)
+
+
 class Frame:
     """One slice, loaded lazily from its source file."""
 
@@ -1338,7 +1243,7 @@ class Frame:
     @property
     def data(self):
         if self._data is None:
-            self._data = load_image_file(self.path)[self.page]
+            self._data = load_image_plane(self.path, self.page)
         return self._data
 
     def release(self):

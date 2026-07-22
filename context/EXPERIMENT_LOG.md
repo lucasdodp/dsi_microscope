@@ -26,6 +26,46 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-21 — Optical z-sectioning: per-bead axial FWHM, ORCA DSI vs EVK4 event (3D agarose)
+
+**Conditions**
+- Sample: beads dispersed through a thick **3D agarose** film (beads at all depths, not one plane).
+- Light power at sample: 1.75 mW.
+- Illumination (AWG): CH1 = 1500 Hz, 18 Vpp, square (CH2 off).
+- Camera settings: 100-plane Z-stack, 0.5 µm step (≈50 µm range) on **both** cameras.
+  ORCA-Fusion 30 ms × N=200 per plane, ROI cropped to the EVK4 FOV. EVK4 5 s/plane,
+  bias_fo=bias_hpf=40, bias_on=bias_off=0 (acq1/2); acq3 = "threshold40test".
+- Data at `D:/2026-07-21/` — 3 ORCA (`orca_3d_agarose_acquisition{1,2,3}`) and 3 EVK4
+  (`evk4_3d_agarose_acquisition{1,2,3_threshold40test}`) acquisitions.
+
+**Data treatment**
+- Whole-plane axial profile is invalid on a 3D sample (beads in every plane → its FWHM
+  measures film thickness). Measured sectioning **per bead**: detect axially-isolated
+  beads on the sectioned max-projection, extract each bead's I(z), fit a
+  Gaussian-on-offset, report the **distribution** of FWHM = 2.3548·σ over N beads.
+- Widefield (per-frame average) beads measured from the **raw** ROI (no annulus
+  subtraction) so the out-of-focus pedestal survives and is captured by the fit offset —
+  subtracting it would launder the haze and make widefield look sectioned.
+
+**Results**
+- **ORCA DSI axial sectioning ≈ 2.1–2.4 µm** (2.14±0.43 / 2.42±0.50 / 2.37±0.40, median±MAD;
+  N=20/34/59), consistent across three repeats.
+- **EVK4 event-DSI comparable, ≈ 1.9–2.9 µm** (2.46±1.07 / 2.88±1.00 / 1.87±0.65; N=35/37/50) —
+  the event camera sections as well as the sCMOS on this sample; bias-40 run is tightest.
+- **Sectioning gain over widefield ×2.1–2.4** (widefield FWHM 4.6–5.6 µm), and the
+  out-of-focus haze floor drops from ≈0.44 (widefield) to ≈0.20 (DSI), ~2.2× better rejection.
+- FWHM-vs-depth slope small (≈7 nm/µm ORCA): no strong depth degradation over the in-range band.
+- **Caveats:** EVK4 runs not all at one bias (acq3=bias 40) → spread is method+setting, not pure
+  optics; bead diameter not deconvolved; a thin/2D bead layer is still the clean PSF gold standard.
+
+**Main files generated** (in `D:/2026-07-21/`)
+- `<acq>/<acq>_perbead_sectioning.png` — per-acquisition figure (FWHM histogram, FWHM-vs-depth,
+  mean bead axial response DSI vs widefield).
+- `ZSECTIONING_SUMMARY.md`, `zsectioning_summary.json` — write-up + machine-readable metrics.
+- `analysis_scripts/` — `per_bead_axial.py` (detection + Gaussian fit) and `run_eval.py` (driver).
+
+---
+
 ## 2026-07-20 — Biases in physical units (Hz): temporal spectrum of the event stream (re-analysis of 07-15/16)
 
 **Conditions**

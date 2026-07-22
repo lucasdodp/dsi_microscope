@@ -38,6 +38,7 @@ from ui.widgets import (
     AWGWidget, Evk4ParamsWidget, Evk4QueueWidget, FovMatchPreviewDialog,
     OrcaParamsWidget, PIStageWidget, VideoFeedLabel,
 )
+from tools.image_lab import ImageLab
 
 
 class MainWindow(QMainWindow):
@@ -73,6 +74,10 @@ class MainWindow(QMainWindow):
         # field, so the field is only re-stamped while it still holds that default
         # (a name the user typed themselves is never overwritten).
         self._fn_defaults = {}
+        # Image Lab: opened lazily and kept modeless, so acquisition can carry
+        # on while it's open; the reference must be kept or Python would
+        # collect the window immediately.
+        self._image_lab_window = None
 
         # Live elapsed-time readout: while an acquisition runs, the relevant tab's
         # time label shows "Elapsed: mm:ss" (ground truth vs the rough estimate).
@@ -143,6 +148,14 @@ class MainWindow(QMainWindow):
         preset_layout.addWidget(btn_save_preset)
         preset_layout.addWidget(btn_load_preset)
         control_layout.addLayout(preset_layout)
+
+        btn_image_lab = QPushButton("Open Image Lab…")
+        btn_image_lab.setToolTip(
+            "Open the two-channel post-processing workbench (tools/image_lab.py) "
+            "in its own window, for turning acquired stacks into publication-quality images."
+        )
+        btn_image_lab.clicked.connect(self.open_image_lab)
+        control_layout.addWidget(btn_image_lab)
 
         # Shared instruments live in collapsible sections so both Z-stack tabs can
         # reach them. The AWG is set rarely, so it starts collapsed; the PI stage is
@@ -855,6 +868,28 @@ class MainWindow(QMainWindow):
                 self.txt_orca_dir.setText(od.get("orca") or od.get("zstack"))
             if od.get("evk4") or od.get("zstack"):
                 self.txt_evk4_dir.setText(od.get("evk4") or od.get("zstack"))
+
+    def open_image_lab(self):
+        """Open the Image Lab post-processing workbench in its own window.
+
+        Reuses the running QApplication instead of spawning a subprocess, so it
+        shares the process but not any state with acquisition; kept modeless
+        and cached so a second click just raises the existing window.
+        """
+        if self._image_lab_window is None:
+            self._image_lab_window = ImageLab()
+            self._image_lab_window.destroyed.connect(self._on_image_lab_closed)
+            # Opens maximized (title bar intact, so it can still be closed);
+            # only on creation, so a window the user has since resized is left
+            # exactly as they put it.
+            self._image_lab_window.showMaximized()
+        else:
+            self._image_lab_window.show()
+        self._image_lab_window.raise_()
+        self._image_lab_window.activateWindow()
+
+    def _on_image_lab_closed(self):
+        self._image_lab_window = None
 
     def save_preset(self):
         path, _ = QFileDialog.getSaveFileName(
