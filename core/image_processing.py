@@ -931,6 +931,27 @@ def save_mat_tif(image, out_dir, filename):
 # ---------------------------------------------------------------------------
 # EVK4 -> ORCA field-of-view matching
 # ---------------------------------------------------------------------------
+def evk4_footprint_in_orca(affine, evk4_roi):
+    """The EVK4 window's four corners in full-sensor ORCA pixels.
+
+    Returns a 4x2 float array of (x, y) in EVK4-window order TL, TR, BR, BL.
+    The footprint is *rotated* (~43 deg) in the ORCA field, so those four points
+    are a quadrilateral, not an axis-aligned box — which is exactly why the
+    event camera's field is impossible to guess from the ORCA image alone.
+
+    Pure geometry: no clamping, no alignment, and it never raises for a
+    footprint that falls off the sensor. Overlays want it raw like this;
+    :func:`map_evk4_window_to_orca` builds the aligned camera crop on top.
+    """
+    A = np.asarray(affine, dtype=np.float64)
+    if A.shape != (2, 3):
+        raise ValueError(f"affine must be 2x3, got {A.shape}")
+    x0, x1 = float(evk4_roi["x_min"]), float(evk4_roi["x_max"])
+    y0, y1 = float(evk4_roi["y_min"]), float(evk4_roi["y_max"])
+    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x1, y1, 1.0], [x0, y1, 1.0]])
+    return pts @ A.T
+
+
 def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4):
     """Map an EVK4 crop window into ORCA coordinates and derive the matching crop.
 
@@ -955,13 +976,7 @@ def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4)
       * ``clipped`` — True if the footprint ran off the ORCA sensor and the
         crop had to be cut back (the fields are then not fully shared).
     """
-    A = np.asarray(affine, dtype=np.float64)
-    if A.shape != (2, 3):
-        raise ValueError(f"affine must be 2x3, got {A.shape}")
-    x0, x1 = float(evk4_roi["x_min"]), float(evk4_roi["x_max"])
-    y0, y1 = float(evk4_roi["y_min"]), float(evk4_roi["y_max"])
-    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x1, y1, 1.0], [x0, y1, 1.0]])
-    corners = pts @ A.T  # 4x2 (x, y) in ORCA pixels
+    corners = evk4_footprint_in_orca(affine, evk4_roi)  # 4x2 (x, y) in ORCA px
 
     sw, sh = int(orca_sensor[0]), int(orca_sensor[1])
     # Expand outward to the alignment grid so the whole footprint stays inside.

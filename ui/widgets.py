@@ -1286,6 +1286,8 @@ class VideoFeedLabel(QLabel):
         self._origin = None       # drag start (widget coords)
         self._cur = None          # current drag point (widget coords)
         self._selection = None    # committed selection as QRect in image pixels
+        self._overlay = None      # fixed outline, as points in image pixels
+        self._overlay_caption = None
 
     def set_source_size(self, w, h):
         """Tell the label the pixel size of the frame currently shown."""
@@ -1324,6 +1326,19 @@ class VideoFeedLabel(QLabel):
         self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
         if not on:
             self._origin = self._cur = None
+        self.update()
+
+    def set_overlay_polygon(self, points, caption=None):
+        """Draw a fixed outline over the frame, given in source-image pixels.
+
+        Used to mark the event camera's field of view inside the ORCA image: the
+        EVK4 sees a small patch of the ORCA's field, rotated by the detection
+        optics, so without the outline "move the sample until the EVK4 sees it"
+        is guesswork. Independent of crop mode, and ``None`` clears it.
+        """
+        self._overlay = ([(float(x), float(y)) for x, y in points]
+                         if points is not None and len(points) >= 2 else None)
+        self._overlay_caption = caption
         self.update()
 
     def clear_selection(self):
@@ -1397,12 +1412,32 @@ class VideoFeedLabel(QLabel):
         self._selection = QRect(ix, iy, iw, ih)
         self.region_drawn.emit(ix, iy, iw, ih)
 
+    def _paint_overlay(self, rect, scale):
+        """Draw the fixed outline, mapped from image pixels to widget pixels."""
+        points = [QPointF(rect.left() + x * scale, rect.top() + y * scale)
+                  for x, y in self._overlay]
+        painter = QPainter(self)
+        # A footprint can run past the edge of the frame (the EVK4 field is not
+        # wholly inside a cropped ORCA view); clip so it never draws on the
+        # widget's letterbox margins, which would read as part of the image.
+        painter.setClipRect(rect)
+        painter.setPen(QPen(QColor("#00e676"), 2, Qt.PenStyle.SolidLine))
+        painter.drawPolygon(QPolygonF(points))
+        if self._overlay_caption:
+            painter.setPen(QPen(QColor("#00e676")))
+            anchor = min(points, key=lambda p: (p.y(), p.x()))
+            painter.drawText(QPointF(anchor.x() + 6, anchor.y() - 6),
+                             self._overlay_caption)
+        painter.end()
+
     def paintEvent(self, event):
         super().paintEvent(event)  # draws the pixmap / text as usual
-        if not self._crop_mode:
-            return
         rect, scale = self._image_rect()
         if rect is None:
+            return
+        if self._overlay is not None:
+            self._paint_overlay(rect, scale)
+        if not self._crop_mode:
             return
 
         # The box to draw: the live drag if one is in progress, otherwise the

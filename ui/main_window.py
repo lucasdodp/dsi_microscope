@@ -29,7 +29,8 @@ from config import (
     ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
     PREVIEW_MAX_DISPLAY_EDGE, SESSION_STATE_PATH,
 )
-from core import compose_registration_overlay, downscale_for_display, map_evk4_window_to_orca
+from core import (compose_registration_overlay, downscale_for_display,
+                  evk4_footprint_in_orca, map_evk4_window_to_orca)
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
 from ui.fov_registration import FovRegistrationWorker
@@ -441,6 +442,10 @@ class MainWindow(QMainWindow):
         #    "Apply Biases to Live Feed" is clicked.
         self.evk4_params = Evk4ParamsWidget()
         self.evk4_params.spin_time.valueChanged.connect(self._update_evk4_time)
+        # The outline is recomputed with every ORCA frame anyway; this keeps it
+        # honest on a frozen frame too, when either camera's window is edited.
+        self.evk4_params.roi_changed.connect(self._refresh_evk4_footprint)
+        self.orca_params.roi_changed.connect(self._refresh_evk4_footprint)
         layout.addWidget(self.evk4_params)
 
         # 3. Automated Z-stack acquisition.
@@ -1643,6 +1648,7 @@ class MainWindow(QMainWindow):
             return
 
         self._fov_affine = affine  # adopt: future 'Match crop' clicks use it
+        self._refresh_evk4_footprint()   # the outline moves with the new affine
         self.orca_params.set_roi_window(crop)
         self._save_fov_match(crop, evk4_roi, corners,
                              method="measured", score=score, reg_params=params)
@@ -1950,6 +1956,57 @@ class MainWindow(QMainWindow):
     def update_orca_image(self, cv_img):
         self._orca_frame = cv_img
         self._render_to_label(self.video_label_orca, cv_img)
+        self._draw_evk4_footprint(cv_img)
+
+    # ==========================
+    # EVK4 field-of-view outline on the ORCA feed
+    # ==========================
+    def _orca_frame_transform(self, src_w, src_h):
+        """``(x0, y0, sx, sy)`` mapping full-sensor ORCA px -> displayed frame px.
+
+        The live frame is the active ROI window, at the active binning. Deriving
+        the scale from the frame's own size against the ROI's absorbs the
+        binning without having to parse it — and if the frame turns out larger
+        than the ROI (the window is not actually applied), it falls back to
+        treating the frame as the whole sensor rather than drawing a lie.
+        """
+        roi = self.orca_params.get_params()["orca_roi"]
+        w = max(1, int(roi["x_max"]) - int(roi["x_min"]))
+        h = max(1, int(roi["y_max"]) - int(roi["y_min"]))
+        if src_w > w or src_h > h:
+            return (0.0, 0.0,
+                    src_w / float(ORCA_SENSOR_WIDTH), src_h / float(ORCA_SENSOR_HEIGHT))
+        return float(roi["x_min"]), float(roi["y_min"]), src_w / w, src_h / h
+
+    def _draw_evk4_footprint(self, cv_img):
+        """Outline the EVK4's field of view on the ORCA feed.
+
+        The event camera sees a small patch of the ORCA's field, rotated ~43 deg
+        by the detection optics, so finding a region *for the EVK4* while
+        looking at the ORCA image is otherwise trial and error. Drawn from the
+        affine currently in force (``self._fov_affine`` — the last measured
+        registration, else the stored calibration) and the EVK4 tab's ROI, so it
+        tracks both without any extra action.
+        """
+        label = self.video_label_orca
+        if not self.chk_show_evk4_fov.isChecked() or cv_img is None:
+            label.set_overlay_polygon(None)
+            return
+        try:
+            evk4_roi = self.evk4_params.get_params()["evk4_roi"]
+            corners = evk4_footprint_in_orca(self._fov_affine, evk4_roi)
+        except Exception:  # noqa: BLE001 — a bad affine must not stop the preview
+            label.set_overlay_polygon(None)
+            return
+        src_h, src_w = cv_img.shape[:2]
+        x0, y0, sx, sy = self._orca_frame_transform(src_w, src_h)
+        label.set_overlay_polygon(
+            [((x - x0) * sx, (y - y0) * sy) for x, y in corners], "EVK4 field")
+
+    def _refresh_evk4_footprint(self):
+        """Redraw the outline on the frame already on screen (toggle / ROI edit)."""
+        if getattr(self, "_orca_frame", None) is not None:
+            self._draw_evk4_footprint(self._orca_frame)
 
     @pyqtSlot(np.ndarray)
     def update_evk4_image(self, cv_img):
@@ -1982,6 +2039,15 @@ class MainWindow(QMainWindow):
         self.btn_crop_reset = QPushButton("Reset to Full")
         self.btn_crop_reset.clicked.connect(self._reset_crop)
 
+        self.chk_show_evk4_fov = QCheckBox("Show EVK4 field")
+        self.chk_show_evk4_fov.setChecked(True)
+        self.chk_show_evk4_fov.setToolTip(
+            "Outline the event camera's field of view on the ORCA feed, so you "
+            "can drive a region of the sample into it.\n"
+            "Uses the EVK4→ORCA registration currently in force; if the cameras "
+            "have been moved since, re-run 'Measure & Match'.")
+        self.chk_show_evk4_fov.toggled.connect(self._refresh_evk4_footprint)
+
         self.lbl_crop = QLabel("")
         self.lbl_crop.setStyleSheet(
             "color: #00e676; font-size: 11px; font-weight: bold; border: none;"
@@ -1990,6 +2056,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_crop_select)
         layout.addWidget(self.btn_crop_apply)
         layout.addWidget(self.btn_crop_reset)
+        layout.addWidget(self.chk_show_evk4_fov)
         layout.addWidget(self.lbl_crop, stretch=1)
         return bar
 
