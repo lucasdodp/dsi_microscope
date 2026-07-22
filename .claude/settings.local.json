@@ -8,6 +8,9 @@
       "Read(//d/2026-07-08/linearity_analysis/**)",
       "Bash(python -)",
       "Bash(PYTHONIOENCODING=utf-8 python test_axial_gui.py)",
+      "Bash(python -m py_compile core/image_processing.py core/__init__.py hardware/orca_camera.py ui/orchestrator.py ui/widgets.py ui/main_window.py)",
+      "Bash(python -m py_compile hardware/orca_camera.py ui/orchestrator.py)",
+      "Bash(python -m py_compile config.py hardware/orca_camera.py)",
       "Bash(python -c ' *)"
     ]
   }

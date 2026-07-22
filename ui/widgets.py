@@ -1224,6 +1224,11 @@ class PIStageWidget(QWidget):
         scan upward) or ``"center"`` (focus is the middle plane)."""
         return "start" if self.combo_zmode.currentIndex() == 1 else "center"
 
+    def set_start_mode(self, mode):
+        """Restore an anchoring mode saved by :meth:`start_mode` (anything other
+        than ``"start"`` falls back to centred)."""
+        self.combo_zmode.setCurrentIndex(1 if mode == "start" else 0)
+
     def _initial_position(self):
         """Absolute position of the first (bottom) plane, per the anchoring mode."""
         focus = self.spin_focus.value()

@@ -101,7 +101,7 @@ import cv2
 import numpy as np
 import tifffile
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QFontMetrics, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -119,6 +119,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -419,6 +420,22 @@ _HIGHLIGHT_STYLE = (
 )
 
 
+def _dp(px):
+    """Scale a pixel size that was chosen against the 13px design font.
+
+    Every fixed width/height below was eyeballed on a 100%-scaling display. Qt
+    scales the *text* when the effective font grows (display scaling, the
+    Windows text-size setting, a different font fallback) but leaves these
+    constants where they are, so a panel that fit on one machine clips its
+    contents and sprouts a horizontal scrollbar on another. Tying them to the
+    real font metrics keeps the box-to-text ratio identical everywhere.
+    """
+    app = QApplication.instance()
+    if app is None:
+        return px
+    return int(round(px * max(1.0, QFontMetrics(app.font()).height() / 17.0)))
+
+
 def _highlight(button):
     """Mark a button as one of the tool's few essential, high-value actions."""
     button.setStyleSheet(_HIGHLIGHT_STYLE)
@@ -564,7 +581,7 @@ class VolumeView(QDialog):
     def __init__(self, parent, channel, builder, max_dim=256):
         super().__init__(parent)
         self.setWindowTitle(f"3-D volume — channel {channel.name}")
-        self.resize(1180, 820)
+        self.resize(_dp(1180), _dp(820))
         self.setWindowFlag(Qt.WindowType.Window, True)   # modeless, own taskbar entry
 
         self.channel = channel
@@ -608,7 +625,7 @@ class VolumeView(QDialog):
 
         side = QWidget()
         side.setLayout(panel)
-        side.setFixedWidth(330)
+        side.setFixedWidth(_dp(330))
         root = QHBoxLayout(self)
         root.addWidget(self.canvas, 1)
         root.addWidget(side)
@@ -1144,7 +1161,7 @@ class ImageLab(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DSI Image Lab — two-channel post-processing workbench")
-        self.resize(1650, 980)
+        self.resize(_dp(1650), _dp(980))
 
         self.channels = {"A": Channel("A"), "B": Channel("B")}
         self.active = "A"
@@ -1222,20 +1239,19 @@ class ImageLab(QMainWindow):
         left.addWidget(scroll, 1)
         side = QWidget()
         side.setLayout(left)
-        side.setMinimumWidth(370)
-        side.setMaximumWidth(450)
+        side.setMinimumWidth(_dp(370))
 
         self.image_label = ImageView("Load a file into channel A (and optionally B) to begin.")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setStyleSheet("background:#101010; color:#888;")
-        self.image_label.setMinimumSize(560, 420)
+        self.image_label.setMinimumSize(_dp(560), _dp(420))
         self.image_label.scrolled.connect(self._on_image_wheel)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
         self.pos_label = QLabel("0 / 0")
-        self.pos_label.setMinimumWidth(90)
+        self.pos_label.setMinimumWidth(_dp(90))
         self.pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         nav = QHBoxLayout()
@@ -1250,10 +1266,23 @@ class ImageLab(QMainWindow):
         right.addWidget(self.image_label, 1)
         right.addLayout(nav)
         right.addWidget(self.status_label)
+        viewer = QWidget()
+        viewer.setLayout(right)
+
+        # A splitter rather than a fixed-width column: whatever the font ends up
+        # being on a given machine, the user can widen the panel until its
+        # contents fit instead of being stuck with a clipped one.
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(side)
+        split.addWidget(viewer)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setChildrenCollapsible(False)
+        split.setSizes([_dp(400), _dp(1250)])
 
         root = QHBoxLayout()
-        root.addWidget(side)
-        root.addLayout(right, 1)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(split)
         central = QWidget()
         central.setLayout(root)
         self.setCentralWidget(central)
@@ -1267,7 +1296,7 @@ class ImageLab(QMainWindow):
             b_files = QPushButton("File(s)…")
             b_files.clicked.connect(lambda _, n=name: self.open_files(n))
             b_clear = QPushButton("✕")
-            b_clear.setMaximumWidth(30)
+            b_clear.setMaximumWidth(_dp(30))
             b_clear.setToolTip(f"Unload channel {name}")
             b_clear.clicked.connect(lambda _, n=name: self.clear_channel(n))
             row = QHBoxLayout()
@@ -1300,7 +1329,7 @@ class ImageLab(QMainWindow):
         """
         self.editing = QComboBox()
         self.editing.addItems(["A", "B"])
-        self.editing.setFixedWidth(64)
+        self.editing.setFixedWidth(_dp(64))
         self.editing.currentTextChanged.connect(self._on_editing_changed)
 
         self.editing_label = QLabel()

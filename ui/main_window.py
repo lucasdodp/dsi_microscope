@@ -820,6 +820,7 @@ class MainWindow(QMainWindow):
                 "step_size": self.pi_stage_widget.spin_step_size.value(),
                 "num_steps": self.pi_stage_widget.spin_steps.value(),
                 "focus": self.pi_stage_widget.spin_focus.value(),
+                "mode": self.pi_stage_widget.start_mode(),
             },
             "save_raw": {
                 # EVK4 .raw is always saved; only the ORCA raw-stack toggle persists.
@@ -859,6 +860,10 @@ class MainWindow(QMainWindow):
                 self.pi_stage_widget.spin_steps.setValue(int(z["num_steps"]))
             if "focus" in z:
                 self.pi_stage_widget.spin_focus.setValue(float(z["focus"]))
+            # Files written before the anchoring mode was persisted have no
+            # "mode" key; they were all centred, which is the default anyway.
+            if "mode" in z:
+                self.pi_stage_widget.set_start_mode(z["mode"])
 
         if "save_raw" in preset:
             sr = preset["save_raw"]

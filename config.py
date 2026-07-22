@@ -283,7 +283,13 @@ NOTIFY_SMTP_TIMEOUT_S = float(os.environ.get("DSI_SMTP_TIMEOUT_S", "15"))
 STYLESHEET = """
 QMainWindow { background-color: #1e1e1e; }
 QWidget { font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #e0e0e0; }
-QGroupBox { font-weight: bold; border: 1px solid #3a3a3a; border-radius: 6px; margin-top: 12px; padding-top: 15px; background-color: #252526; }
+/* The group-box title is drawn in the top margin, so ``margin-top`` must be at
+   least as tall as a line of the (bold) title font or the text is clipped in
+   half. Sized in ``em`` — i.e. relative to the font actually in use — because a
+   fixed 12px reserved exactly one 13px line with no headroom: any machine whose
+   Segoe UI resolves a little taller (display scaling, the Windows text-size
+   setting, a different font fallback) guillotined every title in the app. */
+QGroupBox { font-weight: bold; border: 1px solid #3a3a3a; border-radius: 6px; margin-top: 1.6em; padding-top: 0.45em; background-color: #252526; }
 QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; color: #4daaf2; left: 10px; }
 QLabel { color: #cccccc; }
 
@@ -292,7 +298,7 @@ QLineEdit, QComboBox {
     border: 1px solid #555555;
     border-radius: 4px;
     padding: 4px 8px;
-    min-height: 24px;
+    min-height: 1.9em;
     color: #ffffff;
 }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #4daaf2; }
@@ -303,7 +309,7 @@ QSpinBox, QDoubleSpinBox {
     border: 1px solid #555555;
     border-radius: 4px;
     padding: 4px 25px 4px 8px;
-    min-height: 24px;
+    min-height: 1.9em;
     color: #ffffff;
 }
 QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #4daaf2; }
@@ -313,7 +319,7 @@ QPushButton {
     border: none;
     border-radius: 4px;
     padding: 6px 12px;
-    min-height: 24px;
+    min-height: 1.9em;
     color: white;
     font-weight: bold;
 }
