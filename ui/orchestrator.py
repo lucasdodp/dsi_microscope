@@ -28,10 +28,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import (
     DCAM_EXPOSURE_PROP, EVK4_ERC_RATE, EVK4_MAX_RECONNECT_ATTEMPTS, EVK4_RECONNECT_DELAY_S,
+    EVK4_SAVE_FORMAT_CSV, EVK4_SAVE_FORMAT_DEFAULT,
 )
 from core import (
-    accumulate_event_frame, apply_smoothing, compute_dsi_images, crop_to_roi,
-    filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
+    EventCsvWriter, accumulate_event_frame, apply_smoothing, compute_dsi_images,
+    crop_to_roi, filter_crazy_pixels, normalize_to_8bit, save_axial_average_plot,
     save_axial_sectioning_plot, save_parameter_log,
     save_raw_stack_tiff, save_volume_tiff,
 )
@@ -420,19 +421,27 @@ class AutomatedZStackWorker(QThread):
         roi = p.get("evk4_roi")
         apply_event_roi(device, roi)
 
-        # Always save this plane's raw event stream (one .raw per plane). Logging
-        # must start before the iterator and be stopped in a finally — stopping
-        # without a prior log_raw_data can crash the native library.
+        # Save this plane's event record, in whichever format the run selected.
+        # EVT3 logging must start before the iterator and be stopped in a finally
+        # — stopping without a prior log_raw_data can crash the native library.
+        # CSV needs the sensor geometry, so its writer starts after the iterator.
+        csv_mode = p.get("evk4_save_format", EVK4_SAVE_FORMAT_DEFAULT) == EVK4_SAVE_FORMAT_CSV
         raw_dir = self.save_params.get("raw_dir") or self.save_params.get("output_dir", "")
         filename = self.save_params.get("filename", "zstack")
         events_stream = device.get_i_events_stream()
         raw_path = None
-        if raw_dir and events_stream:
+        if raw_dir and events_stream and not csv_mode:
             raw_path = os.path.join(raw_dir, f"{filename}_events_z{step:03d}.raw")
             events_stream.log_raw_data(raw_path)
 
         mv_iterator = EventsIterator.from_device(device=device)
         height, width = mv_iterator.get_size()
+
+        csv_writer = None
+        if raw_dir and csv_mode:
+            csv_writer = EventCsvWriter(
+                os.path.join(raw_dir, f"{filename}_events_z{step:03d}_xytp.csv"),
+                width, height).start()
 
         acqu_time = p["acqu_time"]
         self.status_update.emit(f"Recording events at plane {step+1} for {acqu_time} s...")
@@ -507,8 +516,16 @@ class AutomatedZStackWorker(QThread):
                 # for the saved image).
                 for _ in events_for_duration():
                     pass
+            elif csv_writer is not None:
+                # CSV mode: there is no file to re-read afterwards, so this loop
+                # is the only chance to capture the events. submit() is a memcpy
+                # plus a queue put — formatting and disk I/O happen on the
+                # writer thread — so the loop stays about as cheap as the raw
+                # path's empty one.
+                for evs in events_for_duration():
+                    csv_writer.submit(evs)
             else:
-                # No raw file to re-read (unsaved run) — accumulate the live
+                # No event file at all (unsaved run) — accumulate the live
                 # stream as a best-effort fallback.
                 event_img = accumulate_event_frame(events_for_duration(), width, height)
         except Exception:
@@ -519,6 +536,10 @@ class AutomatedZStackWorker(QThread):
         finally:
             recording_over.set()
             stop_logging_once()
+            # Drain the CSV writer before the device is torn down: the events it
+            # still holds exist nowhere else.
+            if csv_writer is not None:
+                csv_writer.close()
             wd.join(timeout=2.0)
         if raw_path is not None:
             event_img = None  # reconstructed from the (possibly partial) raw below
@@ -539,6 +560,11 @@ class AutomatedZStackWorker(QThread):
                 # seconds against a 2 s recording). The .raw is the authoritative
                 # record and loses nothing, so the stream is generated offline
                 # afterwards instead:  python tools/backfill_event_streams.py
+            elif csv_writer is not None:
+                # The writer counted exactly what it wrote, so the image and the
+                # CSV agree by construction — no second pass needed.
+                event_img = csv_writer.image()
+                self._report_csv_plane(csv_writer, step)
             else:  # unsaved run force-stopped before any accumulation
                 event_img = np.zeros((height, width), dtype=np.float32)
 
@@ -562,6 +588,24 @@ class AutomatedZStackWorker(QThread):
         if p.get("apply_smoothing", True):
             event_img = apply_smoothing(event_img)
         return event_img
+
+    def _report_csv_plane(self, writer, step):
+        """Report a CSV plane's outcome, loudly if any events were dropped.
+
+        In a long unattended stack this is the only signal that a plane recorded
+        less than the camera delivered: CSV mode keeps no complete file, so a
+        dropped chunk is gone and an under-recorded plane is otherwise
+        indistinguishable from a dim one.
+        """
+        if writer.error is not None:
+            self.status_update.emit(f"Plane {step+1}: CSV writer error: {writer.error}")
+        if writer.events_dropped:
+            total = writer.events_written + writer.events_dropped
+            pct = 100.0 * writer.events_dropped / total if total else 0.0
+            self.status_update.emit(
+                f"Plane {step+1}: WARNING — {writer.events_dropped:,} of {total:,} events "
+                f"({pct:.1f} %) dropped; the CSV writer could not keep up. Lower the "
+                f"event rate, raise DSI_EVK4_CSV_QUEUE, or record EVT3 (.raw) instead.")
 
     def _sleep_interruptible(self, seconds):
         """Sleep, but wake early if the user aborts (keeps Stop responsive)."""

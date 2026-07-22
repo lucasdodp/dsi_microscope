@@ -1212,19 +1212,48 @@ def load_image_file(path):
     return arr.astype(np.float32)
 
 
+# Most recently decoded multi-plane ``.mat``, as ((path, mtime_ns), array).
+# One entry only — see ``_mat_stack``.
+_MAT_CACHE = None
+
+
+def _mat_stack(path):
+    """The whole ``.mat`` stack, reusing the last decode of the same file.
+
+    ``.mat`` has no partial-read path, so each plane request re-parses the
+    entire file. A stack-wide pass over an N-plane ``.mat`` (stack histogram,
+    export, 3-D build) therefore cost N *full-file* decodes — quadratic in the
+    plane count, and the single slowest thing the tool did on such a dataset.
+
+    Caching the most recent file collapses that to one decode. Only one entry is
+    kept, so the extra memory is a single file's array — which is exactly what
+    one of those decodes already had to hold. The key includes the modification
+    time, so a file rewritten on disk is re-read rather than served stale.
+    """
+    global _MAT_CACHE
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:          # unstat-able: fall back to always decoding
+        return load_image_file(path)
+    if _MAT_CACHE is not None and _MAT_CACHE[0] == key:
+        return _MAT_CACHE[1]
+    arr = load_image_file(path)
+    _MAT_CACHE = (key, arr)
+    return arr
+
+
 def load_image_plane(path, page):
     """Load exactly one plane of a stack file, without decoding the rest.
 
     A multi-page TIFF backing a 100+ plane z-stack must not be fully
     re-decoded from disk on every single slice change while scrubbing —
     ``tifffile`` can seek and decode one IFD directly via ``key=``.
-    ``.mat`` has no such partial-read path (acquisitions normally write one
-    ``.mat`` per plane, so this only costs a whole-file load on the rarer
-    genuinely multi-plane ``.mat``).
+    ``.mat`` has no such partial-read path, so consecutive planes of one file
+    are served from ``_mat_stack``'s single-file cache instead.
     """
     path = Path(path)
     if path.suffix.lower() == ".mat":
-        return np.ascontiguousarray(load_image_file(path)[page], dtype=np.float32)
+        return np.ascontiguousarray(_mat_stack(path)[page], dtype=np.float32)
     arr = np.squeeze(np.asarray(tifffile.imread(str(path), key=page)))
     if arr.ndim == 3 and arr.shape[-1] in (3, 4):
         arr = arr[..., 0]  # collapse an RGB(A) page to one channel

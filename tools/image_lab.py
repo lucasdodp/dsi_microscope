@@ -94,6 +94,7 @@ import os
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -322,9 +323,14 @@ class Channel:
         # warp, or Z resample all reuse the same "materialised slices" slot, but
         # each needs its own label in the status line (see ImageLab._describe).
         self.registered_reason = None
-        self.processed = None
-        self.cache_key = None
         self.stack_range = None
+        # Processed slices, most-recently-used last. Scrubbing a stack used to
+        # re-read the plane from disk and re-run the whole pipeline on every
+        # slider step, including when stepping back onto a slice just visited;
+        # keeping the last few makes revisiting one free.
+        self._cache = OrderedDict()
+        self._cache_signature = None
+        self._cache_bytes = 0
 
     # -- data access ---------------------------------------------------
     @property
@@ -342,9 +348,13 @@ class Channel:
 
     def reset_derived(self):
         """Drop everything computed from the pixels (after a load / re-register)."""
-        self.processed = None
-        self.cache_key = None
+        self._clear_cache()
         self.stack_range = None
+
+    def _clear_cache(self):
+        self._cache.clear()
+        self._cache_bytes = 0
+        self._cache_signature = None
 
     # -- pipeline ------------------------------------------------------
     _PIPELINE_KEYS = (
@@ -352,8 +362,19 @@ class Channel:
         "denoise_method", "denoise_strength", "unsharp_amount", "unsharp_radius",
     )
 
-    def pipeline_key(self):
-        return ((self.index, self.registered is not None)
+    # Cached processed slices are bounded by total bytes, not by count: one
+    # slice is ~21 MB at the full ORCA sensor but well under 1 MB for a small
+    # EVK4 crop, so a fixed slice count would either waste memory on one or be
+    # useless on the other.
+    _CACHE_BYTES = 256 * 1024 * 1024
+
+    def pipeline_signature(self):
+        """Everything except the slice index that the pipeline output depends on.
+
+        The index is deliberately *not* part of this: it keys the cache instead,
+        so moving through the stack reuses entries rather than invalidating them.
+        """
+        return ((self.registered is not None,)
                 + tuple(self.params[k] for k in self._PIPELINE_KEYS))
 
     def process_index(self, i, release=True):
@@ -364,25 +385,36 @@ class Channel:
         return out
 
     def ensure_processed(self):
-        """Recompute the current slice only when a pipeline input changed."""
-        key = self.pipeline_key()
-        if key != self.cache_key or self.processed is None:
-            self.processed = self.process_index(self.index, release=False)
-            self.cache_key = key
-        return self.processed
+        """The current slice, processed — from cache when nothing has changed."""
+        signature = self.pipeline_signature()
+        if signature != self._cache_signature:
+            self._clear_cache()          # a pipeline setting moved: all stale
+            self._cache_signature = signature
+        out = self._cache.get(self.index)
+        if out is not None:
+            self._cache.move_to_end(self.index)
+            return out
+        out = self.process_index(self.index, release=False)
+        self._cache[self.index] = out
+        self._cache_bytes += out.nbytes
+        # Always keep the current slice, even if it alone exceeds the budget.
+        while self._cache_bytes > self._CACHE_BYTES and len(self._cache) > 1:
+            _, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= evicted.nbytes
+        return out
 
     def display_image(self):
-        """The float image currently on show."""
-        return self.processed
+        """The float image currently on show, or None if not processed yet."""
+        return self._cache.get(self.index)
 
     def render(self):
         """Render this channel to an 8-bit view."""
         p = self.params
-        self.ensure_processed()
+        processed = self.ensure_processed()
         rng = None
         if self.use_stack_range and p["contrast_mode"] != "manual":
             rng = self.stack_range
-        return render_display(self.processed, p, rng)
+        return render_display(processed, p, rng)
 
     use_stack_range = False
 
@@ -2155,6 +2187,7 @@ class ImageLab(QMainWindow):
         if c.stack_range is not None or c.params["contrast_mode"] == "manual":
             return
         lows, highs = [], []
+        cancelled = False
         prog = QProgressDialog(f"Computing stack histogram (channel {c.name})…",
                                "Cancel", 0, c.n_slices, self)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -2163,6 +2196,7 @@ class ImageLab(QMainWindow):
                 prog.setValue(i)
                 QApplication.processEvents()
                 if prog.wasCanceled():
+                    cancelled = True
                     break
                 img = c.process_index(i)
                 lo, hi = imagej_auto_minmax(img)
@@ -2170,6 +2204,19 @@ class ImageLab(QMainWindow):
                 highs.append(hi)
         finally:
             prog.close()
+
+        if cancelled:
+            # A partial scan is not a stack range. Caching it would display the
+            # whole stack against the statistics of the few slices that were
+            # reached — and because it is then non-None, it would never be
+            # recomputed. Fall back to per-slice auto instead of a silent lie.
+            c.stack_range = None
+            c.use_stack_range = False
+            self.stack_cb.blockSignals(True)   # not a user edit; don't re-enter
+            self.stack_cb.setChecked(False)
+            self.stack_cb.blockSignals(False)
+            self._status("Stack histogram cancelled — using per-slice auto contrast.")
+            return
         c.stack_range = (min(lows), max(highs)) if lows else None
 
     def _process_all(self, c, title):
@@ -2356,7 +2403,13 @@ class ImageLab(QMainWindow):
 
     def save_slice_tiff(self):
         c = self.ch()
-        img = c.display_image()
+        if not c.loaded:
+            return
+        # Process rather than read whatever happens to be cached: the edited
+        # channel is not necessarily the one on screen (View mode "A only"
+        # while editing B), so its cached slice can be absent or predate the
+        # current settings — which silently exported the wrong pixels.
+        img = c.ensure_processed()
         if img is None:
             return
         base, suffix = self._out_base(), f"z{c.index:03d}"
@@ -2380,6 +2433,11 @@ class ImageLab(QMainWindow):
             return
         out = self._out_dir() / f"{self._out_base(stack_wide=True)}_display"
         os.makedirs(out, exist_ok=True)
+        # Compute the stack range if it is switched on but not yet measured
+        # (nothing forces it before an export). Without this the series fell
+        # back to per-slice auto contrast — the exact flicker between planes
+        # that the stack range exists to remove.
+        self._ensure_stack_range(c)
         rng = c.stack_range if c.use_stack_range else None
         for i, img in enumerate(processed):
             view, _ = render_display(img, c.params, rng)

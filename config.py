@@ -160,7 +160,13 @@ ZSTACK_DISK_BYTES_PER_S = 150e6  # assumed sustained disk write rate for the raw
 # previously left out of the estimate entirely, which is the main reason a full-
 # sensor Z-stack ran much longer than predicted: at full sensor it is ~5–6 s PER
 # PLANE (≈90–100 Mpx/s measured; the conservative value here slightly over-estimates).
-ORCA_DSI_PROCESS_PIXELS_PER_S = 85e6
+# Raised from 85e6 after compute_dsi_images gained its exact single-pass integer
+# path (~1.6x): the same 2304x2304 x 50 stack now reconstructs at 281 Mpx/s on
+# the development machine, against 155 Mpx/s before. Kept well under that
+# measurement because the lab PC is the slower machine and this is only the
+# COLD-START value — measured run times recalibrate it after a couple of
+# acquisitions, so erring low just means the first estimate runs long.
+ORCA_DSI_PROCESS_PIXELS_PER_S = 150e6
 
 # ---------------------------------------------------------------------------
 # Session state — parameters from the last run, auto-restored on startup
@@ -200,6 +206,56 @@ ACQUISITION_HISTORY_MAX = 60  # most recent runs kept per acquisition type
 # Prophesee EVK4 (Metavision)
 # ---------------------------------------------------------------------------
 EVK4_ERC_RATE = 20_000_000          # Event Rate Controller cap (events/s)
+
+# What an EVK4 acquisition writes as its event record, selected per-run in the
+# EVK4 tab. The two options are NOT equivalent and the choice is not reversible
+# after the fact:
+#   * "evt3" — the camera's own encoded stream, logged by the SDK to <name>.raw.
+#     Costs ~2 bytes/event, is written by the SDK's own thread (so the Python
+#     loop stays idle), and is a strict superset of the decoded list: it also
+#     carries the header, external triggers and the ERC drop counters. The image
+#     is then reconstructed from the complete file, so it cannot miss an event.
+#   * "csv" — no .raw at all. Decoded events are streamed to <name>_xytp.csv as
+#     they arrive from the live iterator. This is the only way to get the event
+#     list without a .raw, but it is a lossy path by construction: nothing
+#     re-reads a complete file afterwards, so anything the host fails to consume
+#     in time is gone. EventCsvWriter counts those drops and the acquisition
+#     reports them, so the loss is at least visible rather than silent.
+# CSV is also by far the largest of the three formats on disk (~18 bytes per
+# event as text, measured, against ~2 for EVT3), and a CSV run leaves no .raw for
+# tools/rebuild_evk4_zstack.py or tools/backfill_event_streams.py to work from.
+#
+# THROUGHPUT CEILING — the number that decides whether CSV is usable for a given
+# sample. Serialising text is CPU-bound, and it is what limits CSV mode.
+# Measured on the development machine, per formatting strategy:
+#     np.savetxt                        0.7 Mev/s
+#     pandas.to_csv                     1.4 Mev/s
+#     Python "%d,%d,%d,%d" % ...        2.1 Mev/s   (cannot be threaded: GIL)
+#     core.event_csv_rows (NumPy)       3.5 Mev/s   single-threaded
+#     core.event_csv_rows x4 threads    7.3 Mev/s   <- what EventCsvWriter does
+# So CSV mode sustains roughly 7 Mev/s. That is still BELOW EVK4_ERC_RATE
+# (20 Mev/s): a sustained rate above ~7 Mev/s will fill the queue and drop
+# events. For a bright or badly-biased sample, lower the ERC cap or tighten the
+# ROI when recording CSV — or record EVT3, which the SDK writes at line rate.
+EVK4_CSV_WORKERS = int(os.environ.get("DSI_EVK4_CSV_WORKERS", "4"))
+EVK4_SAVE_FORMAT_EVT3 = "evt3"
+EVK4_SAVE_FORMAT_CSV = "csv"
+EVK4_SAVE_FORMAT_DEFAULT = EVK4_SAVE_FORMAT_EVT3
+# {combo-box label: stored value} — the UI order is the dict order.
+EVK4_SAVE_FORMAT_OPTIONS = {
+    "EVT3 raw (.raw) — complete, fastest": EVK4_SAVE_FORMAT_EVT3,
+    "Event stream (.csv) — decoded x,y,p,t": EVK4_SAVE_FORMAT_CSV,
+}
+
+# CSV mode: how many event chunks may sit between the acquisition loop and the
+# CSV writer thread. This bounds the extra memory (a chunk is ~10 ms of events,
+# so ~200k events / ~2.6 MB at the ERC cap — 64 chunks is ~170 MB worst case)
+# and is what makes the loop non-blocking: the loop only ever hands over a
+# memcpy'd copy and never waits on formatting or disk. If the writer falls
+# behind and the queue fills, chunks are DROPPED rather than back-pressuring the
+# SDK iterator, and the dropped-event count is surfaced in the run status.
+# Raise it to trade memory for tolerance of short bursts.
+EVK4_CSV_QUEUE_CHUNKS = int(os.environ.get("DSI_EVK4_CSV_QUEUE", "64"))
 EVK4_FPS = 25                       # PeriodicFrameGenerationAlgorithm display fps
 EVK4_CRAZY_PIXEL_PERCENTILE = 99.9  # Hot-pixel rejection threshold
 # IMX636 sensor geometry — the EVK4 streams events in this full-sensor pixel

@@ -17,6 +17,7 @@ import numpy as np
 from config import (
     DCAM_BINNING_OPTIONS, DCAM_DEFECTCORRECT_OPTIONS, DCAM_READOUTSPEED_OPTIONS,
     DCAM_TRIGGER_MODE_OPTIONS, DCAM_TRIGGERSOURCE_OPTIONS,
+    EVK4_SAVE_FORMAT_CSV, EVK4_SAVE_FORMAT_DEFAULT, EVK4_SAVE_FORMAT_OPTIONS,
     EVK4_SENSOR_WIDTH, EVK4_SENSOR_HEIGHT,
     ORCA_DSI_PROCESS_PIXELS_PER_S, ORCA_ROW_READOUT_US,
     ORCA_SENSOR_WIDTH, ORCA_SENSOR_HEIGHT, ZSTACK_DISK_BYTES_PER_S,
@@ -102,6 +103,24 @@ class Evk4ParamsWidget(QWidget):
         dur_group.setLayout(dur_layout)
         layout.addWidget(dur_group)
 
+        # Event record format. This picks what an acquisition writes to disk and
+        # is not undoable afterwards, so the caveat is spelled out inline rather
+        # than left to the documentation: EVT3 is reconstructed from a complete
+        # file and cannot lose events, CSV is written live and can.
+        fmt_group = QGroupBox("Event Data Format")
+        fmt_layout = QVBoxLayout()
+        self.combo_save_format = QComboBox()
+        for label, value in EVK4_SAVE_FORMAT_OPTIONS.items():
+            self.combo_save_format.addItem(label, value)
+        fmt_layout.addWidget(self.combo_save_format)
+        self.lbl_save_format = QLabel()
+        self.lbl_save_format.setWordWrap(True)
+        fmt_layout.addWidget(self.lbl_save_format)
+        fmt_group.setLayout(fmt_layout)
+        layout.addWidget(fmt_group)
+        self.combo_save_format.currentIndexChanged.connect(self._update_save_format_hint)
+        self._update_save_format_hint()
+
         post_group = QGroupBox("EVK4 Post-Processing")
         post_layout = QVBoxLayout()
         self.chk_crazy = QCheckBox("Remove 'Crazy' Pixels (Top 0.1%)"); self.chk_crazy.setChecked(True)
@@ -159,6 +178,26 @@ class Evk4ParamsWidget(QWidget):
         ):
             signal.connect(lambda *_: self._roi_debounce.start())
 
+    def _update_save_format_hint(self):
+        """Show what the selected format actually costs, next to the selector."""
+        if self.combo_save_format.currentData() == EVK4_SAVE_FORMAT_CSV:
+            self.lbl_save_format.setText(
+                "Writes <name>_xytp.csv (decoded x, y, p, t) during the "
+                "acquisition — no .raw is produced. Sustains about 7 Mevents/s: "
+                "above that the writer falls behind and events are DROPPED (the "
+                "loss is counted and reported at the end of the run). CSV is ~9x "
+                "larger on disk than EVT3 (~18 bytes/event), and "
+                "rebuild_evk4_zstack / backfill_event_streams cannot be used on "
+                "these runs.")
+            self.lbl_save_format.setStyleSheet("color: #d9a441; font-size: 11px;")
+        else:
+            self.lbl_save_format.setText(
+                "Writes <name>.raw (the camera's encoded EVT3 stream). The image "
+                "is reconstructed from the complete file afterwards, so no event "
+                "can be lost. Smallest on disk, and the offline tools work from "
+                "it. Use tools/backfill_event_streams.py for the decoded list.")
+            self.lbl_save_format.setStyleSheet("color: #888888; font-size: 11px;")
+
     def _compute_roi(self):
         """Compute x_min/x_max/y_min/y_max from the width, height and centre-offset
         controls, clamped to the IMX636 sensor.
@@ -185,6 +224,7 @@ class Evk4ParamsWidget(QWidget):
             "acqu_time": self.spin_time.value(),
             "filter_crazy_pixels": self.chk_crazy.isChecked(),
             "apply_smoothing": self.chk_smooth.isChecked(),
+            "evk4_save_format": self.combo_save_format.currentData(),
             "evk4_roi": self._compute_roi(),
         }
 
@@ -216,6 +256,16 @@ class Evk4ParamsWidget(QWidget):
             self.chk_crazy.setChecked(bool(data["filter_crazy_pixels"]))
         if "apply_smoothing" in data:
             self.chk_smooth.setChecked(bool(data["apply_smoothing"]))
+        if "evk4_save_format" in data:
+            # Match on the stored value, not the label, so the combo text can be
+            # reworded without invalidating existing presets. An unrecognised
+            # value falls back to the default rather than silently keeping
+            # whatever was selected.
+            idx = self.combo_save_format.findData(data["evk4_save_format"])
+            if idx < 0:
+                idx = self.combo_save_format.findData(EVK4_SAVE_FORMAT_DEFAULT)
+            if idx >= 0:
+                self.combo_save_format.setCurrentIndex(idx)
         if "roi_width" in data:
             self.spin_roi_width.setValue(int(data["roi_width"]))
         if "roi_height" in data:

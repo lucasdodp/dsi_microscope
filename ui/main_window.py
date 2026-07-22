@@ -1039,6 +1039,7 @@ class MainWindow(QMainWindow):
                 "bias_on": e["bias_on"],
                 "bias_off": e["bias_off"],
                 "acquisition_time_s": e["acqu_time"],
+                "event_data_format": e["evk4_save_format"],
                 "filter_crazy_pixels": e["filter_crazy_pixels"],
                 "apply_smoothing": e["apply_smoothing"],
                 "roi_x_min": eroi["x_min"],
@@ -1435,7 +1436,8 @@ class MainWindow(QMainWindow):
         save_params = {
             "output_dir": out_dir,
             "filename": filename,
-            # ORCA raw-stack TIFF is optional; the EVK4 per-plane .raw is always saved.
+            # ORCA raw-stack TIFF is optional; the EVK4 always saves a per-plane
+            # event record, in whichever format the EVK4 tab selected (.raw or .csv).
             "save_raw": self.chk_orca_raw.isChecked() if camera == "orca" else True,
             "metadata": self.collect_acquisition_metadata(
                 source, out_dir, filename, self.evk4_params, self.orca_params

@@ -1,8 +1,21 @@
 """Prophesee EVK4 event-based camera — Metavision SDK wrapper and acquisition worker.
 
-`CameraWorker` streams events, generates live frames, optionally logs raw data, and
+`CameraWorker` streams events, generates live frames, records the event data, and
 (for acquisition mode) reconstructs a 2D event-count image via the pure routines in
-core.image_processing. Raw-data logging is always stopped in a finally block.
+core.image_processing.
+
+An acquisition records its events in one of two formats, selected by the
+``evk4_save_format`` parameter (see config.EVK4_SAVE_FORMAT_*):
+
+  * ``evt3`` — the SDK logs the camera's encoded stream to ``<name>.raw`` and the
+    image is reconstructed afterwards from that complete file. Lossless.
+  * ``csv``  — no ``.raw``; events are streamed to ``<name>_xytp.csv`` by
+    ``core.EventCsvWriter`` as they arrive, and the image counts exactly what was
+    written. Lossy under load, and the loss is reported.
+
+Whichever is in use is always shut down in a finally block: raw logging must be
+stopped before the device is released, and the CSV writer holds the only copy of
+the events it has queued.
 """
 
 import gc
@@ -12,10 +25,12 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config import EVK4_ERC_RATE, EVK4_FPS
+from config import (
+    EVK4_ERC_RATE, EVK4_FPS, EVK4_SAVE_FORMAT_CSV, EVK4_SAVE_FORMAT_DEFAULT,
+)
 from core import (
-    accumulate_event_frame, apply_smoothing, crop_to_roi, filter_crazy_pixels,
-    save_mat_tif, save_parameter_log,
+    EventCsvWriter, accumulate_event_frame, apply_smoothing, crop_to_roi,
+    filter_crazy_pixels, save_mat_tif, save_parameter_log,
 )
 
 try:
@@ -155,8 +170,15 @@ class CameraWorker(QThread):
                 if apply_event_roi(device, self._roi):
                     self.status_update.emit("Hardware ROI enabled (reduced event rate).")
 
+            # EVT3 vs CSV: the raw logger must be armed *before* the iterator is
+            # created, whereas the CSV writer needs the sensor geometry that only
+            # the iterator can report — hence the two are set up on either side of
+            # it rather than together.
+            save_format = self.params.get("evk4_save_format", EVK4_SAVE_FORMAT_DEFAULT)
+            csv_mode = save_format == EVK4_SAVE_FORMAT_CSV
+
             log_path = ""
-            if self.mode == "acquire":
+            if self.mode == "acquire" and not csv_mode:
                 log_path = os.path.join(self.params["output_dir"], self.params["filename"] + ".raw")
                 if device.get_i_events_stream():
                     device.get_i_events_stream().log_raw_data(log_path)
@@ -164,6 +186,13 @@ class CameraWorker(QThread):
 
             mv_iterator = EventsIterator.from_device(device=device)
             height, width = mv_iterator.get_size()
+
+            csv_writer = None
+            if self.mode == "acquire" and csv_mode:
+                csv_path = os.path.join(
+                    self.params["output_dir"], self.params["filename"] + "_xytp.csv")
+                csv_writer = EventCsvWriter(csv_path, width, height).start()
+                self.status_update.emit(f"Recording event stream to {csv_path}")
 
             event_frame_gen = PeriodicFrameGenerationAlgorithm(
                 sensor_width=width, sensor_height=height, fps=EVK4_FPS, palette=ColorPalette.Dark
@@ -196,6 +225,13 @@ class CameraWorker(QThread):
                                 "EVK4 bias not applied: " + "; ".join(failures))
                         else:
                             self.status_update.emit("EVK4 biases updated.")
+                    # Hand the chunk to the CSV writer before generating the
+                    # display frame: submit() is a memcpy and a queue put, so
+                    # doing it first keeps the recorded data as close to the
+                    # SDK's delivery timing as possible, and the preview (which
+                    # is display-only) absorbs any jitter instead.
+                    if csv_writer is not None:
+                        csv_writer.submit(evs)
                     event_frame_gen.process_events(evs)
 
                     if self.mode == "acquire":
@@ -208,13 +244,28 @@ class CameraWorker(QThread):
                 # a prior log_raw_data can crash the Metavision native library.
                 if log_path and device.get_i_events_stream():
                     device.get_i_events_stream().stop_log_raw_data()
+                # Always drain the CSV writer, including on the error path: the
+                # events already queued are the only copy that exists (there is
+                # no .raw to re-read), so they must reach disk even if the run
+                # ended badly.
+                if csv_writer is not None:
+                    csv_writer.close()
 
             if self.mode == "acquire" and self._is_running:
-                self.status_update.emit("Processing final image from RAW data...")
-                self.process_final_image(log_path, width, height)
-                # The raw event recording (.raw) is always kept alongside the
-                # .tif/.mat — it is the full event stream the 2D image is derived
-                # from, which downstream analysis re-uses.
+                if csv_writer is not None:
+                    # CSV mode: the image counts exactly the events written, so
+                    # there is no second decode pass. No .raw exists — this is
+                    # the only record of the run.
+                    self._report_csv_result(csv_writer)
+                    final_image = csv_writer.image()
+                else:
+                    self.status_update.emit("Processing final image from RAW data...")
+                    final_image = accumulate_event_frame(
+                        EventsIterator(input_path=log_path, delta_t=1000000), width, height)
+                    # The raw event recording (.raw) is always kept alongside the
+                    # .tif/.mat — it is the full event stream the 2D image is
+                    # derived from, which downstream analysis re-uses.
+                self.process_final_image(final_image)
 
             self.status_update.emit("Camera stopped.")
 
@@ -234,23 +285,48 @@ class CameraWorker(QThread):
             # left believing a dead feed is running.
             self.finished_signal.emit()
 
-    def process_final_image(self, raw_path, width, height):
-        """Reconstruct, post-process and save the 2D event image from a raw log.
+    def _report_csv_result(self, writer):
+        """Surface the CSV writer's outcome — especially any dropped events.
 
-        Event iteration is hardware-specific (Metavision), but the accumulation,
-        filtering, smoothing and saving are delegated to the pure core layer.
+        CSV mode has no complete file to re-read, so a chunk the writer could not
+        keep up with is permanently lost. Saying so is the whole point: a run
+        that silently recorded 80 % of its events would otherwise look identical
+        to a genuinely dim sample.
         """
-        iterator = EventsIterator(input_path=raw_path, delta_t=1000000)
-        final_image = accumulate_event_frame(iterator, width, height)
+        if writer.error is not None:
+            self.status_update.emit(f"CSV writer error: {writer.error}")
+        if writer.events_dropped:
+            total = writer.events_written + writer.events_dropped
+            pct = 100.0 * writer.events_dropped / total if total else 0.0
+            self.status_update.emit(
+                f"WARNING: {writer.events_dropped:,} of {total:,} events ({pct:.1f} %) "
+                f"were dropped — the CSV writer could not keep up with the event "
+                f"rate. The image counts only the events written. Lower the event "
+                f"rate (bias/ROI/ERC), raise DSI_EVK4_CSV_QUEUE, or record EVT3 "
+                f"(.raw) instead, which cannot drop events.")
+        else:
+            self.status_update.emit(
+                f"Event stream written: {writer.events_written:,} events -> {writer.path}")
+
+    def process_final_image(self, final_image):
+        """Post-process and save the accumulated 2D event image.
+
+        ``final_image`` is the full-sensor event-count image, produced either by
+        decoding the complete ``.raw`` (EVT3 mode) or by the CSV writer (CSV
+        mode). Filtering, smoothing and saving are delegated to the pure core
+        layer; only the event *sourcing* differs between the two formats.
+        """
         # Crop to the same ROI the live view used, so the saved image matches the
-        # framing the user selected (the raw log keeps every event for re-use).
+        # framing the user selected (the event record keeps the full window).
         final_image = crop_to_roi(final_image, self._roi)
 
-        # The decoded (x, y, p, t) list is deliberately NOT written here — decode
-        # is *not* cheap at high event rates, and the gzip of the per-event list
-        # dominated acquisition time. The .raw log above is the authoritative
-        # record, so the stream is generated offline afterwards instead:
+        # In EVT3 mode the decoded (x, y, p, t) list is deliberately NOT written
+        # here — decode is *not* cheap at high event rates, and the gzip of the
+        # per-event list dominated acquisition time. The .raw log is the
+        # authoritative record, so the stream is generated offline afterwards:
         #     python tools/backfill_event_streams.py
+        # In CSV mode the stream has already been written during acquisition and
+        # there is no .raw, so that tool has nothing to backfill from.
 
         # Always log the acquisition parameters, even if no events were recorded.
         metadata = self.params.get("metadata")
