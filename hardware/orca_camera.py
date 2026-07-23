@@ -22,8 +22,9 @@ from config import (
     HAMAMATSU_SDK_PATH,
 )
 from core import (
-    autocontrast_8bit, compute_dsi_images, normalize_to_8bit, save_dsi_results,
-    save_parameter_log, save_raw_stack_tiff, scale_16bit_image,
+    autocontrast_8bit, compute_dsi_images, crop_to_roi, normalize_to_8bit,
+    save_dsi_results, save_parameter_log, save_raw_stack_tiff, save_single_image,
+    scale_16bit_image,
 )
 
 # Extend the path to the Hamamatsu SDK sample wrapper before importing it.
@@ -344,15 +345,40 @@ class OrcaWorker(QThread):
             dcam.buf_release()
 
         if not self._is_running:
-            self.status_update.emit("DSI acquisition cancelled.")
+            self.status_update.emit("Acquisition cancelled.")
             return
-        if count < 2:
-            self.status_update.emit("Not enough frames acquired to compute DSI statistics.")
+        if count < 1:
+            self.status_update.emit("No frames acquired.")
             return
 
         # Trim if the run was cut short (e.g. stopped mid-capture).
         if count != num_frames:
             raw_stack = raw_stack[:count]
+
+        # Hardware subarray already delivers the cropped frame; only crop in
+        # software when the camera rejected the subarray (so the saved data is
+        # never double-cropped).
+        proc_roi = None if self._hw_roi_active else roi
+
+        # A single frame has no stack to compute a standard deviation over, so
+        # there is no optical sectioning: save it as a plain widefield snapshot.
+        if count == 1:
+            img = crop_to_roi(raw_stack[0], proc_roi)
+            self.image_ready.emit(self._scale_for_display(img))
+            if out_dir:
+                self.status_update.emit("Saving single image...")
+                save_single_image(img, out_dir, filename)
+                metadata = self.params.get("metadata")
+                if metadata:
+                    save_parameter_log(out_dir, filename, metadata)
+                self.status_update.emit(
+                    f"Saved single image (no DSI — one frame) and parameter log to {out_dir}"
+                )
+            else:
+                self.status_update.emit(
+                    "Single image acquired (not saved: no output directory set)."
+                )
+            return
 
         # Measured capture throughput — the number that actually determines how
         # long an acquisition takes. Appended to the final status line so it
@@ -366,10 +392,9 @@ class OrcaWorker(QThread):
             )
 
         self.status_update.emit("Computing average (widefield) and standard-deviation (DSI) images...")
-        # If hardware subarray was active the frames are already the correct size;
-        # pass roi=None so compute_dsi_images does not double-crop them.
-        dsi_roi = None if self._hw_roi_active else roi
-        avg_img, std_img = compute_dsi_images(raw_stack, dsi_roi)
+        # proc_roi is None when the hardware subarray already cropped the frames,
+        # so compute_dsi_images does not double-crop them.
+        avg_img, std_img = compute_dsi_images(raw_stack, proc_roi)
 
         # Display the optically-sectioned DSI image.
         self.image_ready.emit(normalize_to_8bit(std_img))

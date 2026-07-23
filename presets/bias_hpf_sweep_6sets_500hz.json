@@ -1,0 +1,283 @@
+{
+  "version": 1,
+  "awg": {
+    "ch1_wave": "SQUARE",
+    "ch1_freq": 500,
+    "ch1_amp": 18
+  },
+  "evk4_queue": {
+    "auto_name": "bias_hpf",
+    "rows": [
+      {
+        "filename": "0_bias_hpf_set6",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 140,
+        "bias_off": 140,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set6",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 140,
+        "bias_off": 140,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set6",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 140,
+        "bias_off": 140,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set6",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 140,
+        "bias_off": 140,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set6",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 140,
+        "bias_off": 140,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "0_bias_hpf_set5",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 115,
+        "bias_off": 115,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set5",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 115,
+        "bias_off": 115,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set5",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 115,
+        "bias_off": 115,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set5",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 115,
+        "bias_off": 115,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set5",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 115,
+        "bias_off": 115,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "0_bias_hpf_set4",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 90,
+        "bias_off": 90,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set4",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 90,
+        "bias_off": 90,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set4",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 90,
+        "bias_off": 90,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set4",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 90,
+        "bias_off": 90,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set4",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 90,
+        "bias_off": 90,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "0_bias_hpf_set3",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 60,
+        "bias_off": 60,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set3",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 60,
+        "bias_off": 60,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set3",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 60,
+        "bias_off": 60,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set3",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 60,
+        "bias_off": 60,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set3",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 60,
+        "bias_off": 60,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "0_bias_hpf_set2",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 35,
+        "bias_off": 35,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set2",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 35,
+        "bias_off": 35,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set2",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 35,
+        "bias_off": 35,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set2",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 35,
+        "bias_off": 35,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set2",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 35,
+        "bias_off": 35,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "0_bias_hpf_set1",
+        "bias_fo": 40,
+        "bias_hpf": 0,
+        "bias_on": 10,
+        "bias_off": 10,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "25_bias_hpf_set1",
+        "bias_fo": 40,
+        "bias_hpf": 25,
+        "bias_on": 10,
+        "bias_off": 10,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "50_bias_hpf_set1",
+        "bias_fo": 40,
+        "bias_hpf": 50,
+        "bias_on": 10,
+        "bias_off": 10,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "75_bias_hpf_set1",
+        "bias_fo": 40,
+        "bias_hpf": 75,
+        "bias_on": 10,
+        "bias_off": 10,
+        "acqu_time": 2.0,
+        "repeats": 1
+      },
+      {
+        "filename": "100_bias_hpf_set1",
+        "bias_fo": 40,
+        "bias_hpf": 100,
+        "bias_on": 10,
+        "bias_off": 10,
+        "acqu_time": 2.0,
+        "repeats": 1
+      }
+    ]
+  }
+}

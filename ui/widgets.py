@@ -494,7 +494,12 @@ class OrcaParamsWidget(QWidget):
         # reach the high framerates (low exposure + small ROI on Fast scan).
         self.spin_exp = QDoubleSpinBox(); self.spin_exp.setRange(0.017, 10000); self.spin_exp.setDecimals(3); self.spin_exp.setValue(50)
         self.spin_exp.setSuffix(" ms")
-        self.spin_frames = QSpinBox(); self.spin_frames.setRange(2, 1000); self.spin_frames.setValue(100)
+        # Min 1: N=1 has no frame stack to compute a std-dev over, so it is saved
+        # as a plain widefield snapshot (no DSI). N>=2 gives the DSI std-dev image.
+        self.spin_frames = QSpinBox(); self.spin_frames.setRange(1, 1000); self.spin_frames.setValue(100)
+        self.spin_frames.setToolTip(
+            "Number of speckle frames per stack. N=1 saves a single plain image "
+            "(no DSI sectioning); N≥2 computes the average + DSI std-dev images.")
         setup_form.addRow("Exposure Time (texp):", self.spin_exp)
         setup_form.addRow("Frames per Stack (N):", self.spin_frames)
         # Display-only auto-contrast: percentile-stretch each preview frame so
@@ -1286,7 +1291,10 @@ class PIStageWidget(QWidget):
         steps = self.spin_steps.value()
         if self.start_mode() == "start":
             return focus
-        return focus - (step_size * steps / 2)
+        # Centered mode: the scan spans (steps-1) gaps, so the half-span is
+        # step_size*(steps-1)/2 — NOT steps/2, which biased every scan half a step
+        # below focus and put a single plane at focus-step/2 instead of at focus.
+        return focus - (step_size * (steps - 1) / 2)
 
     def _update_zrange(self):
         """Show the absolute first→last plane positions for the current settings,

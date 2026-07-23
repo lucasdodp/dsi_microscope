@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self.orca_worker = None     # ORCA live-focus worker
         self.evk4_worker = None     # EVK4 live worker
         self.zstack_worker = None   # automated Z-stack orchestrator (one at a time)
+        self._orca_single_active = False  # True while a single ORCA DSI acquire runs
         # EVK4 batch queue: expanded per-acquisition configs run back-to-back.
         self._queue = []
         self._queue_index = 0
@@ -402,6 +403,18 @@ class MainWindow(QMainWindow):
         self.btn_orca_zstack.setObjectName("btnAcquire")
         self.btn_orca_zstack.clicked.connect(lambda: self.start_zstack("orca"))
         acq_layout.addWidget(self.btn_orca_zstack)
+        # Single DSI acquisition at the current focus — one speckle stack, no
+        # stage sweep, so it needs no PI connection. Uses the same output dir /
+        # filename / raw-stack controls above.
+        self.btn_orca_single = QPushButton("◉  Single Acquisition (current focus)")
+        self.btn_orca_single.setObjectName("btnAcquire")
+        self.btn_orca_single.setToolTip(
+            "Grab one N-frame speckle stack at the objective's current focus and "
+            "compute the average (widefield) + standard-deviation (DSI) images — "
+            "a single plane, no Z sweep. The PI stage is not required."
+        )
+        self.btn_orca_single.clicked.connect(self.start_orca_single)
+        acq_layout.addWidget(self.btn_orca_single)
         # Live pause/resume: appears only while a running ORCA stack is paused waiting
         # for the camera to be restored (e.g. after replugging the USB).
         self.btn_orca_live_resume = QPushButton("⟳  Resume Acquisition")
@@ -1096,12 +1109,17 @@ class MainWindow(QMainWindow):
         # A running batch queue or FOV measurement blocks new manual runs just
         # like a live Z-stack (the FOV measurement owns both cameras).
         fov_measuring = self._fov_worker is not None and self._fov_worker.isRunning()
-        busy = zstack or self._queue_active or fov_measuring
+        # A single ORCA acquire owns the camera briefly; treat it like a running
+        # Z-stack so no other run (stack, queue, FOV measure, or a second single)
+        # can start over it.
+        busy = zstack or self._queue_active or fov_measuring or self._orca_single_active
 
         self.btn_orca_live.setEnabled(not orca_live and not busy)
         self.btn_evk4_live.setEnabled(not evk4_live and not busy)
         self.btn_orca_zstack.setEnabled(not busy)
         self.btn_evk4_zstack.setEnabled(not busy)
+        if hasattr(self, "btn_orca_single"):
+            self.btn_orca_single.setEnabled(not busy)
         if hasattr(self, "btn_fov_match"):
             self.btn_fov_match.setEnabled(not busy)
             self.btn_fov_measure.setEnabled(not busy)
@@ -1199,6 +1217,71 @@ class MainWindow(QMainWindow):
             params = self.orca_params.get_params()
             self._orca_live_params = params
             self.orca_worker.apply_params(params)
+
+    # ==========================
+    # ORCA single acquisition (one DSI plane at the current focus)
+    # ==========================
+    def start_orca_single(self):
+        """Acquire a single DSI plane at the objective's current focus.
+
+        This runs ``OrcaWorker`` in its ``acquire`` mode: it grabs one N-frame
+        speckle stack, computes the average (widefield) + std-dev (DSI) images and
+        saves them (plus the optional raw stack + parameter log) into the ORCA
+        tab's output directory. Unlike the Z-stack it never touches the PI stage,
+        so no stage connection is required — the sectioning comes from the
+        statistics across the stack at the one focus.
+        """
+        if not DCAM_AVAILABLE:
+            QMessageBox.warning(
+                self, "ORCA Camera Unavailable",
+                "The Hamamatsu DCAM API was not found. See README.md for setup instructions.")
+            return
+        # Block if anything else already owns a camera / the stage path.
+        if (self.zstack_worker is not None and self.zstack_worker.isRunning()) \
+                or self._queue_active \
+                or (self._fov_worker is not None and self._fov_worker.isRunning()) \
+                or self._orca_single_active:
+            self.lbl_status.setText(
+                "The ORCA is busy — wait for the current acquisition to finish.")
+            return
+
+        out_dir = self.txt_orca_dir.text()
+        if not out_dir:
+            QMessageBox.warning(self, "Missing Parameter",
+                "Please select an output directory for the acquisition.")
+            return
+
+        self._refresh_default_filename(self.txt_orca_filename, "zstack_orca")
+        filename = self.txt_orca_filename.text()
+
+        # Free a running ORCA live feed so the acquire worker can open the camera.
+        if self._stop_worker_silently(self.orca_worker, self.on_orca_live_finished):
+            self._reset_orca_live_apply()
+
+        params = self.orca_params.get_params()
+        params.update({
+            "output_dir": out_dir,
+            "filename": filename,
+            "save_raw_stack": self.chk_orca_raw.isChecked(),
+            "metadata": self.collect_acquisition_metadata(
+                "Single Acquisition (ORCA) - single-plane DSI",
+                out_dir, filename, self.evk4_params, self.orca_params),
+        })
+
+        self._orca_single_active = True
+        self.orca_worker = OrcaWorker("acquire", params)
+        self.orca_worker.image_ready.connect(self.update_orca_image)
+        self.orca_worker.status_update.connect(self.lbl_status.setText)
+        self.orca_worker.error_signal.connect(self.show_error)
+        self.orca_worker.finished_signal.connect(self.on_orca_single_finished)
+        self.orca_worker.start()
+        self._refresh_buttons()
+        self._sync_both_live_button()
+
+    def on_orca_single_finished(self):
+        self._orca_single_active = False
+        self._refresh_buttons()
+        self._sync_both_live_button()
 
     def _apply_orca_roi_live(self):
         """Apply only the crop/ROI to the running ORCA live feed, in real time.

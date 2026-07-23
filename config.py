@@ -358,7 +358,22 @@ QLineEdit, QComboBox {
     color: #ffffff;
 }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #4daaf2; }
-QComboBox::drop-down { border-left: 1px solid #555555; width: 20px; }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 20px; border-left: 1px solid #555555; background-color: #3a3f44;
+    border-top-right-radius: 4px; border-bottom-right-radius: 4px;
+}
+QComboBox::drop-down:hover { background-color: #4a5056; }
+QComboBox::down-arrow {
+    width: 0; height: 0; border-left: 4px solid transparent;
+    border-right: 4px solid transparent; border-top: 5px solid #cccccc;
+}
+/* The pop-up list itself; without this it falls back to the native (white) list. */
+QComboBox QAbstractItemView {
+    background-color: #333333; color: #ffffff;
+    border: 1px solid #555555; selection-background-color: #094771;
+    selection-color: #ffffff; outline: none;
+}
 
 QSpinBox, QDoubleSpinBox {
     background-color: #333333;
@@ -369,6 +384,33 @@ QSpinBox, QDoubleSpinBox {
     color: #ffffff;
 }
 QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #4daaf2; }
+/* Style the up/down buttons explicitly, or the native (white) arrows show
+   through the dark theme. The arrows are drawn as CSS border triangles so no
+   image assets are needed. */
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: 18px; background-color: #3a3f44;
+    border-left: 1px solid #555555; border-top-right-radius: 4px;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 18px; background-color: #3a3f44;
+    border-left: 1px solid #555555; border-bottom-right-radius: 4px;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #4a5056; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 0; height: 0; border-left: 4px solid transparent;
+    border-right: 4px solid transparent; border-bottom: 5px solid #cccccc;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 0; height: 0; border-left: 4px solid transparent;
+    border-right: 4px solid transparent; border-top: 5px solid #cccccc;
+}
+QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled,
+QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
+    border-top-color: #666666; border-bottom-color: #666666;
+}
 
 QPushButton {
     background-color: #3a3f44;

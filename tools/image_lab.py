@@ -607,10 +607,10 @@ class VolumeView(QDialog):
     """
 
     DETAIL = (("Fast (128)", 128), ("Balanced (256)", 256), ("Fine (384)", 384),
-              ("Ultra (512)", 512))
+              ("Ultra (512)", 512), ("Max (768)", 768))
     AXES = (("x", "X"), ("y", "Y"), ("z", "Z (depth)"))
 
-    def __init__(self, parent, channel, builder, max_dim=256):
+    def __init__(self, parent, channel, builder, max_dim=768):
         super().__init__(parent)
         self.setWindowTitle(f"3-D volume — channel {channel.name}")
         self.resize(_dp(1180), _dp(820))
@@ -1195,6 +1195,21 @@ class ImageLab(QMainWindow):
         self.setWindowTitle("DSI Image Lab — two-channel post-processing workbench")
         self.resize(_dp(1650), _dp(980))
 
+        # The Image Lab is opened *inside the running acquisition process*
+        # (ui.main_window.open_image_lab), so its heavy OpenCV work (per-plane
+        # warps/resizes when rendering and building the 3-D volume) competes for
+        # the same CPU cores as the live acquisition. On a modest machine that
+        # oversubscription is what makes everything stutter when both are open.
+        # Leave ~2 cores free so the acquisition threads keep running smoothly;
+        # OpenCV still parallelises, just not across every core. Process-global,
+        # but the main app itself uses OpenCV only lightly, so this throttles the
+        # Lab without slowing capture. Best-effort — never block startup.
+        try:
+            cores = os.cpu_count() or 4
+            cv2.setNumThreads(max(1, cores - 2))
+        except Exception:  # noqa: BLE001
+            pass
+
         self.channels = {"A": Channel("A"), "B": Channel("B")}
         self.active = "A"
         self._loading_params = False   # guard against feedback while repopulating
@@ -1228,6 +1243,15 @@ class ImageLab(QMainWindow):
         self._debounce.setInterval(40)
         self._debounce.timeout.connect(self.refresh)
         self._apply_params_to_widgets(self.ch().params)
+        # Restoring the last session reloads its image stacks from disk and
+        # processes them — heavy work. Defer it until after the window has been
+        # shown and the event loop has drained one pass, so opening the Lab
+        # paints instantly and (crucially) doesn't freeze a live acquisition's
+        # UI in a single synchronous burst. A 0 ms singleShot runs as soon as the
+        # event loop is idle.
+        QTimer.singleShot(0, self._restore_deferred)
+
+    def _restore_deferred(self):
         # Reopen exactly as it was left: same channels, same pipeline settings,
         # same view — so the tool doesn't need reconfiguring from scratch.
         self._restore_session_state()
@@ -2309,7 +2333,11 @@ class ImageLab(QMainWindow):
             self._status("Set the Z step before opening the 3-D view — without "
                          "it the volume cannot be scaled to true proportions.")
             return
-        view = VolumeView(self, c, self._build_volume)
+        # Open at the highest detail tier so the volume starts as sharp as the
+        # data allows; the user can drop it down if their machine struggles.
+        # Drafts coarsen automatically, so rotation stays smooth regardless.
+        view = VolumeView(self, c, self._build_volume,
+                          max_dim=VolumeView.DETAIL[-1][1])
         if view.vol is None:
             return
         # Modeless, so the pipeline can be tuned with the volume still open;
@@ -2478,6 +2506,16 @@ class ImageLab(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # Match the main application's dark theme. When the Image Lab is opened from
+    # the running app instead (ui.main_window.open_image_lab) the QApplication
+    # already carries this stylesheet, so it only needs applying here for the
+    # standalone `python tools/image_lab.py` launch. Best-effort: the tool must
+    # still start if config is somehow unavailable.
+    try:
+        from config import STYLESHEET
+        app.setStyleSheet(STYLESHEET)
+    except Exception:  # noqa: BLE001 — theming is cosmetic, never block startup
+        pass
     win = ImageLab()
     # Maximized rather than true full screen: the window keeps its title bar,
     # so it can still be moved and closed.

@@ -244,6 +244,22 @@ def save_dsi_results(avg_img, std_img, out_dir, filename):
     return out_dir
 
 
+def save_single_image(image, out_dir, filename):
+    """Persist a single plain (non-DSI) camera image.
+
+    Used when only **one** frame is acquired: with a single frame there is no
+    stack to compute a standard deviation over, so there is no optical
+    sectioning — the result is an ordinary widefield snapshot, not a DSI image.
+    The ``.mat`` keeps the full precision; the ``.tif`` preserves the camera's
+    native bit depth (e.g. 16-bit), unlike the 8-bit normalized DSI previews.
+
+    Returns the output directory for status reporting.
+    """
+    scipy.io.savemat(os.path.join(out_dir, f"{filename}_image.mat"), {"image": image})
+    cv2.imwrite(os.path.join(out_dir, f"{filename}_image.tif"), image)
+    return out_dir
+
+
 def _write_multipage_tiff(path, frames):
     """Write a (N, H, W) array as a multi-page TIFF.
 
