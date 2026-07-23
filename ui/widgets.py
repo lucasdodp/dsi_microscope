@@ -103,23 +103,16 @@ class Evk4ParamsWidget(QWidget):
         dur_group.setLayout(dur_layout)
         layout.addWidget(dur_group)
 
-        # Event record format. This picks what an acquisition writes to disk and
-        # is not undoable afterwards, so the caveat is spelled out inline rather
-        # than left to the documentation: EVT3 is reconstructed from a complete
-        # file and cannot lose events, CSV is written live and can.
+        # Event record format: what an acquisition writes to disk (EVT3 .raw or
+        # decoded CSV). Just the selector — the format trade-offs live in the docs.
         fmt_group = QGroupBox("Event Data Format")
         fmt_layout = QVBoxLayout()
         self.combo_save_format = QComboBox()
         for label, value in EVK4_SAVE_FORMAT_OPTIONS.items():
             self.combo_save_format.addItem(label, value)
         fmt_layout.addWidget(self.combo_save_format)
-        self.lbl_save_format = QLabel()
-        self.lbl_save_format.setWordWrap(True)
-        fmt_layout.addWidget(self.lbl_save_format)
         fmt_group.setLayout(fmt_layout)
         layout.addWidget(fmt_group)
-        self.combo_save_format.currentIndexChanged.connect(self._update_save_format_hint)
-        self._update_save_format_hint()
 
         post_group = QGroupBox("EVK4 Post-Processing")
         post_layout = QVBoxLayout()
@@ -177,26 +170,6 @@ class Evk4ParamsWidget(QWidget):
             self.slider_offset_y.valueChanged,
         ):
             signal.connect(lambda *_: self._roi_debounce.start())
-
-    def _update_save_format_hint(self):
-        """Show what the selected format actually costs, next to the selector."""
-        if self.combo_save_format.currentData() == EVK4_SAVE_FORMAT_CSV:
-            self.lbl_save_format.setText(
-                "Writes <name>_xytp.csv (decoded x, y, p, t) during the "
-                "acquisition — no .raw is produced. Sustains about 7 Mevents/s: "
-                "above that the writer falls behind and events are DROPPED (the "
-                "loss is counted and reported at the end of the run). CSV is ~9x "
-                "larger on disk than EVT3 (~18 bytes/event), and "
-                "rebuild_evk4_zstack / backfill_event_streams cannot be used on "
-                "these runs.")
-            self.lbl_save_format.setStyleSheet("color: #d9a441; font-size: 11px;")
-        else:
-            self.lbl_save_format.setText(
-                "Writes <name>.raw (the camera's encoded EVT3 stream). The image "
-                "is reconstructed from the complete file afterwards, so no event "
-                "can be lost. Smallest on disk, and the offline tools work from "
-                "it. Use tools/backfill_event_streams.py for the decoded list.")
-            self.lbl_save_format.setStyleSheet("color: #888888; font-size: 11px;")
 
     def _compute_roi(self):
         """Compute x_min/x_max/y_min/y_max from the width, height and centre-offset
@@ -338,6 +311,7 @@ class Evk4QueueWidget(QGroupBox):
         root.addLayout(name_row)
 
         self.lbl_estimate = QLabel("")
+        self.lbl_estimate.setWordWrap(True)  # long total-time text must wrap, not widen the panel
         self.lbl_estimate.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
         root.addWidget(self.lbl_estimate)
 
@@ -350,6 +324,7 @@ class Evk4QueueWidget(QGroupBox):
         root.addLayout(run_row)
 
         self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)  # long running-status text must wrap, not widen the panel
         self.lbl_status.setStyleSheet("color: #4daaf2; font-size: 11px;")
         root.addWidget(self.lbl_status)
 

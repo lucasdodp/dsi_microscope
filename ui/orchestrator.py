@@ -20,6 +20,7 @@ TIFF — a single consolidated output per stack for either camera.
 """
 
 import os
+import queue
 import threading
 import time
 
@@ -43,6 +44,16 @@ from hardware.orca_camera import _ORCA_BUSY_HINT, DCAM_AVAILABLE, Dcam, Dcamapi
 from hardware.stage_control import pitools
 
 
+# Sentinel returned by a plane capture when processing is deferred: the plane's
+# raw data was saved but its image was intentionally not reconstructed (that runs
+# afterwards on a background thread). Distinct from None, which means "aborted".
+_DEFERRED = object()
+
+# Sentinel pushed onto the pipeline queue to tell the consumer thread the run is
+# over and it should drain and exit.
+_PIPE_SENTINEL = object()
+
+
 class AutomatedZStackWorker(QThread):
     """Master orchestrator for the combined PI motor + camera acquisition loop."""
 
@@ -53,6 +64,7 @@ class AutomatedZStackWorker(QThread):
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
     awaiting_reconnect = pyqtSignal(bool)  # True -> paused, waiting for the user to replug + Resume
+    deferred_ready = pyqtSignal(dict)  # deferred mode: emit the rebuild job when capture finishes
 
     def __init__(self, pidevice, axis, motor_params, orca_params, save_params=None,
                  camera="orca", evk4_params=None):
@@ -66,7 +78,43 @@ class AutomatedZStackWorker(QThread):
         self.camera = camera  # "orca" or "event"
         self._is_running = True
         self._resume_requested = False  # set by resume() to continue a paused run
+        # Processing mode — how per-plane reconstruction relates to capture:
+        #   "per_plane" (default): capture then reconstruct inline, one plane at a
+        #       time (live feedback, slowest).
+        #   "pipelined": reconstruct plane N on a background thread while the stage
+        #       captures plane N+1 (live feedback, faster — the compute is hidden
+        #       behind the next capture).
+        #   "deferred": capture + save raw only; reconstruct everything after the
+        #       run (fastest on-instrument, no live feedback). See `_finish_deferred`.
+        mode = self.save_params.get("processing_mode")
+        if mode is None:  # legacy callers only set the boolean
+            mode = "deferred" if self.save_params.get("defer_processing", False) else "per_plane"
+        self._defer = (mode == "deferred")
+        self._pipeline = (mode == "pipelined")
+        # CSV event format has no raw stream to reconstruct from afterwards — the
+        # writer builds the image inline as events arrive — so it is incompatible
+        # with BOTH deferral and pipelining (both split capture from reconstruction).
+        # Deferral silently forcing EVT3 (.raw) instead was a real bug (the user's
+        # chosen CSV format was overridden without warning), so the format wins: CSV
+        # falls the run back to inline per-plane processing.
+        if (self._defer or self._pipeline) and self.camera == "event" and self.evk4_params.get(
+                "evk4_save_format", EVK4_SAVE_FORMAT_DEFAULT) == EVK4_SAVE_FORMAT_CSV:
+            self._defer = self._pipeline = False
+            self._defer_disabled_for_csv = True
+        else:
+            self._defer_disabled_for_csv = False
+        # Pipeline plumbing (created in run() only when pipelined); declared here so
+        # helpers can reference them unconditionally.
+        self._proc_queue = None
+        self._proc_error = None
+        self._proc_sem = None
         self._dcam = None  # open ORCA handle (kept on self so recovery can reopen it)
+        # Measured ORCA capture throughput, accumulated across planes so the
+        # parameter log can record the *real* framerate (not just the estimate).
+        # Frame-gaps and wall-clock are summed so the reported fps is the
+        # time-weighted average over every plane's capture window.
+        self._orca_capture_gaps = 0
+        self._orca_capture_time = 0.0
 
     def _prepare_output_dir(self):
         """Create a per-acquisition subfolder named after the filename base.
@@ -112,6 +160,12 @@ class AutomatedZStackWorker(QThread):
         # Put every file from this acquisition into its own <filename> subfolder.
         self._prepare_output_dir()
 
+        if self._defer_disabled_for_csv:
+            self.status_update.emit(
+                "Note: pipelined/deferred processing has no effect with the CSV "
+                "event format (there is no raw stream to reconstruct from later) — "
+                "this run processes each plane inline, as CSV always has.")
+
         focus = self.motor_params["focus"]
         step_size = self.motor_params["step_size"]
         steps = self.motor_params["steps"]
@@ -126,10 +180,18 @@ class AutomatedZStackWorker(QThread):
         # Per-plane sectioned images, accumulated into depth volumes.
         std_volume, avg_volume, event_volume, z_positions = [], [], [], []
         self._dcam = None
+        consumer = None  # pipelined-mode background reconstruction thread
 
         try:
             if self.camera == "orca":
                 self._dcam = self._open_orca()
+
+            # Pipelined mode: a background consumer reconstructs plane N while the
+            # stage captures plane N+1. It owns all appends/emits so the volumes are
+            # only touched from one thread (the producer reads them after join).
+            if self._pipeline:
+                consumer = self._start_pipeline_consumer(
+                    std_volume, avg_volume, event_volume, z_positions)
 
             # Move to the bottom of the stack (the first plane).
             self.status_update.emit(f"Moving to start position {init_pos:.4f} µm...")
@@ -150,11 +212,41 @@ class AutomatedZStackWorker(QThread):
 
                 z_now = float(self.pidevice.qPOS(self.axis)[self.axis])
 
+                if self._pipeline:
+                    # Bound the number of raw stacks in flight (ORCA memory); the
+                    # consumer releases a slot when it finishes a plane. Poll the
+                    # acquire so a user Stop stays responsive even if the consumer
+                    # stalls on a plane. Give the slot back if the capture aborts.
+                    if self._proc_sem is not None:
+                        while not self._proc_sem.acquire(timeout=0.2):
+                            if not self._is_running:
+                                break
+                        if not self._is_running:
+                            break
+                    raw_material = self._capture_plane(step)
+                    if raw_material is None:  # aborted (user Stop / unrecoverable)
+                        if self._proc_sem is not None:
+                            self._proc_sem.release()
+                        break
+                    # A processing fault on an earlier plane surfaces here.
+                    if self._proc_error is not None:
+                        raise self._proc_error
+                    self._proc_queue.put((raw_material, step, z_now))
+                    self.status_update.emit(
+                        f"Plane {step+1}/{steps} captured — reconstructing in parallel.")
+                    continue
+
                 # Both cameras go through the same recover-and-pause wrapper, so a
                 # transient fault on either retries the plane and, if needed, pauses
                 # the run for a manual Resume instead of aborting.
                 result = self._capture_plane(step)
-                if result is not None:
+                if result is _DEFERRED:
+                    # Raw saved; reconstruction happens after the run. Record the
+                    # real plane position so the offline rebuild is exact.
+                    z_positions.append(z_now)
+                    self.status_update.emit(
+                        f"Plane {step+1}/{steps} captured — processing deferred.")
+                elif result is not None:
                     if self.camera == "orca":
                         avg_img, std_img = result
                         avg_volume.append(avg_img)
@@ -169,6 +261,14 @@ class AutomatedZStackWorker(QThread):
                         self.image_ready.emit(normalize_to_8bit(event_img))
                         self.z_profile_update.emit(float(np.sum(event_img)), step)
 
+            # Drain the pipeline before saving: the consumer is still reconstructing
+            # the last plane(s), and it owns the volumes until it exits.
+            if self._pipeline:
+                self._drain_pipeline(consumer)
+                consumer = None
+                if self._proc_error is not None:
+                    raise self._proc_error
+
             self._close_orca()
 
             # Recenter the objective on the focus: the scan loop otherwise leaves
@@ -176,7 +276,10 @@ class AutomatedZStackWorker(QThread):
             # at the centre of the stack whether the run completed or was stopped.
             self._return_to_focus()
 
-            saved_msg = self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
+            if self._defer:
+                saved_msg = self._finish_deferred(z_positions)
+            else:
+                saved_msg = self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
             if self._is_running:
                 self.status_update.emit(f"Automated Z-Stack Complete.{saved_msg}")
             else:
@@ -186,7 +289,14 @@ class AutomatedZStackWorker(QThread):
         except Exception as e:
             # Try to preserve whatever planes were captured before failing.
             try:
-                self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
+                if consumer is not None:  # stop the pipeline consumer first
+                    self._drain_pipeline(consumer)
+                if self._defer:
+                    # In deferred mode the raw planes are already on disk; queue the
+                    # partial rebuild so nothing captured before the fault is lost.
+                    self._finish_deferred(z_positions)
+                else:
+                    self._save_outputs(std_volume, avg_volume, event_volume, z_positions)
             except Exception:
                 pass
             self.error_signal.emit(f"Z-Stack Orchestrator Error: {str(e)}")
@@ -263,12 +373,16 @@ class AutomatedZStackWorker(QThread):
         # buffer already holds N frames; this keeps the host-side overhead to one.
         raw_stack = None
         count = 0
+        capture_start = None  # set on the first frame in hand (matches single-Z)
+        capture_elapsed = 0.0
         try:
             if dcam.cap_start():
                 for i in range(num_frames):
                     if not self._is_running:
                         break
                     if dcam.wait_capevent_frameready(2000):
+                        if i == 0:
+                            capture_start = time.perf_counter()  # first frame in hand
                         frame = dcam.buf_getframedata(i)
                         if raw_stack is None:
                             raw_stack = np.empty((num_frames,) + frame.shape, dtype=frame.dtype)
@@ -276,6 +390,8 @@ class AutomatedZStackWorker(QThread):
                         count += 1
                     else:
                         raise RuntimeError(f"Frame timeout: {dcam.lasterr()}")
+                if capture_start is not None:
+                    capture_elapsed = time.perf_counter() - capture_start
                 dcam.cap_stop()
         finally:
             dcam.buf_release()
@@ -283,11 +399,39 @@ class AutomatedZStackWorker(QThread):
         if not self._is_running or count != num_frames:
             return None
 
+        # Accumulate the real capture throughput for this plane. The window spans
+        # (count-1) inter-frame gaps, matching the single-Z acquire's fps formula.
+        if capture_elapsed > 0 and count > 1:
+            self._orca_capture_gaps += count - 1
+            self._orca_capture_time += capture_elapsed
+
+        if self._defer:
+            # Skip the (expensive) per-plane DSI reconstruction; it runs after the
+            # run, rebuilt from the raw stack. Raw must be written now (forced).
+            self._save_orca_raw(raw_stack, step)
+            return _DEFERRED
+        if self._pipeline:
+            # Hand the raw frames off to the consumer thread, which saves the raw
+            # and runs compute_dsi_images while the stage captures the next plane.
+            return raw_stack
+        return self._finish_orca_plane(raw_stack, step)
+
+    def _save_orca_raw(self, raw_stack, step):
+        """Write one plane's raw 16-bit speckle stack (per the save_raw toggle, or
+        always in deferred mode which needs it to rebuild from). Cheap no-op when
+        no output/raw dir or raw saving is off."""
         raw_dir = self.save_params.get("raw_dir") or self.save_params.get("output_dir", "")
-        if raw_dir and self.save_params.get("save_raw", True):
+        if raw_dir and (self._defer or self.save_params.get("save_raw", True)):
             filename = self.save_params.get("filename", "zstack")
-            save_raw_stack_tiff(raw_stack, raw_dir, filename, roi, plane=step)
-        return compute_dsi_images(raw_stack, roi)
+            save_raw_stack_tiff(raw_stack, raw_dir, filename,
+                                self.orca_params["orca_roi"], plane=step)
+
+    def _finish_orca_plane(self, raw_stack, step):
+        """Save the plane's raw (if enabled) and reconstruct its DSI images. Runs
+        inline in per-plane mode, or on the consumer thread in pipelined mode —
+        both the (expensive) parts that pipelining hides behind the next capture."""
+        self._save_orca_raw(raw_stack, step)
+        return compute_dsi_images(raw_stack, self.orca_params["orca_roi"])
 
     # -------------------------------------------------- capture with recovery
     def _camera_label(self):
@@ -425,6 +569,8 @@ class AutomatedZStackWorker(QThread):
         # EVT3 logging must start before the iterator and be stopped in a finally
         # — stopping without a prior log_raw_data can crash the native library.
         # CSV needs the sensor geometry, so its writer starts after the iterator.
+        # (Deferred mode and CSV are mutually exclusive — __init__ already forces
+        # self._defer False whenever CSV is selected — so the format alone decides.)
         csv_mode = p.get("evk4_save_format", EVK4_SAVE_FORMAT_DEFAULT) == EVK4_SAVE_FORMAT_CSV
         raw_dir = self.save_params.get("raw_dir") or self.save_params.get("output_dir", "")
         filename = self.save_params.get("filename", "zstack")
@@ -547,19 +693,25 @@ class AutomatedZStackWorker(QThread):
         if not self._is_running:
             return None
 
+        # A stalled recording is a capture-side fact known now, whatever the mode.
+        if timed_out["flag"]:
+            self.status_update.emit(
+                f"Plane {step+1}: event delivery stalled — recording capped at "
+                f"{ceiling_s:.0f} s and continuing.")
+
+        if self._defer:
+            # The plane's raw event stream is on disk; the accumulate + filter +
+            # smooth reconstruction runs later on the background thread.
+            return _DEFERRED
+
+        if self._pipeline and raw_path is not None:
+            # Reconstruct on the consumer thread while the next plane records; the
+            # complete .raw is the authoritative record it rebuilds from.
+            return (raw_path, width, height)
+
         if event_img is None:
             if raw_path is not None:
-                # Reconstruct from the plane's saved raw stream — the complete event
-                # record — matching event_camera.process_final_image().
-                reader = EventsIterator(input_path=raw_path, delta_t=1000000)
-                event_img = accumulate_event_frame(reader, width, height)
-
-                # The decoded (x, y, p, t) list is deliberately NOT written here.
-                # It cost a second full decode pass plus a gzip of ~13 bytes/event,
-                # which at high event rates dominated the per-plane time (tens of
-                # seconds against a 2 s recording). The .raw is the authoritative
-                # record and loses nothing, so the stream is generated offline
-                # afterwards instead:  python tools/backfill_event_streams.py
+                event_img = self._reconstruct_event_from_raw(raw_path, width, height)
             elif csv_writer is not None:
                 # The writer counted exactly what it wrote, so the image and the
                 # CSV agree by construction — no second pass needed.
@@ -568,24 +720,37 @@ class AutomatedZStackWorker(QThread):
             else:  # unsaved run force-stopped before any accumulation
                 event_img = np.zeros((height, width), dtype=np.float32)
 
-        # Report empty / stalled planes so the user sees *why* a run underperforms
-        # (the common cause is a bias_hpf near its maximum suppressing all events,
-        # or the camera falling back off USB3) rather than just a slow, blank stack.
+        return self._finish_event_plane(event_img, step, roi)
+
+    def _reconstruct_event_from_raw(self, raw_path, width, height):
+        """Accumulate a plane's 2D event image from its saved .raw — the complete,
+        authoritative record — matching event_camera.process_final_image(). Used
+        inline (per-plane) and on the consumer thread (pipelined).
+
+        The decoded (x, y, p, t) list is deliberately NOT written here: it cost a
+        second full decode pass plus a gzip of ~13 bytes/event, which at high event
+        rates dominated the per-plane time. The .raw loses nothing, so that stream
+        is generated offline afterwards (tools/backfill_event_streams.py).
+        """
+        reader = EventsIterator(input_path=raw_path, delta_t=1000000)
+        return accumulate_event_frame(reader, width, height)
+
+    def _finish_event_plane(self, event_img, step, roi):
+        """Crop → filter → smooth an accumulated event image (and report an empty
+        plane). Runs inline in per-plane mode, or on the consumer thread when
+        pipelined — the reconstruction cost pipelining hides behind the next
+        recording."""
+        # Report an empty plane so the user sees *why* a run underperforms (usually
+        # a bias_hpf near its maximum, or the camera falling back off USB3).
         if float(np.max(event_img)) == 0:
             self.status_update.emit(
                 f"Plane {step+1}: 0 events recorded — the camera delivered nothing. "
                 f"Check the USB3 connection and lower bias_hpf (a value near its "
                 f"maximum suppresses all events).")
-        elif timed_out["flag"]:
-            self.status_update.emit(
-                f"Plane {step+1}: event delivery stalled — recording capped at "
-                f"{ceiling_s:.0f} s and continuing.")
-
         event_img = crop_to_roi(event_img, roi)  # match the live crop framing
-
-        if p.get("filter_crazy_pixels", True):
+        if self.evk4_params.get("filter_crazy_pixels", True):
             event_img = filter_crazy_pixels(event_img)
-        if p.get("apply_smoothing", True):
+        if self.evk4_params.get("apply_smoothing", True):
             event_img = apply_smoothing(event_img)
         return event_img
 
@@ -621,7 +786,143 @@ class AutomatedZStackWorker(QThread):
         except Exception:
             pass
 
+    # ------------------------------------------------ pipelined processing
+    def _start_pipeline_consumer(self, std_volume, avg_volume, event_volume, z_positions):
+        """Start the background reconstruction consumer for pipelined mode.
+
+        The producer (the run loop) captures each plane and enqueues its raw
+        material; this consumer reconstructs it — the expensive part — while the
+        next plane is captured, then appends to the depth volumes and emits the live
+        preview. It owns the volumes for the run's duration, so the producer only
+        reads them after joining the consumer (`_drain_pipeline`).
+        """
+        self._proc_queue = queue.Queue()
+        self._proc_error = None
+        # Cap ORCA raw stacks in flight (each is large); event images are small and
+        # reconstruction is far faster than a recording, so the event pipeline is
+        # left unbounded (its queue never backs up).
+        self._proc_sem = threading.Semaphore(2) if self.camera == "orca" else None
+        consumer = threading.Thread(
+            target=self._pipeline_consumer,
+            args=(std_volume, avg_volume, event_volume, z_positions),
+            name="zstack-pipeline", daemon=True)
+        consumer.start()
+        return consumer
+
+    def _pipeline_consumer(self, std_volume, avg_volume, event_volume, z_positions):
+        """Reconstruct captured planes off the acquisition thread (pipelined mode).
+
+        Runs the same `_finish_orca_plane` / event reconstruction the inline path
+        uses, so the output is identical — only *when* it runs differs. The first
+        processing fault is stored and surfaced to the producer, which raises it.
+        """
+        while True:
+            item = self._proc_queue.get()
+            try:
+                if item is _PIPE_SENTINEL:
+                    return
+                raw_material, step, z_now = item
+                try:
+                    if self.camera == "orca":
+                        avg_img, std_img = self._finish_orca_plane(raw_material, step)
+                        avg_volume.append(avg_img)
+                        std_volume.append(std_img)
+                        z_positions.append(z_now)
+                        self.image_ready.emit(normalize_to_8bit(std_img))
+                        self.z_profile_update.emit(float(np.sum(std_img)), step)
+                    else:
+                        if isinstance(raw_material, tuple):
+                            raw_path, width, height = raw_material
+                            event_img = self._reconstruct_event_from_raw(raw_path, width, height)
+                            event_img = self._finish_event_plane(
+                                event_img, step, self.evk4_params.get("evk4_roi"))
+                        else:
+                            # Unsaved run: no .raw exists, so the capture already
+                            # accumulated + finished the image inline (pipelining
+                            # degrades gracefully); just record and show it.
+                            event_img = raw_material
+                        event_volume.append(event_img)
+                        z_positions.append(z_now)
+                        self.image_ready.emit(normalize_to_8bit(event_img))
+                        self.z_profile_update.emit(float(np.sum(event_img)), step)
+                except Exception as e:  # noqa: BLE001 — surfaced to the producer
+                    if self._proc_error is None:
+                        self._proc_error = e
+            finally:
+                if item is not _PIPE_SENTINEL and self._proc_sem is not None:
+                    self._proc_sem.release()  # free a raw-stack slot
+                self._proc_queue.task_done()
+
+    def _drain_pipeline(self, consumer):
+        """Signal the consumer to finish and wait for it. Every already-captured
+        plane is reconstructed before it exits, so an aborted run still keeps the
+        planes it managed to capture."""
+        if consumer is None:
+            return
+        try:
+            self._proc_queue.put(_PIPE_SENTINEL)
+        except Exception:
+            pass
+        consumer.join()
+
     # ----------------------------------------------------------------- save
+    def _finish_deferred(self, z_positions):
+        """Deferred mode: capture is done and every plane's raw is archived on disk.
+
+        Writes an immediate parameter log (so the acquisition folder has a record
+        straight away, and the elapsed-timing section can be appended to it), then
+        emits the rebuild job that the background processor picks up — so the
+        reconstruction runs off-instrument while the microscope is free for the
+        next acquisition. Returns a short status message.
+        """
+        out_dir = self.save_params.get("output_dir", "")
+        filename = self.save_params.get("filename", "zstack")
+        n = len(z_positions)
+        if not out_dir or n == 0:
+            return " No planes captured — nothing to process."
+
+        raw_dir = self.save_params.get("raw_dir") or out_dir
+
+        # Immediate parameter log: the settings + measured framerate, marked as
+        # pending. The background rebuild writes only the volumes/profiles (it is
+        # passed no metadata), so it never overwrites this file and the appended
+        # elapsed-timing section survives.
+        metadata = self.save_params.get("metadata")
+        if metadata:
+            log_meta = dict(metadata)
+            log_meta["Z-Stack planes"] = {
+                "camera": self.camera,
+                "num_planes_captured": n,
+                "processing": "DEFERRED — reconstruction runs after acquisition",
+                "z_positions": ", ".join(f"{z:.4f}" for z in z_positions),
+            }
+            if self.camera == "orca" and self._orca_capture_time > 0:
+                measured_fps = self._orca_capture_gaps / self._orca_capture_time
+                log_meta["Measured performance (ORCA)"] = {
+                    "measured_framerate_fps": f"{measured_fps:.1f}",
+                    "total_capture_time_s": f"{self._orca_capture_time:.3f}",
+                    "frames_timed": self._orca_capture_gaps + n,
+                }
+            save_parameter_log(out_dir, filename, log_meta)
+
+        job = {
+            "camera": self.camera,
+            "raw_dir": raw_dir,
+            "out_dir": out_dir,
+            "filename": filename,
+            "z_positions": list(z_positions),
+        }
+        if self.camera == "orca":
+            job["expected_frames"] = self.orca_params.get("orca_frames")
+            job["save_average"] = True
+        else:
+            job["roi"] = self.evk4_params.get("evk4_roi")
+            job["do_filter"] = self.evk4_params.get("filter_crazy_pixels", True)
+            job["do_smooth"] = self.evk4_params.get("apply_smoothing", True)
+        self.deferred_ready.emit(job)
+        return (f" Captured {n} planes; DSI processing queued in the background — "
+                f"the microscope is free for the next acquisition.")
+
     def _save_outputs(self, std_volume, avg_volume, event_volume, z_positions):
         """Save the depth volume(s) (3D TIFF) and the parameter log. Returns a
         short message for the status bar (empty if nothing was saved)."""
@@ -675,6 +976,16 @@ class AutomatedZStackWorker(QThread):
                 "num_planes_saved": n,
                 "z_positions": ", ".join(f"{z:.4f}" for z in z_positions),
             }
+            # Record the *measured* ORCA capture framerate (averaged over every
+            # plane) next to the estimated settings, so the log carries the real
+            # rate the frames were recorded at.
+            if self.camera == "orca" and self._orca_capture_time > 0:
+                measured_fps = self._orca_capture_gaps / self._orca_capture_time
+                metadata["Measured performance (ORCA)"] = {
+                    "measured_framerate_fps": f"{measured_fps:.1f}",
+                    "total_capture_time_s": f"{self._orca_capture_time:.3f}",
+                    "frames_timed": self._orca_capture_gaps + n,
+                }
             save_parameter_log(out_dir, filename, metadata)
 
         return f" Saved {n} planes (3D TIFF) to {out_dir}.{profile_msg}"

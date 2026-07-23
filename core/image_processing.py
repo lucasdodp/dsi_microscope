@@ -850,6 +850,80 @@ def rebuild_zstack_from_raw(raw_dir, out_dir, filename, z_positions,
     return len(std_volume), missing
 
 
+def rebuild_evk4_zstack_from_raw(raw_dir, out_dir, filename, z_positions, reader_factory,
+                                 roi=None, do_filter=True, do_smooth=True,
+                                 metadata=None, status=None):
+    """Reassemble the EVK4 event Z-stack outputs from the per-plane ``.raw`` streams.
+
+    The event-camera counterpart of :func:`rebuild_zstack_from_raw`: for every
+    present ``<name>_events_zNNN.raw`` it accumulates that plane's 2D event image
+    (cropped to ``roi``, then optionally hot-pixel filtered and smoothed), stacks
+    the planes into the event depth volume, and writes the same products a live run
+    would — ``_zstack_event.tif`` + the axial-sectioning CSV/PNG, and the parameter
+    log when ``metadata`` is given.
+
+    Decoding a ``.raw`` needs the Prophesee Metavision SDK, which ``core`` must not
+    import, so the reader is **injected**: ``reader_factory(raw_path)`` returns
+    ``(iterator, width, height)`` — an iterator of event chunks plus the sensor
+    size (mirroring how :func:`accumulate_event_frame` takes an injected iterator).
+    Planes are processed one at a time so peak memory stays at one plane.
+
+    Returns ``(n_planes, skipped)``: the number of planes assembled and the sorted
+    list of plane indices whose ``.raw`` could not be decoded.
+    """
+    def report(msg):
+        if status is not None:
+            status(msg)
+
+    steps = len(z_positions)
+    present = [k for k in range(steps)
+               if os.path.exists(event_raw_plane_path(raw_dir, filename, k))]
+    if not present:
+        raise RuntimeError(f"No per-plane .raw event streams found in {raw_dir}")
+
+    event_volume, z_kept, skipped = [], [], []
+    for k in present:
+        report(f"Rebuilding event plane {k + 1}/{steps} "
+               f"({len(event_volume) + 1}/{len(present)} present)...")
+        raw_path = event_raw_plane_path(raw_dir, filename, k)
+        try:
+            reader, width, height = reader_factory(raw_path)
+            img = accumulate_event_frame(reader, width, height)
+        except Exception as exc:  # noqa: BLE001 — report, keep going
+            report(f"  event plane {k + 1}: skipped ({exc})")
+            skipped.append(k)
+            continue
+        img = crop_to_roi(img, roi)
+        if do_filter:
+            img = filter_crazy_pixels(img)
+        if do_smooth:
+            img = apply_smoothing(img)
+        event_volume.append(img)
+        z_kept.append(float(z_positions[k]))
+
+    if not event_volume:
+        raise RuntimeError("No event planes could be reconstructed.")
+
+    report(f"Writing event depth volume ({len(event_volume)} planes)...")
+    save_volume_tiff(np.array(event_volume, dtype=np.float32), out_dir, filename, "zstack_event")
+    intensities = [float(np.mean(img)) for img in event_volume]
+    save_axial_sectioning_plot(z_kept, intensities, out_dir, filename, "event")
+
+    if metadata:
+        meta = dict(metadata)
+        meta["Z-Stack planes"] = {
+            "camera": "event",
+            "num_planes_saved": len(event_volume),
+            "skipped_planes": ", ".join(str(s) for s in skipped) or "none",
+            "z_positions": ", ".join(f"{z:.4f}" for z in z_kept),
+        }
+        save_parameter_log(out_dir, filename, meta)
+
+    report(f"Rebuilt {len(event_volume)} event planes"
+           + (f"; skipped {len(skipped)}: {skipped}" if skipped else " (complete)"))
+    return len(event_volume), skipped
+
+
 def scale_16bit_image(data):
     """Scale a 16-bit camera frame to an 8-bit display image.
 

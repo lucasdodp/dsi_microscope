@@ -406,6 +406,15 @@ class OrcaWorker(QThread):
             save_dsi_results(avg_img, std_img, out_dir, filename)
             metadata = self.params.get("metadata")
             if metadata:
+                # Record the *measured* capture framerate alongside the settings,
+                # so the log carries the real rate the frames were recorded at.
+                if capture_elapsed > 0 and n > 1:
+                    metadata = dict(metadata)
+                    metadata["Measured performance (ORCA)"] = {
+                        "measured_framerate_fps": f"{(n - 1) / capture_elapsed:.1f}",
+                        "total_capture_time_s": f"{capture_elapsed:.3f}",
+                        "frames_timed": n,
+                    }
                 save_parameter_log(out_dir, filename, metadata)
             self.status_update.emit(
                 f"Saved raw stack + average + DSI images and parameter log to {out_dir}{fps_msg}"

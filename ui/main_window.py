@@ -25,14 +25,15 @@ from PyQt6.QtWidgets import (
 
 from config import (
     ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
-    EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE, FOV_MATCH_PATH,
-    ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT, ORCA_SENSOR_WIDTH,
-    PREVIEW_MAX_DISPLAY_EDGE, SESSION_STATE_PATH,
+    EVK4_SAVE_FORMAT_CSV, EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE,
+    FOV_MATCH_PATH, ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT,
+    ORCA_SENSOR_WIDTH, PREVIEW_MAX_DISPLAY_EDGE, SESSION_STATE_PATH,
 )
 from core import (compose_registration_overlay, downscale_for_display,
                   evk4_footprint_in_orca, map_evk4_window_to_orca)
 from hardware.event_camera import CameraWorker, METAVISION_AVAILABLE
 from hardware.orca_camera import OrcaWorker, DCAM_AVAILABLE
+from ui.deferred_processing import DeferredProcessingWorker
 from ui.fov_registration import FovRegistrationWorker
 from ui.orchestrator import AutomatedZStackWorker
 from ui.widgets import (
@@ -51,6 +52,10 @@ class MainWindow(QMainWindow):
         self.orca_worker = None     # ORCA live-focus worker
         self.evk4_worker = None     # EVK4 live worker
         self.zstack_worker = None   # automated Z-stack orchestrator (one at a time)
+        # Deferred processing: a queue of finished acquisitions awaiting off-thread
+        # reconstruction, processed one at a time so several never thrash the CPU.
+        self._deferred_queue = []
+        self._deferred_worker = None
         self._orca_single_active = False  # True while a single ORCA DSI acquire runs
         # EVK4 batch queue: expanded per-acquisition configs run back-to-back.
         self._queue = []
@@ -201,7 +206,11 @@ class MainWindow(QMainWindow):
         control_scroll = QScrollArea()
         control_scroll.setWidgetResizable(True)
         control_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # "As needed" rather than "always off": if any control ever needs more
+        # width than the panel has (a long unwrapped label, a wide table), a
+        # scrollbar appears so the control stays reachable instead of being
+        # silently clipped off the right edge with no way to see or use it.
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         control_scroll.setWidget(scroll_content)
         control_panel_layout.addWidget(control_scroll, stretch=1)
 
@@ -391,6 +400,17 @@ class MainWindow(QMainWindow):
         self.chk_orca_raw.setChecked(True)
         self.chk_orca_raw.stateChanged.connect(self._update_orca_time)
         acq_layout.addWidget(self.chk_orca_raw)
+        # Processing mode: when the per-plane DSI reconstruction runs relative to
+        # capture — inline (slowest, simplest), in parallel on a background thread
+        # (faster, keeps live feedback), or wholly after the run (fastest capture,
+        # frees the microscope for the next acquisition, no live feedback).
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Processing:"))
+        self.combo_orca_mode = QComboBox()
+        self._populate_mode_combo(self.combo_orca_mode)
+        self.combo_orca_mode.currentIndexChanged.connect(self._on_orca_mode_changed)
+        mode_row.addWidget(self.combo_orca_mode, stretch=1)
+        acq_layout.addLayout(mode_row)
         info = QLabel(
             "Moves through Z and acquires an ORCA speckle stack at each plane, saving "
             "the per-plane sectioned images as a 3D TIFF depth volume, the raw stacks "
@@ -423,6 +443,7 @@ class MainWindow(QMainWindow):
         self.btn_orca_live_resume.setVisible(False)
         acq_layout.addWidget(self.btn_orca_live_resume)
         self.lbl_orca_time = QLabel()
+        self.lbl_orca_time.setWordWrap(True)  # long "Estimated … – … left" text must wrap, not widen the panel
         self.lbl_orca_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
         acq_layout.addWidget(self.lbl_orca_time)
         acq_group.setLayout(acq_layout)
@@ -475,6 +496,21 @@ class MainWindow(QMainWindow):
         self.txt_evk4_filename = QLineEdit()
         self._stamp_default_filename(self.txt_evk4_filename, "zstack_evk4")
         acq_layout.addWidget(self.txt_evk4_filename)
+        # Processing mode (see the ORCA tab): inline per-plane, pipelined (parallel
+        # with the next plane's recording), or deferred to after the run.
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Processing:"))
+        self.combo_evk4_mode = QComboBox()
+        self._populate_mode_combo(self.combo_evk4_mode)
+        mode_row.addWidget(self.combo_evk4_mode, stretch=1)
+        acq_layout.addLayout(mode_row)
+        # CSV has no raw stream to reconstruct from later (the writer builds the
+        # image inline as events arrive), so it is incompatible with pipelined and
+        # deferred processing alike. Lock the mode to per-plane while CSV is
+        # selected, rather than silently overriding the chosen format at run time.
+        self.evk4_params.combo_save_format.currentIndexChanged.connect(
+            self._on_evk4_save_format_changed)
+        self._on_evk4_save_format_changed()
         info = QLabel(
             "Moves through Z and records events at each plane. Each plane's raw event "
             "stream (.raw) is always saved, alongside the accumulated event depth "
@@ -495,6 +531,7 @@ class MainWindow(QMainWindow):
         self.btn_evk4_resume.setVisible(False)
         acq_layout.addWidget(self.btn_evk4_resume)
         self.lbl_evk4_time = QLabel()
+        self.lbl_evk4_time.setWordWrap(True)  # long "Elapsed … – … left" text must wrap, not widen the panel
         self.lbl_evk4_time.setStyleSheet("color: #4daaf2; font-size: 11px; font-weight: bold;")
         acq_layout.addWidget(self.lbl_evk4_time)
         acq_group.setLayout(acq_layout)
@@ -594,29 +631,126 @@ class MainWindow(QMainWindow):
             return f"{m} min {s:02d} s"
         return f"{s} s"
 
+    # ----- processing mode (per-plane / pipelined / deferred) -----
+    @staticmethod
+    def _populate_mode_combo(combo):
+        """Fill a processing-mode selector. The stored data is the value the
+        orchestrator receives as ``processing_mode``."""
+        combo.addItem("Per-plane (process each plane inline)", "per_plane")
+        combo.addItem("Pipelined (process while next plane captures)", "pipelined")
+        combo.addItem("Deferred (process everything after the run)", "deferred")
+        combo.setToolTip(
+            "Per-plane: capture → reconstruct → next plane. Simplest; slowest.\n"
+            "Pipelined: plane N reconstructs on a background thread while plane "
+            "N+1 captures — faster, keeps the live preview; ~2 raw stacks in RAM.\n"
+            "Deferred: capture + save raw only; everything reconstructs after the "
+            "run — fastest capture, frees the microscope soonest, no live preview.")
+
+    def _orca_mode(self):
+        return self.combo_orca_mode.currentData()
+
+    def _evk4_mode(self):
+        return self.combo_evk4_mode.currentData()
+
     def _orca_zstack_predicted_s(self):
         """Cold-start estimate (s) for an ORCA Z-stack: camera start-up plus, per
         plane, motor move + settle, capture, DSI reconstruction and raw write."""
         steps = self.pi_stage_widget.spin_steps.value()
         n = self.orca_params.spin_frames.value()
         frame_s = self.orca_params.estimated_frame_time_s()
+        mode = self._orca_mode()
+        capture_s = ORCA_PLANE_OVERHEAD_S + n * frame_s
         compute_s = self.orca_params.estimated_compute_s(n)
-        save_s = self.orca_params.estimated_raw_save_s(n) if self.chk_orca_raw.isChecked() else 0.0
-        plane_s = ORCA_PLANE_OVERHEAD_S + n * frame_s + compute_s + save_s
+        save_s = (self.orca_params.estimated_raw_save_s(n)
+                  if (mode == "deferred" or self.chk_orca_raw.isChecked()) else 0.0)
+        if mode == "deferred":
+            # Reconstruction runs after the run — only capture + raw write count
+            # toward the on-instrument time.
+            plane_s = capture_s + save_s
+        elif mode == "pipelined":
+            # Plane N's compute+write overlaps plane N+1's capture, so each plane
+            # costs whichever of the two phases is longer.
+            plane_s = max(capture_s, compute_s + save_s)
+        else:  # per_plane: strictly sequential
+            plane_s = capture_s + compute_s + save_s
         return ORCA_CAMERA_INIT_S + steps * plane_s
+
+    def _on_orca_mode_changed(self):
+        """Deferred moves the DSI compute off the acquisition and *requires* the
+        raw stack (it rebuilds from it), so raw saving is forced on + locked. The
+        other modes leave the raw toggle free. Always refresh the time estimate."""
+        deferred = self._orca_mode() == "deferred"
+        if deferred:
+            self.chk_orca_raw.setChecked(True)
+        self.chk_orca_raw.setEnabled(not deferred)
+        self._update_orca_time()
+
+    def _on_evk4_save_format_changed(self):
+        """CSV has no raw stream to reconstruct from afterwards (the writer builds
+        the image inline as events arrive), so neither pipelined nor deferred
+        processing can work with it. Lock the mode selector to per-plane while CSV
+        is selected, so the incompatibility is visible and can't be silently
+        overridden at run time (deferral used to force EVT3 (.raw) regardless of
+        the chosen format — a real bug)."""
+        is_csv = self.evk4_params.combo_save_format.currentData() == EVK4_SAVE_FORMAT_CSV
+        if is_csv:
+            idx = self.combo_evk4_mode.findData("per_plane")
+            if idx >= 0:
+                self.combo_evk4_mode.setCurrentIndex(idx)
+        self.combo_evk4_mode.setEnabled(not is_csv)
+        if is_csv:
+            self.combo_evk4_mode.setToolTip(
+                "Locked to per-plane: the CSV event format has no raw stream to "
+                "reconstruct from afterwards, so pipelined/deferred processing "
+                "cannot be used. Switch to Event stream (.raw) to unlock.")
+        else:
+            self.combo_evk4_mode.setToolTip(
+                "Per-plane: capture → reconstruct → next plane. Simplest; slowest.\n"
+                "Pipelined: plane N reconstructs on a background thread while plane "
+                "N+1 records — faster, keeps the live preview.\n"
+                "Deferred: record + save raw only; everything reconstructs after the "
+                "run — fastest capture, frees the microscope soonest, no live preview.")
 
     def _evk4_zstack_predicted_s(self):
         """Cold-start estimate (s) for an EVK4 Z-stack: per plane the device is
-        re-opened and events accumulated for the fixed recording duration."""
+        re-opened and events accumulated for the fixed recording duration.
+
+        The recording itself is fixed wall-clock whatever the mode; pipelined and
+        deferred only move the (event-count-dependent) reconstruction off the
+        capture path, which the per-mode calibration buckets learn from real runs.
+        """
         steps = self.pi_stage_widget.spin_steps.value()
         plane_s = EVK4_PLANE_OVERHEAD_S + self.evk4_params.spin_time.value()
         return steps * plane_s
+
+    def _orca_acq_type(self):
+        """History/calibration bucket for an ORCA Z-stack. Each processing mode is
+        a *separate* bucket: their wall-clocks differ structurally (deferred skips
+        the per-plane compute entirely; pipelined overlaps it with capture), so
+        calibrating one mode against another's ratios produced wildly wide,
+        misleading ranges. Each mode learns only from runs of its own kind."""
+        mode = self._orca_mode()
+        if mode == "deferred":
+            return "orca_zstack_deferred"
+        if mode == "pipelined":
+            return "orca_zstack_pipelined"
+        return "orca_zstack"
+
+    def _evk4_acq_type(self):
+        """History/calibration bucket for an EVK4 Z-stack (per mode — see
+        `_orca_acq_type`)."""
+        mode = self._evk4_mode()
+        if mode == "deferred":
+            return "evk4_zstack_deferred"
+        if mode == "pipelined":
+            return "evk4_zstack_pipelined"
+        return "evk4_zstack"
 
     def _update_orca_time(self):
         if self._acq_label is self.lbl_orca_time:
             return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
-        lo, hi, runs = self._calibrate_range(self._orca_zstack_predicted_s(), "orca_zstack")
+        lo, hi, runs = self._calibrate_range(self._orca_zstack_predicted_s(), self._orca_acq_type())
         self.lbl_orca_time.setText(
             f"Estimated: {self._fmt_range(lo, hi)}  ({steps} planes){self._calib_note(runs)}"
         )
@@ -625,7 +759,7 @@ class MainWindow(QMainWindow):
         if self._acq_label is self.lbl_evk4_time:
             return  # acquisition running: leave the live elapsed readout alone
         steps = self.pi_stage_widget.spin_steps.value()
-        lo, hi, runs = self._calibrate_range(self._evk4_zstack_predicted_s(), "evk4_zstack")
+        lo, hi, runs = self._calibrate_range(self._evk4_zstack_predicted_s(), self._evk4_acq_type())
         self.lbl_evk4_time.setText(
             f"Estimated: {self._fmt_range(lo, hi)}  ({steps} planes){self._calib_note(runs)}"
         )
@@ -640,7 +774,7 @@ class MainWindow(QMainWindow):
         for r in self.evk4_queue.rows():
             total_raw += r["repeats"] * steps * (EVK4_PLANE_OVERHEAD_S + r["acqu_time"])
             n_acq += r["repeats"]
-        lo, hi, runs = self._calibrate_range(total_raw, "evk4_zstack")  # calibration is linear
+        lo, hi, runs = self._calibrate_range(total_raw, self._evk4_acq_type())  # calibration is linear
         return lo, hi, n_acq, runs
 
     def _update_queue_estimate(self):
@@ -745,8 +879,16 @@ class MainWindow(QMainWindow):
         out_dir, filename = rec.get("out_dir"), rec.get("filename")
         if not out_dir or not filename:
             return
-        path = os.path.join(out_dir, f"{filename}_parameters.txt")
-        if not os.path.exists(path):
+        # The Z-stack writes every file into a per-acquisition subfolder
+        # (<output_dir>/<filename>/, see AutomatedZStackWorker._prepare_output_dir),
+        # so the parameter log lives there — not in the parent dir the UI recorded.
+        # Prefer the subfolder; fall back to the flat path for older/other layouts.
+        candidates = [
+            os.path.join(out_dir, filename, f"{filename}_parameters.txt"),
+            os.path.join(out_dir, f"{filename}_parameters.txt"),
+        ]
+        path = next((p for p in candidates if os.path.exists(p)), None)
+        if path is None:
             return
         try:
             with open(path, "a", encoding="utf-8") as f:
@@ -810,6 +952,16 @@ class MainWindow(QMainWindow):
                 worker.stop()
                 worker.wait(2000)
 
+        # Deferred reconstruction can't be safely interrupted mid-plane (and the
+        # raw files it reads are the source of truth), so let the current job finish
+        # rather than destroy its thread. Anything still queued is dropped — those
+        # acquisitions keep their raws and can be rebuilt later with tools/rebuild_*.
+        self._deferred_queue.clear()
+        if self._deferred_worker is not None and self._deferred_worker.isRunning():
+            self.lbl_status.setText(
+                "Finishing deferred processing before exit (raw files are safe)...")
+            self._deferred_worker.wait()
+
         self.awg_widget.close_device()
         self.pi_stage_widget.close_device()
         event.accept()
@@ -838,6 +990,10 @@ class MainWindow(QMainWindow):
             "save_raw": {
                 # EVK4 .raw is always saved; only the ORCA raw-stack toggle persists.
                 "orca": self.chk_orca_raw.isChecked(),
+            },
+            "processing_mode": {
+                "orca": self._orca_mode(),
+                "evk4": self._evk4_mode(),
             },
             "output_dirs": {
                 "evk4": self.txt_evk4_dir.text(),
@@ -883,6 +1039,24 @@ class MainWindow(QMainWindow):
             val = sr.get("orca", sr.get("zstack"))  # old files used "zstack" for the ORCA toggle
             if val is not None:
                 self.chk_orca_raw.setChecked(bool(val))
+
+        # Processing mode: current files store the mode string per camera; older
+        # files stored boolean defer_processing flags — map those onto the modes.
+        modes = dict(preset.get("processing_mode") or {})
+        if not modes and "defer_processing" in preset:
+            dp = preset["defer_processing"]
+            modes = {cam: ("deferred" if dp.get(cam) else "per_plane")
+                     for cam in ("orca", "evk4") if cam in dp}
+        if modes:
+            for cam, combo in (("orca", self.combo_orca_mode), ("evk4", self.combo_evk4_mode)):
+                idx = combo.findData(modes.get(cam))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            self._on_orca_mode_changed()  # sync the raw-toggle enable state
+            # Re-validate against the just-restored save format: if the preset
+            # somehow paired a non-per-plane EVK4 mode with CSV, CSV must still win
+            # (setCurrentIndex above is programmatic and bypasses the lock).
+            self._on_evk4_save_format_changed()
 
         # Output directories are restored (the filename bases stay timestamped).
         if "output_dirs" in preset:
@@ -1421,7 +1595,11 @@ class MainWindow(QMainWindow):
         n = p["orca_frames"]
         z = self.pi_stage_widget.spin_steps.value()
         px = w * h
-        frame_stack = 2 * n * px * 2     # SDK ring buffer + host copy (uint16 = 2 B)
+        # Pipelined mode holds up to two raw stacks in flight (the orchestrator's
+        # semaphore blocks the next capture until the consumer frees a slot), so
+        # the host-side footprint doubles. Per-plane and deferred hold just one.
+        host_copies = 2 if self._orca_mode() == "pipelined" else 1
+        frame_stack = (1 + host_copies) * n * px * 2  # SDK ring buffer + host copies (uint16)
         volumes = 3 * z * px * 4         # avg + DSI float32 volumes + a save-time copy
         chunk = 128 * 1024 * 1024        # compute_dsi_images working-set budget
         return frame_stack + volumes + chunk
@@ -1516,12 +1694,20 @@ class MainWindow(QMainWindow):
             else "3D Z-Stack (EVK4) - per-plane event-DSI"
         )
 
+        # Processing mode: per_plane (inline), pipelined (reconstruct in parallel
+        # with the next capture) or deferred (reconstruct after the run). Deferred
+        # needs the raw archive, so raw saving is forced on for the ORCA (the EVK4
+        # always saves its per-plane event record).
+        mode = self._orca_mode() if camera == "orca" else self._evk4_mode()
+
         save_params = {
             "output_dir": out_dir,
             "filename": filename,
             # ORCA raw-stack TIFF is optional; the EVK4 always saves a per-plane
             # event record, in whichever format the EVK4 tab selected (.raw or .csv).
-            "save_raw": self.chk_orca_raw.isChecked() if camera == "orca" else True,
+            "save_raw": True if (camera == "orca" and mode == "deferred") else (
+                self.chk_orca_raw.isChecked() if camera == "orca" else True),
+            "processing_mode": mode,
             "metadata": self.collect_acquisition_metadata(
                 source, out_dir, filename, self.evk4_params, self.orca_params
             ),
@@ -1559,6 +1745,7 @@ class MainWindow(QMainWindow):
         self.zstack_worker.position_update.connect(self.pi_stage_widget.show_position)
         self.zstack_worker.error_signal.connect(self.show_error)
         self.zstack_worker.awaiting_reconnect.connect(self._on_awaiting_reconnect)
+        self.zstack_worker.deferred_ready.connect(self._on_deferred_ready)
         self.zstack_worker.finished_signal.connect(self.on_zstack_finished)
         self.zstack_worker.start()
         self._refresh_buttons()
@@ -1568,12 +1755,16 @@ class MainWindow(QMainWindow):
             predicted = self._orca_zstack_predicted_s()
             frames = self.orca_params.get_params()["orca_frames"]
             label, restore = self.lbl_orca_time, self._update_orca_time
+            acq_type = self._orca_acq_type()
         else:
             predicted = self._evk4_zstack_predicted_s()
             frames = self.evk4_params.get_params()["acqu_time"]
             label, restore = self.lbl_evk4_time, self._update_evk4_time
+            acq_type = self._evk4_acq_type()
+        # Deferred runs learn into their own bucket (see `_orca_acq_type`) so their
+        # much-shorter capture-only time never widens the per-plane estimate.
         self._begin_acq_record(
-            "orca_zstack" if camera == "orca" else "evk4_zstack",
+            acq_type,
             predicted, planes=self.pi_stage_widget.spin_steps.value(),
             frames=frames, out_dir=out_dir, filename=filename,
         )
@@ -1610,6 +1801,77 @@ class MainWindow(QMainWindow):
         if self._queue_active:
             self._queue_index += 1
             QTimer.singleShot(800, self._run_next_queue_item)
+
+    # ==========================
+    # Deferred processing — reconstruct finished acquisitions off-thread
+    # ==========================
+    def _on_deferred_ready(self, job):
+        """A deferred acquisition finished capturing; queue its reconstruction.
+
+        The job carries everything the background worker needs to rebuild the
+        summary products from the archived per-plane raws. Processing runs on its
+        own thread, so the microscope (and this UI) stay free for the next run.
+        """
+        # Stamp the acquisition start (still live here — this fires before
+        # on_zstack_finished stops the elapsed timer) so the *total* pipeline time
+        # (acquisition + data treatment) can be recorded when processing finishes.
+        job["_acq_start_time"] = self._acq_start
+        self._deferred_queue.append(job)
+        self._maybe_start_deferred()
+        self._refresh_buttons()
+
+    def _maybe_start_deferred(self):
+        """Start the next queued deferred job if none is currently processing.
+
+        Only one runs at a time: several deferred acquisitions reconstruct in
+        sequence rather than competing for CPU/RAM/disk all at once.
+        """
+        if self._deferred_worker is not None or not self._deferred_queue:
+            return
+        job = self._deferred_queue.pop(0)
+        job["_proc_start_time"] = time.time()  # for the pure data-treatment duration
+        worker = DeferredProcessingWorker(job)
+        worker.status_update.connect(self.lbl_status.setText)
+        worker.error_signal.connect(self.show_error)
+        worker.finished_signal.connect(self._on_deferred_finished)
+        self._deferred_worker = worker
+        worker.start()
+
+    def _on_deferred_finished(self, job):
+        """A deferred job finished (success or failure); record its timing and
+        start the next queued job, if any."""
+        self._deferred_worker = None
+        self._append_deferred_timing_to_log(job)
+        self._maybe_start_deferred()
+        self._refresh_buttons()
+
+    def _append_deferred_timing_to_log(self, job):
+        """Append the data-treatment and full-pipeline durations to the parameter
+        log, so a deferred dataset records both the acquisition-only time (written
+        earlier as [Acquisition timing]) and the whole process end to end."""
+        out_dir, filename = job.get("out_dir"), job.get("filename")
+        if not out_dir or not filename:
+            return
+        path = os.path.join(out_dir, f"{filename}_parameters.txt")
+        if not os.path.exists(path):
+            return
+        now = time.time()
+        proc_start = job.get("_proc_start_time")
+        acq_start = job.get("_acq_start_time")
+        proc_s = (now - proc_start) if proc_start else None
+        total_s = (now - acq_start) if acq_start else None
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n[Deferred processing timing]\n")
+                if proc_s is not None:
+                    f.write(f"data_treatment_s = {proc_s:.1f}\n")
+                    f.write(f"data_treatment = {self._fmt_dur(proc_s)}\n")
+                if total_s is not None:
+                    f.write("# whole pipeline: acquisition + data treatment\n")
+                    f.write(f"total_pipeline_s = {total_s:.1f}\n")
+                    f.write(f"total_pipeline = {self._fmt_dur(total_s)}\n")
+        except OSError:
+            pass
 
     # ==========================
     # FOV matching — crop the ORCA to the EVK4 field
