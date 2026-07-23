@@ -1269,6 +1269,12 @@ class ImageLab(QMainWindow):
     def _build_ui(self):
         header = self._build_editing_header()   # first: the groups reference it
         panel = QWidget()
+        # The scroll-area viewport is themed by the app stylesheet, but the widget
+        # handed to setWidget() is a grandchild of the viewport, so it keeps the
+        # default (white) background. Colour it explicitly to match the main app,
+        # exactly as ui/main_window.py does for its own scroll content.
+        panel.setObjectName("labPanel")
+        panel.setStyleSheet("QWidget#labPanel { background-color: #1e1e1e; }")
         col = QVBoxLayout(panel)
         col.setContentsMargins(6, 6, 6, 6)
         col.setSpacing(6)
