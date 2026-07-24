@@ -26,6 +26,89 @@ TEMPLATE — copy this block for a new entry:
 
 ---
 
+## 2026-07-24 — Re-analysis of the 07-02 duration test: does longer acquisition help? (curve smoothness vs total events)
+
+**Conditions**
+- No new acquisition. Re-analysis of `D:/2026-07-02 duration tests/duration_tests_singleline/`
+  (single-line sample, EVK4 bias_on=bias_off=40, bias_fo=bias_hpf=0, 2500 Hz, 51 planes ×
+  0.5 µm, 0.41 mW). Five acquisitions at 0.1/1/2/5/10 s per plane.
+- Tutor said the previous analysis (`make_duration_figures.py`) was not good: it read
+  SNR = (signal−bg)/noise at the single focal plane, where signal and background both grow
+  ∝ time → SNR looks flat, contrast drops → wrongly concluded "duration doesn't help,
+  FWHM time-independent." That metric hides what changes in the axial **curve**.
+
+**Data treatment**
+- Wrote a minimal, vectorised **EVT3 decoder** (`evt3_counts.py`, no Metavision SDK) that
+  returns per-plane event **counts vs timestamp**; validated against the app's own axial
+  CSV to 0.2–0.3 % on the high-count planes. (x,y not needed: accumulate_event_frame adds
+  1 per event, so a plane's signal = events/npix.)
+- **Controlled duration axis from ONE acquisition:** truncate the 10 s stack at increasing
+  T (2 ms → 10 s) → the exact curve we'd have measured at duration T, same sample/speckle.
+- Separated two noises: **statistical** (even/odd **1 ms** interleaved split — 1 ms spans
+  5 periods of the 5 kHz = 2×AWG event modulation, so unbiased; a 100 µs split aliases it
+  and was the first-attempt bug) and **structural** (2nd-difference roughness). FWHM from a
+  Gaussian fit **and** a model-free half-max width (guards against fit artefacts).
+
+**Results**
+- **Total events ∝ acquisition time** (constant ~6.6 Mev/s at focus, ~58 Mev/s whole stack).
+- **Statistical curve noise falls as ~1/√(events):** 3.5 % of peak at 2 ms (1.1e4 ev) →
+  0.02 % at 10 s (5.8e8 ev). This is how total events "make the curve smoother."
+- **Reproducible structural floor ≈ 1.4 % of peak** (real profile + plane-to-plane
+  speckle/stage jitter) that time cannot remove; random noise crosses below it at
+  **T ≈ 20 ms (~0.5 M events)** → curve "converged" there.
+- **Sectioning FWHM converges UPWARD to ~3.5 µm (model-free) / ~3.8 µm (Gaussian) by ~1 s**:
+  2.3 µm @10 ms → 3.3 @100 ms → 3.5 @≥1 s (plateau spread <0.02 µm). The faint out-of-focus
+  **wings** (~50× dimmer than the peak) need ~1 s to emerge, so short runs **under-report**
+  the section thickness. Peak grows linearly (no saturation); model-free width confirms it
+  is physical, not a fit artefact. **This corrects the old "FWHM is time-independent" claim.**
+- The five real separate acquisitions (0.1/1/2/5/10 s → 4/58/117/294/576 M events) land on
+  the same noise and FWHM trends → validates the truncation model.
+- **Answer:** duration matters up to **~1 s** (cuts 1/√N noise + lets the FWHM converge);
+  beyond ~2 s it only costs time. Recommend ~1 s/plane for this bright sample. The old
+  conclusion was an artefact of the focal-plane-SNR metric.
+
+**Main files generated** (in `D:/2026-07-02 duration tests/duration_tests_singleline/`)
+- `DURATION_SMOOTHNESS_SUMMARY.md` — write-up.
+- `duration_smoothness.png` (4-panel: total events; 1/√N noise vs floor; FWHM convergence;
+  curve overlay), `duration_curves_overlay.png`, `duration_smoothness_results.csv`.
+- `analyze_duration_smoothness.py`, `evt3_counts.py`; cache `_decode_cache_10s.npz`.
+- Supersedes `snr_vs_duration.png` / `duration_focal_images.png` (old focal-plane-SNR).
+
+---
+
+## 2026-07-24 — LC decorrelation (AWG frequency) vs high-pass bias sweep (fixed a broken plotting script)
+
+**Conditions**
+- Sample: fluorescent-marker sample (per-plane event-DSI Z-stack, EVK4 only).
+- Light power at sample: 0.51 mW (folder name flags this as "sweep with power mistake" —
+  power differs from other sweeps, _(fill in — intended vs actual power)_).
+- Illumination (AWG): CH1 square, 18 Vpp, swept over 500/1000/1500/2000/2500 Hz (CH2 off).
+- Camera settings: EVK4 only, bias_fo=5, bias_on=bias_off=40, bias_hpf swept
+  (20/40/60/100/110 seen), 5 s/plane, 61-plane Z-stack (0.5 µm step).
+- Data at `D:/2026-07-07 sweep with power mistake/` — `hpf_sweep_{500,1000,1500,2000,2500}hz/`,
+  each containing one folder per `bias_hpf` value.
+- Notes: `make_decorrelation_figures.py` (in the same folder) had a stale hardcoded
+  `ROOT = r'D:\2026-07-07'`, missing the ` sweep with power mistake` suffix — every glob
+  found zero files, so it silently plotted nothing and crashed on `savefig` (dir doesn't
+  exist). Fixed the path in place; script runs clean now.
+
+**Data treatment**
+- For each AWG frequency, read `bias_hpf` and the in-focus event rate (peak of the
+  per-plane mean-event-count axial profile, from each cell's `*axial_profile_event.csv`)
+  across the `bias_hpf` sweep. Plotted (a) event rate vs `bias_hpf` per frequency and
+  (b) event rate vs AWG frequency per `bias_hpf` level, both log-y.
+
+**Results**
+- Peak in-focus event rate at `bias_hpf=20` is highest at **1500 Hz** (16.4 events/px/5s),
+  well above 1000 Hz (6.2), 2000 Hz (10.3), 2500 Hz (7.5), and 500 Hz (0.4).
+- Half-max `bias_hpf` cutoff is roughly flat across frequency (62–69), i.e. no strong
+  shift of the high-pass corner with AWG decorrelation frequency in this sweep.
+
+**Main files generated**
+- `D:/2026-07-07 sweep with power mistake/decorrelation_bandpass.png`
+
+---
+
 ## 2026-07-21 — Optical z-sectioning: per-bead axial FWHM, ORCA DSI vs EVK4 event (3D agarose)
 
 **Conditions**

@@ -1339,6 +1339,9 @@ class MainWindow(QMainWindow):
         self.orca_params.btn_apply_live.setEnabled(True)
         self.orca_params.btn_apply_live.clicked.connect(self._apply_orca_params_live)
         self.orca_params.roi_changed.connect(self._apply_orca_roi_live)
+        # Camera mode/readout also applies on change (like the crop), so a mode
+        # edit re-applies to the running feed without the Apply button.
+        self.orca_params.mode_changed.connect(self._apply_orca_mode_live)
         # Auto-contrast is display-only, so it applies to the running feed
         # instantly (no capture restart, unlike the other settings).
         self.orca_params.chk_auto_contrast.toggled.connect(self._apply_orca_autocontrast_live)
@@ -1373,6 +1376,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.orca_params.roi_changed.disconnect(self._apply_orca_roi_live)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.orca_params.mode_changed.disconnect(self._apply_orca_mode_live)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -1469,6 +1476,25 @@ class MainWindow(QMainWindow):
         base = self._orca_live_params or self.orca_params.get_params()
         params = dict(base)
         params["orca_roi"] = self.orca_params._compute_roi()
+        self._orca_live_params = params
+        self.orca_worker.apply_params(params)
+
+    def _apply_orca_mode_live(self):
+        """Apply only the camera mode/readout to the running ORCA live feed.
+
+        Mirrors `_apply_orca_roi_live`: the mode fields (readout speed, binning,
+        trigger, defect correction) are merged onto the last-applied settings, so
+        changing a mode re-applies immediately without the Apply button and
+        without pushing un-applied exposure/frame edits. Readout and binning
+        changes restart the capture inside the worker's `apply_params`.
+        """
+        if not (self.orca_worker is not None and self.orca_worker.isRunning()):
+            return
+        current = self.orca_params.get_params()
+        params = dict(self._orca_live_params or current)
+        for key in ("readout_speed", "binning", "trigger_source",
+                    "trigger_mode", "defect_correct"):
+            params[key] = current[key]
         self._orca_live_params = params
         self.orca_worker.apply_params(params)
 

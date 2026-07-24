@@ -1,7 +1,5 @@
 # DSI Microscope — Project Overview & Code Architecture
 
-NEVER COMMIT AS CLAUDE COAUTHOR.
-
 Control software for the **Institut Fresnel event-based Dynamic Speckle Illumination (event-DSI) microscope**. It is a PyQt6 desktop application that drives the full optical setup and reconstructs optically-sectioned wide-field fluorescence images.
 
 >

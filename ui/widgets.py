@@ -85,10 +85,27 @@ class Evk4ParamsWidget(QWidget):
         self.spin_hpf = QSpinBox(); self.spin_hpf.setRange(0, 120); self.spin_hpf.setValue(30)
         self.spin_on = QSpinBox(); self.spin_on.setRange(-85, 140); self.spin_on.setValue(5)
         self.spin_off = QSpinBox(); self.spin_off.setRange(-35, 190); self.spin_off.setValue(5)
-        bias_form.addRow("bias_fo (low-pass):", self.spin_fo)
-        bias_form.addRow("bias_hpf (high-pass):", self.spin_hpf)
-        bias_form.addRow("bias_on (positive):", self.spin_on)
-        bias_form.addRow("bias_off (negative):", self.spin_off)
+
+        def _bias_row(label, spin):
+            """Add a bias row whose label states its allowed range, so the user
+            sees the whole usable span without having to hit the spinbox clamp.
+            The range sits on a second line in a smaller, muted font; it is read
+            back from the spinbox, so it tracks setRange above.
+            """
+            lo, hi = spin.minimum(), spin.maximum()
+            spin.setToolTip(
+                f"Allowed range {lo} to {hi} (IMX636 datasheet). Values outside "
+                "are clamped to this span.")
+            lbl = QLabel(
+                f"{label}:<br>"
+                f"<span style='font-size: 10px; color: #888888;'>"
+                f"range {lo} to {hi}</span>")
+            bias_form.addRow(lbl, spin)
+
+        _bias_row("bias_fo (low-pass)", self.spin_fo)
+        _bias_row("bias_hpf (high-pass)", self.spin_hpf)
+        _bias_row("bias_on (positive)", self.spin_on)
+        _bias_row("bias_off (negative)", self.spin_off)
         self.btn_apply_biases = QPushButton("Apply Biases to Live Feed")
         self.btn_apply_biases.setEnabled(False)
         bias_form.addRow("", self.btn_apply_biases)
@@ -457,6 +474,12 @@ class OrcaParamsWidget(QWidget):
     # so a running live feed can be re-framed/re-centred without clicking Apply.
     roi_changed = pyqtSignal()
 
+    # Emitted (debounced) whenever a camera-mode setting — readout speed, binning,
+    # trigger or defect correction — changes, so a running live feed re-applies it
+    # immediately (same live-apply model as the crop) rather than waiting for the
+    # Apply button.
+    mode_changed = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
@@ -493,6 +516,10 @@ class OrcaParamsWidget(QWidget):
         setup_group.setLayout(setup_form)
         layout.addWidget(setup_group)
 
+        # The Camera Mode & Readout group is built here but added to the layout
+        # further down — below the ROI crop and the Apply button — so the most-used
+        # controls sit at the top of the panel and the mode settings apply live on
+        # change (see the mode_changed wiring below), not via the Apply button.
         mode_group = QGroupBox("Camera Mode & Readout")
         mode_form = QFormLayout()
         self.combo_readout = make_dcam_combo(DCAM_READOUTSPEED_OPTIONS, "Standard (2)")
@@ -506,7 +533,6 @@ class OrcaParamsWidget(QWidget):
         mode_form.addRow("Trigger Mode:", self.combo_trigmode)
         mode_form.addRow("Defect Correction:", self.combo_defect)
         mode_group.setLayout(mode_form)
-        layout.addWidget(mode_group)
 
         roi_group = QGroupBox("Region of Interest — Hardware Crop")
         roi_form = QFormLayout()
@@ -583,6 +609,24 @@ class OrcaParamsWidget(QWidget):
         self.btn_apply_live = QPushButton("Apply All Settings to Live Feed")
         self.btn_apply_live.setEnabled(False)
         layout.addWidget(self.btn_apply_live)
+
+        # Camera Mode & Readout sits below the crop and the Apply button, and
+        # applies on change: a mode edit emits `mode_changed` (debounced) so
+        # main_window re-applies it to a running live feed straight away, the same
+        # way the crop does — no scrolling back up to click Apply.
+        layout.addWidget(mode_group)
+        self._mode_debounce = QTimer(self)
+        self._mode_debounce.setSingleShot(True)
+        self._mode_debounce.setInterval(200)
+        self._mode_debounce.timeout.connect(self.mode_changed.emit)
+        for combo in (
+            self.combo_readout,
+            self.combo_binning,
+            self.combo_trigsrc,
+            self.combo_trigmode,
+            self.combo_defect,
+        ):
+            combo.currentIndexChanged.connect(lambda *_: self._mode_debounce.start())
 
     def estimated_raw_save_s(self, n):
         """Estimated time to write the N-frame raw 16-bit stack to disk.

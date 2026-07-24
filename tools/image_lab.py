@@ -787,6 +787,13 @@ class VolumeView(QDialog):
         self.show_box = QCheckBox("Bounding box + axes")
         self.show_box.setChecked(True)
         self.show_box.toggled.connect(self._queue)
+        self.show_labels = QCheckBox("Axis labels (x, y, z)")
+        self.show_labels.setChecked(True)
+        self.show_labels.setToolTip(
+            "The x / y / z letters at the ends of the box edges. Turn off to "
+            "leave them out — so they can be added by hand on the final figure "
+            "for a paper. (No effect while the bounding box is hidden.)")
+        self.show_labels.toggled.connect(self._queue)
         self.show_bar = QCheckBox("Scale bar")
         self.show_bar.setChecked(True)
         self.show_bar.toggled.connect(self._queue)
@@ -797,7 +804,7 @@ class VolumeView(QDialog):
             ("Mode", self.mode), (None, self.colour),
             ("Threshold", self.threshold), ("Brightness", self.brightness),
             ("Opacity", self.opacity), (None, self.show_box),
-            (None, self.show_bar), (None, b_png),
+            (None, self.show_labels), (None, self.show_bar), (None, b_png),
         ])
 
     # -- volume --------------------------------------------------------
@@ -935,7 +942,7 @@ class VolumeView(QDialog):
             out_size=viewport, pan=pan)
         if self.show_box.isChecked():
             draw_volume_box(view, rotation, self.vol.shape, zoom, crop=crop,
-                            pan=pan)
+                            labels=self.show_labels.isChecked(), pan=pan)
         if self.show_bar.isChecked():
             view = draw_scale_bar(view, self.voxel_um / max(zoom, EPS),
                                   self.channel.params["bar_um"])
