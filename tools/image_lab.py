@@ -615,6 +615,11 @@ class VolumeView(QDialog):
         self.setWindowTitle(f"3-D volume — channel {channel.name}")
         self.resize(_dp(1180), _dp(820))
         self.setWindowFlag(Qt.WindowType.Window, True)   # modeless, own taskbar entry
+        # A dialog gets no minimize/maximize buttons by default on Windows; add
+        # both so the 3-D view can be tucked away to the taskbar while the
+        # pipeline is tuned, or blown up to fill the screen.
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
 
         self.channel = channel
         self._builder = builder
