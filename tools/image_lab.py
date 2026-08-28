@@ -241,6 +241,19 @@ def read_session_state(path):
 # ===========================================================================
 # Field matching helpers (pure)
 # ===========================================================================
+def affine_scale(affine):
+    """Uniform scale factor of a 2x3 affine (flip-insensitive).
+
+    Computed here rather than imported from ``core.decompose_fov_affine`` so it
+    is available even in a checkout where the optional ``core`` import failed:
+    a match restored from the saved state can be warped with no ``core`` at all.
+    """
+    A2 = np.asarray(affine, dtype=np.float64)[:, :2]
+    if np.linalg.det(A2) < 0:                       # undo the x-flip first
+        A2 = A2 @ np.array([[-1.0, 0.0], [0.0, 1.0]])
+    return float(np.hypot(A2[0, 0], A2[1, 0]))
+
+
 def warp_to(img, affine, shape):
     """Warp ``img`` through a 2x3 affine into an output of ``shape`` (h, w)."""
     h, w = int(shape[0]), int(shape[1])
@@ -308,6 +321,14 @@ DEFAULT_PARAMS = {
     "um_per_px": 0.1625, "bar_um": 10.0, "z_step": 0.5,
 }
 
+# Sample-space pixel size of each camera at 40x: the ORCA's 6.5 um sensor pitch
+# and the EVK4's 4.86 um, both divided by the magnification. Channel A is the
+# ORCA and channel B the EVK4 by convention (the field match only ever shrinks B
+# onto A), so they must not share one default — a single value left the EVK4
+# channel's 3-D view out of proportion by the 4.86/6.5 pitch ratio unless the
+# user happened to correct it by hand.
+DEFAULT_UM_PER_PX = {"A": 6.5 / 40.0, "B": 4.86 / 40.0}
+
 
 class Channel:
     """One loaded dataset with its own settings, references and view state."""
@@ -318,11 +339,20 @@ class Channel:
         self.index = 0
         self.source_dir = None
         self.params = dict(DEFAULT_PARAMS)
+        self.params["um_per_px"] = DEFAULT_UM_PER_PX.get(name,
+                                                         DEFAULT_PARAMS["um_per_px"])
         self.registered = None
         # Why ``registered`` is set — drift correction, footprint crop, exact-FOV
         # warp, or Z resample all reuse the same "materialised slices" slot, but
         # each needs its own label in the status line (see ImageLab._describe).
         self.registered_reason = None
+        # Resampling the channel onto the other camera's grid changes what one
+        # pixel is worth in microns, but not the value the user typed into the
+        # pixel-size box. Keeping the difference as a *derived* factor (rather
+        # than rewriting ``params``) is deliberate: the warp itself is never
+        # persisted, so a rewritten pixel size would be saved into the session
+        # and come back next time attached to un-warped data.
+        self._px_scale = 1.0
         self.stack_range = None
         # Processed slices, most-recently-used last. Scrubbing a stack used to
         # re-read the plane from disk and re-run the whole pipeline on every
@@ -345,6 +375,24 @@ class Channel:
         if self.registered is not None:
             return self.registered[i]
         return self.frames[i].data
+
+    def um_per_px(self):
+        """Microns per pixel of the slices this channel currently *serves*.
+
+        Not simply ``params["um_per_px"]``: after the channel has been resampled
+        onto the other camera's grid its pixels are that camera's pixels, and
+        every physical measurement downstream — the 3-D view's voxel aspect
+        ratio, the scale bar, the depth read-outs — has to follow. Missing this
+        rendered a warped ORCA stack with its z axis ~34 % out of proportion.
+        """
+        return float(self.params["um_per_px"]) * self._px_scale
+
+    def clear_registration(self):
+        """Drop any materialised slices and the geometry that came with them."""
+        self.registered = None
+        self.registered_reason = None
+        self._px_scale = 1.0
+        self.reset_derived()
 
     def reset_derived(self):
         """Drop everything computed from the pixels (after a load / re-register)."""
@@ -414,7 +462,18 @@ class Channel:
         rng = None
         if self.use_stack_range and p["contrast_mode"] != "manual":
             rng = self.stack_range
-        return render_display(processed, p, rng)
+        return render_display(processed, self.display_params(), rng)
+
+    def display_params(self):
+        """``params`` with the *effective* pixel size substituted in.
+
+        The scale bar is drawn from the pixel size, so a resampled channel needs
+        the resampled one — otherwise its bar is wrong by the same factor the
+        3-D view was.
+        """
+        if self._px_scale == 1.0:
+            return self.params
+        return {**self.params, "um_per_px": self.um_per_px()}
 
     use_stack_range = False
 
@@ -868,7 +927,7 @@ class VolumeView(QDialog):
         """
         if self.vol is None:
             return
-        scale_xy = self.voxel_um / max(self.channel.params["um_per_px"], EPS)
+        scale_xy = self.voxel_um / max(self.channel.um_per_px(), EPS)
         scale_z = self.voxel_um / max(self.channel.params["z_step"], EPS)
         (x0, x1), (y0, y1), (z0, z1) = (self._range(a) for a, _ in self.AXES)
         # Crop indices are voxels of the *current* volume, which may itself be a
@@ -1648,11 +1707,31 @@ class ImageLab(QMainWindow):
         b_stack.clicked.connect(self.save_stack_tiff)
         b_series = QPushButton("Save display series (8-bit PNGs)")
         b_series.clicked.connect(self.save_display_series)
+
+        # Exporting the ORCA restricted to the event camera's field is the whole
+        # point of having matched them, so it gets its own control rather than
+        # being an undocumented side effect of "warp A onto B, then save stack".
+        self.export_field_mode = QComboBox()
+        self.export_field_mode.addItems(["EVK4 grid (comparable, resampled)",
+                                         "ORCA resolution (crop, not resampled)"])
+        self.export_field_mode.setToolTip(
+            "EVK4 grid: channel A is resampled onto B's exact pixels, so the two "
+            "stacks line up voxel for voxel — best for comparing them.\n"
+            "ORCA resolution: an axis-aligned crop in A's own pixels, so the "
+            "ORCA keeps its finer sampling — best for measuring on the ORCA. "
+            "Because the EVK4 field is rotated ~43°, this box also contains "
+            "corners the EVK4 did not see.")
+        b_matched = QPushButton("Save A at EVK4 field (32-bit TIFF)")
+        b_matched.setToolTip("Needs a measured field match. Exports channel A's "
+                             "whole stack limited to the event camera's field.")
+        b_matched.clicked.connect(self.save_matched_stack_tiff)
+
         note = QLabel("Everything is written into the active channel's data folder.")
         note.setStyleSheet("color:#888;")
         note.setWordWrap(True)
         return _group("Export", [
             (None, b_png), (None, b_tif32), (None, b_stack), (None, b_series),
+            ("Field", self.export_field_mode), (None, b_matched),
             (None, note),
         ])
 
@@ -1799,9 +1878,7 @@ class ImageLab(QMainWindow):
         c.frames = scan_paths(paths)
         c.index = 0
         c.source_dir = source_dir
-        c.registered = None
-        c.registered_reason = None
-        c.reset_derived()
+        c.clear_registration()
         if not c.frames:
             self.chan_labels[name].setText("no readable frames")
             self._status(f"Channel {name}: nothing readable in that selection.")
@@ -1824,9 +1901,7 @@ class ImageLab(QMainWindow):
         c = self.ch(name)
         c.frames = []
         c.index = 0
-        c.registered = None
-        c.registered_reason = None
-        c.reset_derived()
+        c.clear_registration()
         self.chan_labels[name].setText("empty")
         self._sync_slider()
         self.refresh()
@@ -1913,9 +1988,7 @@ class ImageLab(QMainWindow):
         a = self.ch("A")
         reverted = a.registered_reason in ("crop", "warp")
         if reverted:
-            a.registered = None
-            a.registered_reason = None
-            a.reset_derived()
+            a.clear_registration()
         self._save_match_state()
         self.refresh()
         if reverted:
@@ -2068,9 +2141,7 @@ class ImageLab(QMainWindow):
             if not c.frames:
                 continue
             c.source_dir = Path(cfg.get("source_dir") or paths[0].parent)
-            c.registered = None
-            c.registered_reason = None
-            c.reset_derived()
+            c.clear_registration()
             c.params = self._sanitize_params(cfg.get("params"))
             c.use_stack_range = bool(cfg.get("use_stack_range", False))
             c.index = int(np.clip(cfg.get("index", 0), 0, c.n_slices - 1))
@@ -2142,6 +2213,11 @@ class ImageLab(QMainWindow):
                   for i in range(a.n_slices)]
         a.registered = warped  # reuse the "materialised slices" path
         a.registered_reason = "warp"
+        # A's pixels are B's pixels now. The affine's scale *is* the conversion:
+        # it maps one B pixel onto ``scale`` A pixels, so one warped pixel spans
+        # ``scale`` times the microns an original A pixel did. Without this the
+        # 3-D view keeps A's old pixel size and renders z out of proportion.
+        a._px_scale = affine_scale(self.current_affine())
         a.reset_derived()
         # A now sits on B's own grid, so the live "warp B into A" pass in the
         # overlay/side-by-side view would re-apply the B->A map on top of an
@@ -2221,6 +2297,10 @@ class ImageLab(QMainWindow):
         label = c.frames[c.index].label if c.loaded else "empty"
         reg = self._REGISTERED_LABELS.get(c.registered_reason, "")
         reg = f" · {reg}" if reg else ""
+        # Say so when the pixels are no longer the size the pixel-size box shows
+        # — otherwise a resampled channel silently disagrees with its own control.
+        if c._px_scale != 1.0:
+            reg += f" ({c.um_per_px():.4g} µm/px)"
         return f"{label}{reg} | display {lo:.4g}–{hi:.4g}"
 
     def _ensure_stack_range(self, c):
@@ -2390,7 +2470,7 @@ class ImageLab(QMainWindow):
 
         try:
             return build_view_volume(get_slice, c.n_slices, c.params["z_step"],
-                                     c.params["um_per_px"], max_dim=max_dim,
+                                     c.um_per_px(), max_dim=max_dim,
                                      roi=roi, planes=planes)
         except _Cancelled:
             return None
@@ -2413,22 +2493,26 @@ class ImageLab(QMainWindow):
     # ------------------------------------------------------------------
     # export
     # ------------------------------------------------------------------
-    def _out_dir(self):
-        c = self.ch()
+    def _out_dir(self, channel=None):
+        c = channel or self.ch()
         return c.source_dir or Path.cwd()
 
-    def _out_base(self, stack_wide=False):
+    def _out_base(self, stack_wide=False, channel=None):
         """Filename base for exports.
 
         Slice exports are named after the slice's own source file. Stack-wide
         exports fall back to the folder name when the frames span several files,
         so the result isn't named after whichever slice happened to be selected.
+
+        ``channel`` defaults to the one being edited, but must be passed for an
+        export that is *about* a specific channel rather than the active one —
+        otherwise the file lands next to the wrong dataset under the wrong name.
         """
-        c = self.ch()
+        c = channel or self.ch()
         if not c.loaded:
             return "image"
         if stack_wide and len({f.path for f in c.frames}) > 1:
-            return self._out_dir().name or "stack"
+            return self._out_dir(c).name or "stack"
         return Path(c.frames[c.index].label.split(" [")[0]).stem
 
     def save_view_png(self):
@@ -2472,6 +2556,98 @@ class ImageLab(QMainWindow):
         tifffile.imwrite(str(path), np.asarray(processed, dtype=np.float32), imagej=True)
         self._final_status(f"Saved {path} ({len(processed)} planes, 32-bit)")
 
+    def evk4_field_in_a(self):
+        """Corners of channel B's frame expressed in channel A's pixels (4x2).
+
+        The EVK4's field lands in the ORCA *rotated* by ~43°, so this is a
+        quadrilateral, not a box — which is why the two export modes below have
+        to differ.
+        """
+        b = self.ch("B")
+        h, w = np.asarray(b.raw(0)).shape[:2]
+        pts = np.array([[0.0, 0.0, 1.0], [w, 0.0, 1.0], [w, h, 1.0], [0.0, h, 1.0]])
+        return pts @ np.asarray(self.current_affine(), dtype=np.float64).T
+
+    def save_matched_stack_tiff(self):
+        """Export channel A's stack restricted to the EVK4's field of view.
+
+        Two modes, because there is a real trade-off and no default is right for
+        every use:
+
+        * **EVK4 grid** resamples A onto B's exact pixel grid. The two stacks
+          then share one coordinate system voxel for voxel, which is what you
+          want for a direct comparison — but it throws away ORCA sampling, since
+          an EVK4 pixel is the coarser of the two in the sample.
+        * **ORCA resolution** takes the axis-aligned bounding box of B's field
+          in A's own pixels. Nothing is resampled, so the ORCA keeps its full
+          sampling; the cost is that a box around a rotated field also contains
+          four corner regions the EVK4 never saw.
+
+        The pipeline runs *before* the geometry in both cases: hot-pixel removal
+        and background subtraction are defined on the acquired pixels, and
+        resampling first would have them work on interpolated data.
+        """
+        a, b = self.ch("A"), self.ch("B")
+        if not a.loaded:
+            self._status("Channel A is empty — load the ORCA stack first.")
+            return
+        if not self.match_measured:
+            self._status("No field match measured — measure one first, or load "
+                         "last session's.")
+            return
+        to_grid = self.export_field_mode.currentIndex() == 0
+        if to_grid and not b.loaded:
+            self._status("Exporting onto the EVK4 grid needs channel B loaded "
+                         "(it defines the grid). Load it, or export at ORCA "
+                         "resolution.")
+            return
+
+        already = a.registered_reason in ("warp", "crop")
+        processed = self._process_all(a, "Processing channel A for export…")
+        if processed is None:
+            return
+
+        if already:
+            # A is already sitting on B's grid; re-applying the map would shear
+            # it a second time. What is on screen is what should be written —
+            # and an ORCA-resolution crop is no longer available, because the
+            # ORCA sampling was already spent by the warp.
+            out, tag = processed, "evk4grid"
+            note = ("  (channel A is already warped onto B's grid, so it was "
+                    "exported as-is" +
+                    ("; 'Reset match' first for an ORCA-resolution crop)"
+                     if not to_grid else ")"))
+        elif to_grid:
+            inv = cv2.invertAffineTransform(
+                np.asarray(self.current_affine(), dtype=np.float64))
+            shape_b = np.asarray(b.raw(0)).shape[:2]
+            out = [warp_to(img, inv, shape_b) for img in processed]
+            tag, note = "evk4grid", ""
+        else:
+            corners = self.evk4_field_in_a()
+            h, w = processed[0].shape[:2]
+            x0 = int(np.clip(np.floor(corners[:, 0].min()), 0, w - 1))
+            y0 = int(np.clip(np.floor(corners[:, 1].min()), 0, h - 1))
+            x1 = int(np.clip(np.ceil(corners[:, 0].max()), x0 + 1, w))
+            y1 = int(np.clip(np.ceil(corners[:, 1].max()), y0 + 1, h))
+            out = [img[y0:y1, x0:x1] for img in processed]
+            tag = "evk4crop"
+            covered = (corners[:, 0].min() >= 0 and corners[:, 1].min() >= 0
+                       and corners[:, 0].max() <= w and corners[:, 1].max() <= h)
+            note = ("" if covered else
+                    "  ⚠ the EVK4 field runs past the edge of the ORCA data — "
+                    "the crop is only the shared part")
+
+        # Named and placed after channel A, not the channel being edited: this
+        # export is always about A, and the ORCA data is rarely the active one
+        # while the match is being set up on B.
+        path = (self._out_dir(a) /
+                f"{self._out_base(stack_wide=True, channel=a)}_{tag}_stack.tif")
+        tifffile.imwrite(str(path), np.asarray(out, dtype=np.float32), imagej=True)
+        self._final_status(f"Saved {path} ({len(out)} planes, "
+                           f"{out[0].shape[1]}×{out[0].shape[0]} px, 32-bit)"
+                           f"{note}")
+
     def save_display_series(self):
         c = self.ch()
         processed = self._process_all(c, f"Rendering channel {c.name} display series…")
@@ -2486,7 +2662,7 @@ class ImageLab(QMainWindow):
         self._ensure_stack_range(c)
         rng = c.stack_range if c.use_stack_range else None
         for i, img in enumerate(processed):
-            view, _ = render_display(img, c.params, rng)
+            view, _ = render_display(img, c.display_params(), rng)
             cv2.imwrite(str(out / f"z{i:03d}.png"), view)
         self._final_status(f"Saved {len(processed)} PNGs to {out}")
 

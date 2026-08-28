@@ -293,6 +293,21 @@ EVK4_TO_ORCA_AFFINE = [
     [0.5080887782465614, 0.5448585077062823, 550.1741191479392],
 ]
 
+# Safety margin added to every side of the ORCA crop that matches the EVK4 field,
+# as a fraction of the mapped footprint's size (so the crop is 1 + 2*margin times
+# larger than the bare bounding box).
+#
+# It must not be zero. A crop sized to the *exact* footprint leaves the ORCA no
+# bigger than the EVK4's rotated field, and offline re-registration
+# (``register_evk4_to_orca``, and the Image Lab's field match) matches by sliding
+# the EVK4 template *inside* the ORCA image — a template that does not fit is
+# rejected outright. With a bare bounding box the search therefore cannot reach
+# the true scale and settles on a smaller one: measured on the 2026-07-24 pair
+# (ORCA 1052x996, EVK4 1280x720) it capped at 0.710 against a true 0.745, i.e.
+# an ORCA field ~5 % too small. 6 % per side restores enough room to reach 0.78.
+# It also absorbs the translation drift between a calibration and the acquisition.
+EVK4_ORCA_CROP_MARGIN = float(os.environ.get("DSI_FOV_CROP_MARGIN", "0.06"))
+
 _affine_path = os.environ.get("DSI_FOV_AFFINE_PATH", "")
 if _affine_path and os.path.exists(_affine_path):
     try:

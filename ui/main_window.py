@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
 
 from config import (
     ACQUISITION_HISTORY_MAX, ACQUISITION_HISTORY_PATH, EVK4_PLANE_OVERHEAD_S,
-    EVK4_SAVE_FORMAT_CSV, EVK4_SENSOR_HEIGHT, EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE,
+    EVK4_ORCA_CROP_MARGIN, EVK4_SAVE_FORMAT_CSV, EVK4_SENSOR_HEIGHT,
+    EVK4_SENSOR_WIDTH, EVK4_TO_ORCA_AFFINE,
     FOV_MATCH_PATH, ORCA_CAMERA_INIT_S, ORCA_PLANE_OVERHEAD_S, ORCA_SENSOR_HEIGHT,
     ORCA_SENSOR_WIDTH, PREVIEW_MAX_DISPLAY_EDGE, SESSION_STATE_PATH,
 )
@@ -1939,9 +1940,14 @@ class MainWindow(QMainWindow):
         self._save_fov_match(crop, evk4_roi, corners)
         w = crop["x_max"] - crop["x_min"]
         h = crop["y_max"] - crop["y_min"]
+        fw = float(corners[:, 0].max() - corners[:, 0].min())
+        fh = float(corners[:, 1].max() - corners[:, 1].min())
         self.lbl_status.setText(
             f"ORCA crop matched to the EVK4 field: {w} × {h} px at "
-            f"({crop['x_min']}, {crop['y_min']}). Saved as the last matching crop.")
+            f"({crop['x_min']}, {crop['y_min']}) — the {fw:.0f} × {fh:.0f} px "
+            f"footprint plus a {EVK4_ORCA_CROP_MARGIN:.0%} margin, which offline "
+            f"re-registration needs to reach the correct scale. "
+            f"Saved as the last matching crop.")
 
     def _measure_fov_registration(self):
         """Re-measure the EVK4->ORCA registration from live images (both cameras).

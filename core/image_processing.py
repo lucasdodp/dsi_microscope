@@ -17,6 +17,7 @@ import scipy.io
 
 from config import (
     EVK4_CRAZY_PIXEL_PERCENTILE, EVK4_CSV_QUEUE_CHUNKS, EVK4_CSV_WORKERS,
+    EVK4_ORCA_CROP_MARGIN,
 )
 
 
@@ -1372,7 +1373,8 @@ def evk4_footprint_in_orca(affine, evk4_roi):
     return pts @ A.T
 
 
-def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4):
+def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4,
+                            margin=None):
     """Map an EVK4 crop window into ORCA coordinates and derive the matching crop.
 
     ``affine`` is the calibrated 2x3 EVK4->ORCA map (see
@@ -1385,26 +1387,46 @@ def map_evk4_window_to_orca(affine, evk4_roi, orca_sensor=(2304, 2304), align=4)
 
     ``evk4_roi`` is the EVK4 window as ``{x_min, x_max, y_min, y_max}`` in
     full-sensor IMX636 pixels (the widget's native format). The bounding box is
-    expanded outward to the DCAM ``align`` grid (position and size must be
-    multiples of 4 for the hardware subarray) and clamped to the sensor.
+    grown by ``margin`` on each side (fraction of the footprint's size, default
+    ``config.EVK4_ORCA_CROP_MARGIN``), expanded outward to the DCAM ``align``
+    grid (position and size must be multiples of 4 for the hardware subarray)
+    and clamped to the sensor.
+
+    The margin is not cosmetic: a crop sized to the bare bounding box leaves the
+    ORCA image no larger than the EVK4's rotated field, and the offline
+    re-registration (:func:`register_evk4_to_orca`) matches by sliding the EVK4
+    template *inside* the ORCA image. Without room to spare the search cannot
+    reach the true scale and settles ~5 % small — see ``EVK4_ORCA_CROP_MARGIN``.
 
     Returns ``(crop, corners, clipped)``:
       * ``crop`` — ``{x_min, x_max, y_min, y_max}`` in full-sensor unbinned
-        ORCA pixels, aligned and clamped;
+        ORCA pixels, with margin, aligned and clamped;
       * ``corners`` — 4x2 float array of the mapped EVK4 window corners
         (x, y), in EVK4-window order TL, TR, BR, BL;
-      * ``clipped`` — True if the footprint ran off the ORCA sensor and the
-        crop had to be cut back (the fields are then not fully shared).
+      * ``clipped`` — True if the **footprint itself** ran off the ORCA sensor,
+        so the fields are genuinely not fully shared. Losing only part of the
+        margin to the sensor edge does not set it: the margin is slack, and
+        reporting its loss as a clipped field of view would cry wolf on a
+        footprint that is still completely covered.
     """
     corners = evk4_footprint_in_orca(affine, evk4_roi)  # 4x2 (x, y) in ORCA px
+    if margin is None:
+        margin = EVK4_ORCA_CROP_MARGIN
 
     sw, sh = int(orca_sensor[0]), int(orca_sensor[1])
+    fx0, fx1 = float(corners[:, 0].min()), float(corners[:, 0].max())
+    fy0, fy1 = float(corners[:, 1].min()), float(corners[:, 1].max())
+    # Whether the shared field is complete is a property of the footprint alone,
+    # so it is decided before the margin is added.
+    clipped = fx0 < 0 or fy0 < 0 or fx1 > sw or fy1 > sh
+
+    pad_x = max(0.0, float(margin)) * (fx1 - fx0)
+    pad_y = max(0.0, float(margin)) * (fy1 - fy0)
     # Expand outward to the alignment grid so the whole footprint stays inside.
-    bx0 = int(np.floor(corners[:, 0].min() / align) * align)
-    by0 = int(np.floor(corners[:, 1].min() / align) * align)
-    bx1 = int(np.ceil(corners[:, 0].max() / align) * align)
-    by1 = int(np.ceil(corners[:, 1].max() / align) * align)
-    clipped = bx0 < 0 or by0 < 0 or bx1 > sw or by1 > sh
+    bx0 = int(np.floor((fx0 - pad_x) / align) * align)
+    by0 = int(np.floor((fy0 - pad_y) / align) * align)
+    bx1 = int(np.ceil((fx1 + pad_x) / align) * align)
+    by1 = int(np.ceil((fy1 + pad_y) / align) * align)
     bx0, by0 = max(0, bx0), max(0, by0)
     bx1, by1 = min(sw, bx1), min(sh, by1)
     if bx1 - bx0 < align or by1 - by0 < align:
@@ -1470,6 +1492,36 @@ def _masked_ncc(big, tmpl, mask):
     return float(mx), loc
 
 
+# Upper bound on the scale the registration search ever tries (the full grid
+# stops below 0.96, the seeded one at seed + 0.06 then + 0.03 in the refine).
+_MAX_SEARCH_SCALE = 1.0
+
+
+def _registration_pad(orca_shape, evk4_shape, max_scale=_MAX_SEARCH_SCALE):
+    """Border to add to the ORCA blob map before the template search, in pixels.
+
+    ``_masked_ncc`` slides the transformed EVK4 template *inside* the ORCA image
+    and rejects any geometry where the template is not strictly smaller. When
+    the ORCA was cropped tightly to the EVK4 field — which is exactly what the
+    FOV matcher used to produce — the template at the true scale does not fit,
+    so the search silently settles on a smaller scale and reports a field of
+    view a few percent too small.
+
+    Padding the ORCA map removes that constraint. The bound is the diagonal of
+    the EVK4 frame, since the rotated canvas side ``w|cos| + h|sin|`` is at most
+    ``hypot(w, h)`` over all angles. Only the shortfall is padded, so a
+    full-sensor ORCA (the common case) is untouched and costs nothing.
+    """
+    h_o, w_o = int(orca_shape[0]), int(orca_shape[1])
+    need = float(max_scale) * float(np.hypot(evk4_shape[0], evk4_shape[1]))
+    # +2 keeps the template strictly smaller; the extra 5 % keeps the optimum off
+    # the very edge of the search range, where it could not be refined.
+    need = need * 1.05 + 2.0
+    pad_x = max(0.0, (need - w_o) / 2.0)
+    pad_y = max(0.0, (need - h_o) / 2.0)
+    return int(np.ceil(max(pad_x, pad_y)))
+
+
 def decompose_fov_affine(affine):
     """Extract (flip, theta_deg, scale) from a 2x3 EVK4->ORCA affine.
 
@@ -1508,8 +1560,23 @@ def register_evk4_to_orca(orca_img, evk4_img, seed_affine=None, status=None):
         if status is not None:
             status(msg)
 
-    cov_o = _blobmap(orca_img, 4.0)
     cov_e = _blobmap(evk4_img, 3.0)
+    # Pad the ORCA map so a tightly-cropped ORCA cannot bound the scale search
+    # (see _registration_pad). Everything downstream — including the returned
+    # translation — works in this padded frame, and ``pad`` is subtracted off at
+    # the end to bring the affine back into the caller's ORCA coordinates. The
+    # border is 0.0, which is the background level of a blob map (``_blobmap``
+    # subtracts the 50th percentile), so it adds no structure to match against.
+    # Named ``border``, not ``pad``: the full-resolution polish below already
+    # uses ``pad`` for its own search-window slack, and shadowing it silently
+    # subtracted the wrong offset from the final translation.
+    border = _registration_pad(np.shape(orca_img), cov_e.shape)
+    cov_o = _blobmap(orca_img, 4.0)
+    if border:
+        say(f"ORCA frame is tight for the search — padding by {border} px so "
+            f"the full scale range stays reachable...")
+        cov_o = cv2.copyMakeBorder(cov_o, border, border, border, border,
+                                   cv2.BORDER_CONSTANT, value=0.0)
     o4 = cv2.resize(cov_o, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
     e4 = cv2.resize(cov_e, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
     o2 = cv2.resize(cov_o, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
@@ -1578,7 +1645,10 @@ def register_evk4_to_orca(orca_img, evk4_img, seed_affine=None, status=None):
         x0, y0 = x0w + dx, y0w + dy
 
     S3 = np.array([[scale_r, 0, 0], [0, scale_r, 0], [0, 0, 1.0]])
-    T3 = np.array([[1.0, 0, x0], [0, 1, y0], [0, 0, 1.0]])
+    # Back out of the padded frame. A negative translation is a legitimate
+    # result: it means the EVK4 field extends past the edge of the ORCA crop,
+    # which is precisely the case the padding exists to let the search express.
+    T3 = np.array([[1.0, 0, x0 - border], [0, 1, y0 - border], [0, 0, 1.0]])
     A3 = T3 @ S3 @ np.vstack([A_rot, [0, 0, 1.0]])
     say(f"Registration done: NCC = {s:.2f}, θ = {theta_r:.2f}°, scale = {scale_r:.4f}.")
     return A3[:2].tolist(), float(s), {
