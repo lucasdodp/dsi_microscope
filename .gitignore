@@ -27,3 +27,6 @@ EVK4_parameter_analysis/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Claude Code local settings
+.claude/
