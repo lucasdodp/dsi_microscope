@@ -31,7 +31,7 @@ Clone the repo (or copy the `dsi_microscope/` folder). Do **not** copy your
 
 Use **64-bit Python 3.x on Windows** (developed on 3.12).
 
-> ⚠️ **Check the Prophesee Metavision SDK's supported Python version first** if you
+> **Check the Prophesee Metavision SDK's supported Python version first** if you
 > need the event camera. Metavision only ships bindings for specific Python
 > versions (and sometimes pins `numpy<2`). Match your Python version to whatever
 > the installed Metavision SDK supports — otherwise `import metavision_core`
